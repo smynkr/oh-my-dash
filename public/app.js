@@ -772,11 +772,14 @@
     const labelCounts = new Map();
     for (const entry of options) labelCounts.set(entry.label, (labelCounts.get(entry.label) || 0) + 1);
     options.sort((a, b) => a.label.localeCompare(b.label));
-    select.replaceChildren(new Option('All repositories', ''), ...options.map(entry => {
-      const label = labelCounts.get(entry.label) > 1 ? `${entry.label} (${entry.host || 'unknown host'})` : entry.label;
-      return new Option(label, entry.id);
-    }));
-    if (selected && !entries.has(selected)) select.add(new Option('Saved repository filter (not currently available)', selected));
+    const choices = [{ id: '', label: 'All repositories' }, ...options.map(entry => ({
+      id: entry.id,
+      label: labelCounts.get(entry.label) > 1 ? `${entry.label} (${entry.host || 'unknown host'})` : entry.label,
+    }))];
+    if (selected && !entries.has(selected)) choices.push({ id: selected, label: 'Saved repository filter (not currently available)' });
+    const unchanged = select.options.length === choices.length && choices.every((entry, index) =>
+      select.options[index].value === entry.id && select.options[index].text === entry.label);
+    if (!unchanged) select.replaceChildren(...choices.map(entry => new Option(entry.label, entry.id)));
     select.value = selected;
   }
   function restoreProjectFilter() {

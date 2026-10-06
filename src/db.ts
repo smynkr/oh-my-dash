@@ -140,6 +140,7 @@ export class DashDB {
         ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT
       );
       CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+      CREATE INDEX IF NOT EXISTS events_session_kind ON events(session_key, kind);
       CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS replies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
