@@ -1,0 +1,16 @@
+node_modules/
+bin/
+data/
+*.sqlite
+*.sqlite-*
+.DS_Store
+.bun-cache/
+.tmp-*/
+.omx/
+.omc/
+.env
+.env.*
+!.env.example
+backups/
+*.log
+cloudflare.env

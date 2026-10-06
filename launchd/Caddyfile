@@ -1,0 +1,30 @@
+{
+	admin 127.0.0.1:2019
+	auto_https disable_redirects
+	https_port 8443
+	servers {
+		protocols h1 h2
+		strict_sni_host on
+		listener_wrappers {
+			proxy_protocol {
+				timeout 5s
+				fallback_policy require
+			}
+			tls
+		}
+	}
+}
+
+https://{$DASH_PUBLIC_HOST} {
+	# Configure DASH_PUBLIC_HOST in com.dash.ingress.plist before loading the ingress launch agent.
+	bind 127.0.0.1
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+		resolvers 1.1.1.1 1.0.0.1
+	}
+	reverse_proxy 127.0.0.1:4780 {
+		header_up X-Forwarded-For {remote_host}
+		header_up -Tailscale-*
+		flush_interval -1
+	}
+}

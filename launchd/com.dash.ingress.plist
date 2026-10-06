@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Template: replace every __HOME__ token with the user's absolute home directory and __DASH_PUBLIC_HOST__ with the public DNS hostname before loading this launch agent. -->
+<dict>
+  <key>Label</key><string>com.dash.ingress</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/share/dash-ingress/caddy</string>
+    <string>run</string>
+    <string>--config</string><string>__HOME__/.local/share/dash-ingress/Caddyfile</string>
+    <string>--adapter</string><string>caddyfile</string>
+    <string>--envfile</string><string>__HOME__/.local/share/dash-ingress/cloudflare.env</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>__HOME__</string>
+    <key>XDG_DATA_HOME</key><string>__HOME__/.local/share/dash-ingress/data</string>
+    <key>XDG_CONFIG_HOME</key><string>__HOME__/.local/share/dash-ingress/config</string>
+    <key>DASH_PUBLIC_HOST</key><string>__DASH_PUBLIC_HOST__</string>
+  </dict>
+  <key>WorkingDirectory</key><string>/</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>__HOME__/.local/share/dash-ingress/ingress.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.local/share/dash-ingress/ingress-error.log</string>
+</dict>
+</plist>

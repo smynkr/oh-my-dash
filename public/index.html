@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Oh My Dash · Session feed</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/vendor/marked.js" defer></script>
+  <script src="/vendor/purify.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">D</span><div><strong>Oh My Dash</strong><span class="brand-subtitle">Local session feed</span></div></div>
+    <div class="counts" aria-live="polite">
+      <span class="count needs-count"><b id="needs-count">0</b> needs you</span>
+      <span class="count unread-count"><b id="unread-count">0</b> unread</span>
+      <span class="count working-count"><b id="working-count">0</b> working</span>
+    </div>
+    <div id="telegram-status" class="telegram-status" aria-live="polite" hidden></div>
+    <button id="notification-enable" class="button button-secondary" type="button">Enable desktop notifications</button>
+    <button id="mark-all" class="button button-secondary" type="button">Mark all read</button>
+  </header>
+  <main>
+    <nav class="tabs" aria-label="Feed views">
+      <div id="feed-tabs" class="tab-list" role="tablist" aria-label="Session feed view">
+        <button class="tab active" id="sessions-tab" type="button" role="tab" aria-selected="true" aria-controls="sessions-view" tabindex="0">Sessions</button>
+        <button class="tab" id="timeline-tab" type="button" role="tab" aria-selected="false" aria-controls="timeline-view" tabindex="-1">Timeline</button>
+      </div>
+      <span id="connection" class="connection"><i></i> Connecting</span>
+    </nav>
+    <details id="project-rules-disclosure" class="project-rules-disclosure" hidden>
+      <summary class="project-rules-summary" aria-controls="project-rules-panel">
+        <span>Project rules</span>
+        <span class="project-rules-summary-help">Edit path matching and Telegram routing</span>
+      </summary>
+      <section id="project-rules-panel" class="project-rules" aria-labelledby="project-rules-title" hidden>
+        <div class="project-rules-heading">
+          <div><h1 id="project-rules-title">Project rules</h1><p>Match session paths in order. The first matching rule sets the project used by Telegram routing.</p></div>
+          <button id="project-rule-add" class="button button-secondary" type="button">Add rule</button>
+        </div>
+        <p id="project-rules-notice" class="project-rules-notice" aria-live="polite"></p>
+        <div id="project-rule-rows" class="project-rule-rows"></div>
+        <div class="project-rules-actions">
+          <button id="project-rule-save" class="button button-primary" type="button">Save rules</button>
+          <span id="project-rules-status" role="status" aria-live="polite"></span>
+        </div>
+        <div class="project-preview">
+          <label for="project-test-path">Test a path</label>
+          <input id="project-test-path" type="text" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="/path/to/project">
+          <p id="project-preview-result" aria-live="polite">Enter a path to preview its project.</p>
+        </div>
+      </section>
+    </details>
+    <div class="filters" aria-label="Feed filters">
+      <label>Host <select id="host-filter"><option value="">All hosts</option></select></label>
+      <label>Harness <select id="harness-filter"><option value="">All harnesses</option><option value="claude">Claude Code</option><option value="omp">Oh My Pi</option></select></label>
+      <label title="Options are grouped by host and working directory, not detected Git roots or worktrees.">Repository <select id="project-filter" aria-description="Options are grouped by host and working directory, not detected Git roots or worktrees."><option value="">All repositories</option></select></label>
+      <label class="check-label"><input id="headless-filter" type="checkbox"> Show headless</label>
+      <label class="check-label" id="ended-filter-label"><input id="ended-filter" type="checkbox"> Show ended</label>
+    </div>
+    <section id="sessions-view" class="view" role="tabpanel" aria-labelledby="sessions-tab" tabindex="0">
+      <div id="sessions" class="card-grid" aria-live="polite"></div>
+      <p id="sessions-empty" class="empty-state" hidden>No sessions match these filters.</p>
+    </section>
+    <section id="timeline-view" class="view" role="tabpanel" aria-labelledby="timeline-tab" tabindex="0" hidden>
+      <div id="timeline" class="timeline"></div>
+      <p id="timeline-empty" class="empty-state" hidden>No responses yet.</p>
+      <button id="timeline-more" class="button button-secondary timeline-more" type="button" hidden>Load older responses</button>
+    </section>
+  </main>
+  <dialog id="notifications-dialog" class="notification-dialog">
+    <form method="dialog"><button class="dialog-close" aria-label="Close">×</button></form>
+    <h2>Desktop notifications</h2>
+    <p>Choose which session updates can notify you.</p>
+    <label class="check-label"><input id="notify-needs" type="checkbox"> When a session needs you</label>
+    <label class="check-label"><input id="notify-response" type="checkbox"> When a new response arrives</label>
+    <button id="enable-notifications" class="button button-primary" type="button">Enable desktop notifications</button>
+    <p id="notification-status" class="muted"></p>
+  </dialog>
+  <button id="notification-settings" class="notification-settings" type="button" aria-label="Notification settings" title="Notification settings">♧</button>
+</body>
+</html>

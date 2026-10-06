@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<!-- Template: replace every __HOME__ token with the user's absolute home directory before loading this launch agent. -->
+	<key>Label</key>
+	<string>com.dash.collector</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOME__/.local/share/dash/bin/dash-collector</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>DASH_ROOT</key>
+		<string>__HOME__/.local/share/dash</string>
+		<key>DASH_DATA</key>
+		<string>__HOME__/.local/share/dash/data</string>
+		<key>DASH_CLAUDE_BIN</key>
+		<string>__HOME__/.local/bin/claude</string>
+		<key>PATH</key>
+		<string>__HOME__/.local/bin:__HOME__/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>DASH_BIND</key>
+		<string>127.0.0.1</string>
+		<key>DASH_PORT</key>
+		<string>4777</string>
+		<!-- Leave empty to disable tailnet access. To enable it, set all three before restarting. -->
+		<key>DASH_ALLOWED_HOSTS</key>
+		<string></string>
+		<key>DASH_ALLOWED_PEERS</key>
+		<string></string>
+		<key>DASH_TAILNET_PORT</key>
+		<string></string>
+		<key>DASH_TELEGRAM</key>
+		<string></string>
+		<key>DASH_REPLIES</key>
+		<string></string>
+		<key>DASH_TG_TOPICS</key>
+		<string></string>
+		<key>DASH_TG_URGENT_AFTER_MIN</key>
+		<string>30</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/tmp/dash-collector.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/dash-collector-error.log</string>
+</dict>
+</plist>
