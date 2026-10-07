@@ -251,33 +251,48 @@ try {
     $taskCreated = $true
 
     $unregisterFailureWrapper = Join-Path $fixture.Root 'simulate-unregister-failure.ps1'
+    $unregisterFailureMarker = Join-Path $fixture.Root 'unregister-refusal-triggered.txt'
     $unregisterFailureScript = @'
 param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
-    [Parameter(Mandatory = $true)][string]$ArgumentsJson
+    [Parameter(Mandatory = $true)][string]$HubUrl,
+    [Parameter(Mandatory = $true)][string]$HostLabel,
+    [Parameter(Mandatory = $true)][string]$SettingsPath,
+    [Parameter(Mandatory = $true)][string]$InstallPath,
+    [Parameter(Mandatory = $true)][string]$ClaudePath,
+    [Parameter(Mandatory = $true)][string]$TaskName,
+    [Parameter(Mandatory = $true)][string]$MarkerPath
 )
+$ErrorActionPreference = 'Stop'
+Import-Module ScheduledTasks
 function Unregister-ScheduledTask {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([string]$TaskName, [string]$TaskPath)
-    $errorRecord = [System.Management.Automation.ErrorRecord]::new(
-        [System.UnauthorizedAccessException]::new('Synthetic access denied removing the task.'),
-        'SyntheticUnregisterDenied',
-        [System.Management.Automation.ErrorCategory]::PermissionDenied,
-        $TaskName
-    )
-    $PSCmdlet.WriteError($errorRecord)
+    [System.IO.File]::WriteAllText($MarkerPath, 'reached')
+    Write-Error 'Synthetic scheduler refusal'
 }
-$installerArguments = @($ArgumentsJson | ConvertFrom-Json)
-& $InstallerPath @installerArguments
+& $InstallerPath -HubUrl $HubUrl -HostLabel $HostLabel -SettingsPath $SettingsPath `
+    -InstallPath $InstallPath -ClaudePath $ClaudePath -TaskName $TaskName -Uninstall
+exit $LASTEXITCODE
 '@
     [System.IO.File]::WriteAllText($unregisterFailureWrapper, $unregisterFailureScript, [System.Text.UTF8Encoding]::new($false))
     $settingsBeforeUnregisterFailure = [System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($fixture.SettingsPath))
     $clientConfigPath = Join-Path $fixture.InstallPath 'client-config.json'
     $livenessHelperPath = Join-Path $fixture.InstallPath 'claude-liveness.ps1'
     try {
-        $uninstallArgumentsJson = ConvertTo-Json -InputObject (Get-InstallerArguments $fixture @('-Uninstall')) -Compress
         $failedUnregister = Invoke-WindowsClaudeScript -ScriptPath $unregisterFailureWrapper `
-            -Arguments @($installer, $uninstallArgumentsJson) -TimeoutSeconds 30
+            -Arguments @(
+                '-InstallerPath', $installer,
+                '-HubUrl', $fixture.Server.HubBase,
+                '-HostLabel', $fixture.HostLabel,
+                '-SettingsPath', $fixture.SettingsPath,
+                '-InstallPath', $fixture.InstallPath,
+                '-ClaudePath', $fixture.ClaudePath,
+                '-TaskName', $fixture.TaskName,
+                '-MarkerPath', $unregisterFailureMarker
+            ) -TimeoutSeconds 30
+        Assert-True (Test-Path -LiteralPath $unregisterFailureMarker -PathType Leaf) `
+            'uninstall failure fixture reaches injected task-removal refusal'
         Assert-Equal 1 $failedUnregister.ExitCode 'uninstall fails when owned liveness task removal fails'
         $remainingTask = Get-ScheduledTask -TaskName $fixture.TaskName -TaskPath '\' -ErrorAction Stop
         Assert-Equal $fixture.TaskName $remainingTask.TaskName 'failed task removal leaves the liveness task registered'
