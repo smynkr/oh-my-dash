@@ -48,6 +48,14 @@ foreach ($failurePoint in @('Register-ScheduledTask', 'Start-ScheduledTask')) {
             }
             $before = @{}
             foreach ($path in $activePaths) { $before[$path] = [BitConverter]::ToString([IO.File]::ReadAllBytes($path)) }
+            $backupFilesBefore = @(Get-ChildItem -LiteralPath $rollbackFixture.Root -Filter '*.bak-dash-*' -Recurse -File)
+            $expectedBackupPaths = @($rollbackFixture.SettingsPath)
+            if ($upgrade) {
+                $expectedBackupPaths = @(
+                    (Join-Path $rollbackFixture.InstallPath 'claude-hook.ps1'),
+                    (Join-Path $rollbackFixture.InstallPath 'client-config.json')
+                )
+            }
 
             $failureArguments = @($rollbackArguments)
             $failureArguments[3] = 'synthetic-changed-host'
@@ -65,6 +73,17 @@ foreach ($failurePoint in @('Register-ScheduledTask', 'Start-ScheduledTask')) {
             foreach ($path in $activePaths) {
                 Assert-Equal $before[$path] ([BitConverter]::ToString([IO.File]::ReadAllBytes($path))) `
                     "$failurePoint failure restores existing settings, config and locally modified helpers"
+            }
+            $backupsAfterFailure = @(Get-ChildItem -LiteralPath $rollbackFixture.Root -Filter '*.bak-dash-*' -Recurse -File)
+            Assert-Equal ($backupFilesBefore.Count + $expectedBackupPaths.Count) $backupsAfterFailure.Count `
+                'failed installation creates backups only for replaced pre-existing files'
+            foreach ($backupPath in $expectedBackupPaths) {
+                $pathBackups = @($backupsAfterFailure | Where-Object {
+                    $_.FullName.StartsWith($backupPath + '.bak-dash-', [StringComparison]::OrdinalIgnoreCase)
+                })
+                Assert-Equal 1 $pathBackups.Count 'rollback does not create a backup of generated intermediate content'
+                Assert-Equal $before[$backupPath] ([BitConverter]::ToString([IO.File]::ReadAllBytes($pathBackups[0].FullName))) `
+                    'failed install backup retains the original user-owned bytes'
             }
             $remainingTask = Get-ScheduledTask -TaskName $rollbackFixture.TaskName -TaskPath '\' -ErrorAction SilentlyContinue
             if ($upgrade) {
@@ -116,8 +135,15 @@ $original = [ordered]@{
     permissions = [ordered]@{ allow = @('Read(C:\synthetic\**)') }
     hooks = [ordered]@{
         PreToolUse = @(
-            [ordered]@{ matcher = 'Bash'; hooks = @([ordered]@{ type = 'command'; command = 'keep synthetic unrelated hook'; timeout = 19 }) }
+            [ordered]@{
+                matcher = 'Bash'
+                hooks = @(
+                    [ordered]@{ type = 'command'; command = 'keep synthetic unrelated hook'; timeout = 19 },
+                    [ordered]@{ type = 'command'; command = 'keep synthetic command # dash-hook text' }
+                )
+            }
         )
+        SessionStart = @()
         CustomEmptyEvent = @()
         CustomEvent = @([ordered]@{ hooks = @([ordered]@{ type = 'command'; command = 'keep synthetic custom hook' }) })
     }
@@ -219,6 +245,16 @@ try {
     Assert-Equal 'preserve synthetic unknown value' $settings.futureSetting.nested[0] 'nested unknown settings are preserved'
     Assert-Equal 'synthetic-windows-model' $settings.model 'model setting is preserved'
     Assert-Equal 'keep synthetic unrelated hook' $settings.hooks.PreToolUse[0].hooks[0].command 'unrelated event hook is preserved'
+    Assert-Equal 'keep synthetic command # dash-hook text' $settings.hooks.PreToolUse[0].hooks[1].command `
+        'unrelated commands containing the marker text are preserved'
+    $legacyStopCommands = @(
+        $settings.hooks.Stop |
+            ForEach-Object { $_.hooks } |
+            ForEach-Object { $_ } |
+            Where-Object { $_.command -is [string] -and $_.command.Contains('# dash-hook') }
+    )
+    Assert-Equal 0 $legacyStopCommands.Count 'the previous Dash command-form hook is replaced'
+    Assert-True ($settings.hooks.SessionStart.Count -gt 0) 'managed hook is installed into a pre-existing empty event array'
     Assert-True ($settings.hooks.CustomEmptyEvent.Count -eq 0) 'pre-existing empty event array is preserved'
     Assert-Equal 'keep synthetic custom hook' $settings.hooks.CustomEvent[0].hooks[0].command 'custom event hook is preserved'
 
@@ -237,6 +273,8 @@ try {
 
     $configPath = Join-Path $fixture.InstallPath 'client-config.json'
     $config = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8))
+    Assert-True (@($config.EmptyHookEvents) -contains 'SessionStart') `
+        'reinstall metadata retains an event array that was empty before installation'
 
     $hookText = 'synthetic Unicode prompt ' + $umlaut + ' ' + $snow
     $hookEvent = [ordered]@{
@@ -400,6 +438,9 @@ try {
     Assert-Equal 'preserve synthetic unknown value' $restored.futureSetting.nested[0] 'uninstall preserves nested unknown settings'
     Assert-True ($restored.hooks.CustomEmptyEvent.Count -eq 0) 'uninstall preserves unrelated empty event array'
     Assert-Equal 'keep synthetic unrelated hook' $restored.hooks.PreToolUse[0].hooks[0].command 'uninstall preserves the unrelated hook'
+    Assert-Equal 0 $restored.hooks.SessionStart.Count 'uninstall restores a previously empty managed event array'
+    Assert-Equal 'keep synthetic command # dash-hook text' $restored.hooks.PreToolUse[0].hooks[1].command `
+        'uninstall preserves unrelated commands containing the marker text'
     Assert-Equal 'keep synthetic custom hook' $restored.hooks.CustomEvent[0].hooks[0].command 'uninstall preserves unrelated custom event hook'
     Assert-True (Test-Path -LiteralPath $unrelatedFile) 'uninstall preserves unrelated files in install directory'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixture.InstallPath 'claude-hook.ps1'))) 'uninstall removes an unmodified managed helper'
