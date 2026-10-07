@@ -189,7 +189,8 @@ export function createTelegram(opts: TelegramOptions) {
   const sendingCards = new Set<number>(), submittingCards = new Set<number>();
   const alertMessages = new Set<AlertMessage>();
   const questionCards = new Map<string, QuestionCard>();
-  const sendingQuestionCards = new Set<string>();
+  // Re-pairing can replay this question ID while an older card generation is still sending.
+  const sendingQuestionCards = new Set<QuestionCard>();
   const editingAlerts = new Set<AlertMessage>();
   for (const saved of db.pendingAlertUpdates(now())) {
     try {
@@ -905,8 +906,8 @@ export function createTelegram(opts: TelegramOptions) {
     for (const message of db.telegramQuestionMessagesForQuestion(id)) clearTelegramQuestionMessage(message);
   };
   const sendQuestionCard = async (card: QuestionCard) => {
-    if (sendingQuestionCards.has(card.id)) return;
-    sendingQuestionCards.add(card.id);
+    if (sendingQuestionCards.has(card)) return;
+    sendingQuestionCards.add(card);
     try {
       const canSend = () => questionCardCanSend(card);
       if (!canSend()) { invalidateQuestionCard(card); return; }
@@ -934,7 +935,7 @@ export function createTelegram(opts: TelegramOptions) {
         db.rememberTelegramQuestionMessage(saved);
         card.messages.set(index, { sent: finalMessage, questionIndex: index });
       }
-    } finally { sendingQuestionCards.delete(card.id); }
+    } finally { sendingQuestionCards.delete(card); }
   };
   const createQuestionCard = (dto: SessionDTO) => {
     if (!replies || !isHarness(dto) || dto.status !== "needs_input" || dto.needsReason !== "question" ||
@@ -1004,12 +1005,13 @@ export function createTelegram(opts: TelegramOptions) {
     const destination = { chatId: questionMessage.chatId, threadId: questionMessage.threadId, name: null };
     const sentAt = await queueSend(destination,
       `<a href="tg://user?id=${userId}">Reply with your custom answer</a> for question ${index + 1}.`,
-      { force_reply: true, selective: true }, questionMessage.messageId);
-    if (!sentAt || !questionCardLive(card)) return;
+      { force_reply: true, selective: true }, questionMessage.messageId, false, () => questionCardLive(card));
+    if (!sentAt) return;
     const saved: TelegramQuestionMessage = {
       questionId: card.id, sessionKey: card.key, chatId: sentAt.chatId, threadId: sentAt.threadId,
       messageId: sentAt.messageId, questionIndex: index, createdAt: now(), prompt: true,
     };
+    if (!questionCardLive(card)) { clearTelegramQuestionMessage(saved); return; }
     db.rememberTelegramQuestionMessage(saved);
   };
   const handleCustomQuestionReply = async (message: TelegramMessage, record: TelegramQuestionMessage, text: string) => {

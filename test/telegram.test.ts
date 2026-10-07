@@ -31,6 +31,7 @@ class FakeBot {
   sendSequence: { status: number; body: unknown }[] = [];
   editSequence: { status: number; body: unknown }[] = [];
   beforeEdit?: () => Promise<void>;
+  beforeSend?: (body: Record<string, any>) => Promise<void>;
   nextCallbackAnswer: { status: number; body: unknown } | undefined;
   private updates: Record<string, any>[] = [];
   private pending: { resolve: (updates: Record<string, any>[]) => void; offset: number } | undefined;
@@ -60,6 +61,7 @@ class FakeBot {
       if (method === "sendMessage") {
         this.sent.push(body);
         this.sendTimes.push(this.now());
+        await this.beforeSend?.(body);
         const response = this.sendSequence.shift() ?? this.nextSend;
         if (response) {
           if (response === this.nextSend) this.nextSend = undefined;
@@ -2993,6 +2995,107 @@ describe("Telegram native question answers", () => {
     } });
   const questionMessages = (bot: FakeBot) =>
     bot.sent.filter(send => typeof send.text === "string" && send.text.includes("Claude / OMP question"));
+
+  test("deletes a custom-answer prompt sent after its question is cancelled", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, observeReplies: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "late-custom-prompt", [
+      { id: "route", question: "Which route?", options: [{ label: "Local" }, { label: "Remote" }] },
+    ]);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "question controls");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    const promptStarted = Promise.withResolvers<void>(), finishPrompt = Promise.withResolvers<void>();
+    let promptMessageId: number | undefined;
+    f.bot.beforeSend = async body => {
+      if (!body.reply_markup?.force_reply) return;
+      promptMessageId = f.bot.sent.indexOf(body) + 1;
+      f.bot.beforeSend = undefined;
+      promptStarted.resolve();
+      await finishPrompt.promise;
+    };
+
+    tapQuestion(f, "late-custom-prompt", id, 0, "c", card.messageId);
+    await promptStarted.promise;
+    expect(f.replies!.cancelQuestion(id, key, toolUseId)).toBe(true);
+    finishPrompt.resolve();
+    await apiSettled(() => promptMessageId !== undefined && f.bot.calls.some(call =>
+      call.method === "deleteMessage" && call.body.chat_id === String(chat) && call.body.message_id === promptMessageId),
+    "stale custom prompt deletion");
+
+    const prompt = f.bot.sent.find(send => send.reply_markup?.force_reply)!;
+    expect(prompt.chat_id).toBe(String(chat));
+    expect(prompt.reply_parameters.message_id).toBe(card.messageId);
+    expect(prompt.reply_markup).toEqual({ force_reply: true, selective: true });
+    expect(f.bot.calls.filter(call => call.method === "deleteMessage" && call.body.message_id === promptMessageId)).toHaveLength(1);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+  });
+
+  test("re-pairs an in-flight question send without letting the old generation own or clear the new card", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const nextOwner = owner + 1, nextChat = chat + 1;
+    const oldSendStarted = Promise.withResolvers<void>(), finishOldSend = Promise.withResolvers<void>();
+    const newSendStarted = Promise.withResolvers<void>(), finishNewSend = Promise.withResolvers<void>();
+    let oldCardBody: Record<string, any> | undefined;
+    f.bot.beforeSend = async body => {
+      const buttons = body.reply_markup?.inline_keyboard?.flat() ?? [];
+      if (!buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))) return;
+      if (body.chat_id === String(chat)) {
+        oldCardBody = body;
+        oldSendStarted.resolve();
+        await finishOldSend.promise;
+      } else if (body.chat_id === String(nextChat)) {
+        newSendStarted.resolve();
+        await finishNewSend.promise;
+      }
+    };
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "repaired-inflight-question", [
+      { id: "route", question: "Which route?", options: [{ label: "Local" }, { label: "Remote" }] },
+    ]);
+    const answer = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await oldSendStarted.promise;
+    const oldCardMessageId = f.bot.sent.indexOf(oldCardBody!) + 1;
+
+    f.telegram.unpair();
+    const pairingCode = f.telegram.info(true).pairingCode!;
+    f.bot.enqueue(message(`/pair ${pairingCode}`, {
+      from: { id: nextOwner, username: "synthetic_next_owner" }, chat: { id: nextChat, type: "private" },
+    }));
+    await eventually(() => f.db.getSetting("telegram.user_id") === String(nextOwner), "new owner pairing");
+    finishOldSend.resolve();
+    await newSendStarted.promise;
+    f.telegram.observe(f.db.getSession(key)!, "question");
+    finishNewSend.resolve();
+
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt && item.chatId === String(nextChat)) &&
+      f.bot.calls.some(call => call.method === "editMessageReplyMarkup" &&
+        call.body.chat_id === String(chat) && call.body.message_id === oldCardMessageId),
+    "new owner question controls and old keyboard cleanup");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt && item.chatId === String(nextChat))!;
+    const newOwnerCards = sendCalls(f.bot).filter(call => call.body.chat_id === String(nextChat) &&
+      call.body.reply_markup?.inline_keyboard?.flat().some((button: { callback_data?: string }) => button.callback_data?.startsWith(`q:${id}:`)));
+    expect(newOwnerCards).toHaveLength(1);
+    expect(f.bot.calls.find(call => call.method === "editMessageReplyMarkup" &&
+      call.body.chat_id === String(chat) && call.body.message_id === oldCardMessageId)?.body.reply_markup)
+      .toEqual({ inline_keyboard: [] });
+    expect(f.bot.calls.some(call => call.method === "editMessageReplyMarkup" &&
+      call.body.chat_id === String(nextChat) && call.body.message_id === card.messageId)).toBe(false);
+
+    const offset = Number(f.db.getSetting("telegram.offset") ?? "0");
+    f.bot.enqueueUpdate({ callback_query: {
+      id: "old-owner-tap", from: { id: owner },
+      message: { message_id: card.messageId, chat: { id: nextChat, type: "private" } }, data: `q:${id}:0:1`,
+    } });
+    await eventually(() => Number(f.db.getSetting("telegram.offset") ?? "0") > offset, "rejected old-owner callback");
+    expect(f.bot.count("answerCallbackQuery")).toBe(0);
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("pending");
+
+    f.bot.enqueueUpdate({ callback_query: {
+      id: "new-owner-tap", from: { id: nextOwner },
+      message: { message_id: card.messageId, chat: { id: nextChat, type: "private" } }, data: `q:${id}:0:1`,
+    } });
+    expect(await answer).toEqual({ status: 200, answers: { "Which route?": "Remote" } });
+    expect(f.db.getQuestionInvocation(id, key)).toMatchObject({ state: "consumed", source: "telegram", listener: "telegram" });
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).length === 0, "consumed question cleanup");
+  });
 
   test("redacts every displayed question field before pagination", async () => {
     const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });

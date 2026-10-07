@@ -61,6 +61,7 @@ export function parseArgs(argv: string[]): Args {
   if (!result.replyBase) result.replyBase = new URL(result.url).origin;
   if (!URL_RE.test(result.replyBase)) throw new Error("--reply-base must be an http(s) URL without shell-sensitive characters");
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(result.host)) throw new Error("--host must be a short alphanumeric host label");
+  if (!isAbsolute(result.replyScript)) throw new Error("--reply-script must be an absolute path");
   if (!isAbsolute(result.questionHelper)) throw new Error("--question-helper must be an absolute path");
   if (!isAbsolute(result.python3)) throw new Error("--python3 must be an absolute path");
   if (!Number.isSafeInteger(result.questionTimeoutMs) || result.questionTimeoutMs < 1000 || result.questionTimeoutMs > 600_000)
@@ -146,7 +147,12 @@ function hasQuestionHook(input: unknown): boolean {
     });
   });
 }
+async function isQuestionHelperSource(path: string): Promise<boolean> {
+  try { return await realpath(path) === await realpath(questionHelperSource); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+}
 async function installQuestionHelper(path: string): Promise<void> {
+  if (await isQuestionHelperSource(path)) return;
   await mkdir(dirname(path),{ recursive:true,mode:0o700 });
   let current: string | undefined;
   try { current = await readFile(path,"utf8"); }
@@ -164,6 +170,7 @@ async function installQuestionHelper(path: string): Promise<void> {
   }
 }
 async function removeQuestionHelper(path: string): Promise<void> {
+  if (await isQuestionHelperSource(path)) return;
   let current: string;
   try { current = await readFile(path,"utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }

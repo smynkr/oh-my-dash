@@ -70,6 +70,7 @@ $tooManyPayload['tool_input']['questions'] += @{ question = 'Seventeenth questio
 ) }
 $cases = @(
     @{ Name = 'exact multi-question labels and Unicode custom text'; Status = 200; Body = $json.Serialize(@{ answers = $validAnswers }); Allows = $true },
+    @{ Name = 'one-second wait delivers an answer after registration'; Status = 200; Body = $json.Serialize(@{ answers = $validAnswers }); Allows = $true; WaitSeconds = 1; RegisterDelay = 100 },
     @{ Name = 'empty multi-select answer is delivered'; Status = 200; Body = $json.Serialize(@{ answers = $emptyMultiAnswers }); Allows = $true; ExpectedAnswers = $emptyMultiAnswers },
     @{ Name = 'empty single-select answer falls back'; Status = 200; Body = $json.Serialize(@{ answers = $emptySingleAnswers }); Allows = $false },
     @{ Name = 'whitespace-only multi-select answer falls back'; Status = 200; Body = $json.Serialize(@{ answers = $blankMultiAnswers }); Allows = $false },
@@ -94,7 +95,7 @@ foreach ($case in $cases) {
     try {
         $registerStatus = if ($case.RegisterStatus) { [int]$case.RegisterStatus } else { 201 }
         $fixture.Server = Start-WindowsClaudeHttpFixture -Directory $fixture.Root -Plans @{
-            '/question/register' = @(@{ StatusCode = $registerStatus; Body = '{"questionId":"synthetic-question-identity","expiresAt":9999999999999}'; ContentType = 'application/json' })
+            '/question/register' = @(@{ StatusCode = $registerStatus; Body = '{"questionId":"synthetic-question-identity","expiresAt":9999999999999}'; ContentType = 'application/json'; DelayMilliseconds = $case.RegisterDelay })
             '/question/wait' = @(@{ StatusCode = $case.Status; Body = $case.Body; ContentType = 'application/json'; DelayMilliseconds = $case.Delay })
             '/question/cancel' = @(@{ StatusCode = 200; Body = '{"ok":true}'; ContentType = 'application/json' })
         }
@@ -124,8 +125,13 @@ foreach ($case in $cases) {
         $waitRequests = @($requests | Where-Object Path -eq '/question/wait')
         $cancelRequests = @($requests | Where-Object Path -eq '/question/cancel')
         if (-not $case.NoRequests) {
-            $expectedWaitCount = if ($case.NoWait) { 0 } else { 1 }
-            Assert-Question ($registrationRequests.Count -eq 1 -and $waitRequests.Count -eq $expectedWaitCount) ($case.Name + ': registration or wait count changed')
+            Assert-Question ($registrationRequests.Count -eq 1) ($case.Name + ': question was not registered once')
+            if ($case.NoWait) {
+                Assert-Question ($waitRequests.Count -eq 0) ($case.Name + ': rejected registration still polled')
+            }
+            elseif (-not $case.Delay) {
+                Assert-Question ($waitRequests.Count -eq 1) ($case.Name + ': answer response was not consumed once')
+            }
             $registration = $registrationRequests[0]
             $waitRequest = if ($case.NoWait) { $null } else { $waitRequests[0] }
             Assert-Question ($registration.Method -ceq 'POST' -and

@@ -160,7 +160,17 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     return dto;
   };
   const consumeQuestion = (id: string, key: string, toolUseId: string): QuestionWaitResult | undefined => {
-    const result = db.consumeQuestion(id,key,toolUseId,now());
+    const consumedAt = now();
+    const invocation = db.getQuestionInvocation(id,key,toolUseId);
+    if (invocation?.state === "answered" && invocation.expiresAt > consumedAt) {
+      const dto = db.getSession(key);
+      if (dto && dto.status !== "ended" &&
+          (dto.status !== "working" || !duplicateQuestionEventsAfterAnswer(key,id))) {
+        cancelQuestion(id,key,toolUseId,"session_moved");
+        return { status:409 };
+      }
+    }
+    const result = db.consumeQuestion(id,key,toolUseId,consumedAt);
     if (result.kind === "pending") return undefined;
     if (result.kind === "taken") return { status: 200, answers: result.answers };
     const status = result.kind === "ended" ? 410 : 409;
@@ -277,20 +287,46 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       return token.byteLength === 32 && token.toString("base64url") === id;
     } catch { return false; }
   };
+  const eventHasQuestionIdentity = (detail: unknown, id: string) => {
+    if (typeof detail !== "string") return false;
+    try {
+      const parsed: unknown = JSON.parse(detail);
+      return !!parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
+        "questionIdentity" in parsed && parsed.questionIdentity === id;
+    } catch { return false; }
+  };
+  // last_hook_event_ts advances for duplicate delivery too; only question events for this
+  // exact invocation are harmless after its answer. Any other event means the session moved.
+  const duplicateQuestionEventsAfterAnswer = (key: string, id: string) => {
+    const rows: unknown[] = db.sqlite.query(`SELECT kind,detail FROM events WHERE session_key=? AND id >= (
+      SELECT id FROM events WHERE session_key=? AND kind='question_answered' AND detail=? ORDER BY id LIMIT 1
+    ) ORDER BY id`).all(key,key,JSON.stringify({ questionIdentity:id }));
+    let sawAnswer = false;
+    for (const row of rows) {
+      if (!row || typeof row !== "object" || !("kind" in row) || !("detail" in row)) return false;
+      if (!sawAnswer) {
+        if (row.kind !== "question_answered" || !eventHasQuestionIdentity(row.detail,id)) return false;
+        sawAnswer = true;
+      } else if (row.kind !== "question" || !eventHasQuestionIdentity(row.detail,id)) return false;
+    }
+    return sawAnswer;
+  };
   const observeQuestions = (dto: SessionDTO) => {
     if (dto.status === "ended") {
       for (const cancelled of db.cancelQuestionsForSession(dto.key,now(),"session_ended"))
         finishQuestionWaiter(cancelled.id,{ status:410 });
       return;
     }
+    const observedAt = now();
     for (const invocation of db.questionInvocationsForSession(dto.key)) {
       const pending = invocation.state === "pending" && dto.status === "needs_input" &&
         dto.needsReason === "question" && dto.pendingQuestionId === invocation.id;
       const answered = invocation.state === "answered" && dto.status === "working" &&
-        invocation.answeredAt !== undefined && invocation.lastHookEventAt !== undefined &&
-        invocation.lastHookEventAt <= invocation.answeredAt;
+        invocation.answeredAt !== undefined && invocation.expiresAt > observedAt &&
+        duplicateQuestionEventsAfterAnswer(dto.key,invocation.id);
       if (pending || answered) continue;
-      db.cancelQuestion(invocation.id,dto.key,invocation.toolUseId,now(),"session_moved");
+      db.cancelQuestion(invocation.id,dto.key,invocation.toolUseId,observedAt,
+        invocation.expiresAt <= observedAt ? "expired" : "session_moved");
       finishQuestionWaiter(invocation.id,{ status:409 });
     }
   };

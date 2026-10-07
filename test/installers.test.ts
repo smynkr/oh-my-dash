@@ -84,6 +84,35 @@ describe("Claude hook installer", () => {
     expect(await Bun.file(helper).exists()).toBe(false);
   });
 
+  test("install, uninstall and opt-out preserve a checkout's own question helper", async () => {
+    const home = join(scratch, "home"), scripts = join(home, ".local/share/dash/scripts");
+    await mkdir(scripts, { recursive: true });
+    for (const name of ["install-claude-hooks.ts", "claude-question.py"]) {
+      await writeFile(join(scripts, name), await readFile(join(import.meta.dir, "../scripts", name)));
+    }
+    const source = join(scripts, "claude-question.py"), alias = join(scratch, "helper-alias.py");
+    await chmod(source, 0o644);
+    await symlink(source, alias);
+    const invoke = async (flags: string[]) => {
+      const proc = Bun.spawn([process.execPath, join(scripts, "install-claude-hooks.ts"),
+        "--settings", settings, ...flags], {
+        cwd: "/", env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      expect(await proc.exited).toBe(0);
+    };
+    await invoke(["--remote-questions"]);
+    await invoke(["--uninstall"]);
+    expect(await Bun.file(source).exists()).toBe(true);
+    expect((await lstat(source)).mode & 0o777).toBe(0o644);
+    expect(await settingsDoc()).toEqual(original);
+    await invoke(["--remote-questions", "--question-helper", alias]);
+    await invoke(["--question-helper", alias]);
+    expect(await realpath(alias)).toBe(await realpath(source));
+    expect((await lstat(source)).mode & 0o777).toBe(0o644);
+    const hooks = (await settingsDoc()).hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+    expect(hooks.PreToolUse.some(group => group.hooks.some(hook => hook.command.includes("# dash-hook-question")))).toBe(false);
+  });
+
   test("install preserves unrelated settings values and creates an original backup", async () => {
     await updateSettings(args());
     const installed = await settingsDoc();
@@ -129,6 +158,7 @@ describe("Claude hook installer", () => {
     expect(() => claudeArgs(["--reply-base", "https://hub.example/$(touch-nope)"])).toThrow();
     expect(() => claudeArgs(["--url", "https://hub.example/path;touch-nope"])).toThrow();
     expect(() => claudeArgs(["--host", "bad;touch-nope"])).toThrow();
+    expect(() => claudeArgs(["--reply-script", "scripts/reply-wait.sh"])).toThrow("--reply-script must be an absolute path");
   });
 
   test("keeps pre-existing empty event arrays", async () => {

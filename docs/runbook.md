@@ -154,11 +154,15 @@ bun run scripts/install-claude-hooks.ts --settings "$HOME/.claude/settings.json"
   --remote-questions --question-timeout-ms 120000 --no-reply
 ```
 
-`--no-reply` omits the separate stopped-turn reply waiter; remove that flag if you also use stopped-turn replies. It does not disable question answers. The installer copies the helper to `~/.local/share/dash/scripts/claude-question.py`; override this with `--question-helper` and select an absolute Python executable with `--python3`. Start a fresh Claude session after changing question hooks.
+`--no-reply` omits the separate stopped-turn reply waiter; remove that flag if you also use stopped-turn replies. It does not disable question answers. The installer uses `~/.local/share/dash/scripts/claude-question.py`, copying the helper there only when it is separate from the checkout source; override this with `--question-helper` and select an absolute Python executable with `--python3`. Custom `--reply-script` paths must also be absolute so stopped-turn replies work from any project directory. Start a fresh Claude session after changing question hooks.
 
 The dashboard preserves question order, option labels/descriptions and supplied recommendation markers. One single-select question submits when you tap an option; custom, multi-select and multi-question answers use **Send answer(s)**. In Telegram, numbered buttons match the displayed ordered labels. For one single-select question, tapping a number sends immediately; choosing **Custom** and replying to its prompt also sends immediately. Multi-select and multi-question requests keep **Send** on the last card so you can finish all selections first. Controls share one compact row where they fit and wrap for larger option sets. All questions must have valid answers; multi-select may contain no selections. Telegram display text is redacted; delivered selections retain the original option labels.
 
 Custom-answer prompts mention the paired owner so Telegram's selective reply interface targets that person. Send custom text as a reply to that prompt in the same chat/topic; an unrelated message does not answer the question.
+
+If a question expires or is invalidated while Telegram is sending a custom-answer prompt, the late prompt is deleted. Re-pairing during an in-flight question send replays the pending controls to the newly paired owner and clears the old controls.
+
+An accepted answer survives a duplicate hook event for the same question while the helper opens its wait. A new prompt, another tool, terminal completion, permission request, expiry or session end still invalidates it.
 
 Telegram's global/session mute settings also apply to question cards. `DASH_TELEGRAM_SNIPPET_CHARS=0` keeps only metadata alerts: no question text, option labels, recommendation labels or answer controls are sent. A positive value caps the redacted question body before pagination; if the cap hides an actual option row, the answer card is omitted. Repeated option text elsewhere does not make a hidden row answerable. Cards are also omitted if redaction consumes an option's layout boundary. The dashboard remains available; otherwise wait for the bounded hook to return to the terminal.
 
@@ -166,7 +170,7 @@ The wait is bounded to 1–600 seconds (default 120). Missing connectivity, inva
 
 For verification, use temporary settings/helper paths and an isolated hub with empty `HOME`/`DASH_DATA` (never backfill real transcripts into a smoke instance). Ask a signed-in interactive Claude to call `AskUserQuestion` with a recommended single-select option, a multi-select question and a third custom answer. Answer through the dashboard, then repeat through a dedicated test Telegram bot. Verify the exact labels and Unicode text in Claude's continuation and that old controls no longer work. Test terminal fallback with `--question-timeout-ms 1000`: leave the remote question unanswered, answer the resulting native dialog and verify the remote controls disappear. Do not run two pollers against the production bot.
 
-To disable only remote questions, rerun the installer with your same connection/settings paths **without** `--remote-questions`; it removes the managed question hook and helper while preserving other Dash integration. Use `--uninstall` to remove all Dash hooks instead. Backups are timestamped beside changed settings/helpers; restoring an old backup can overwrite intervening user changes, so prefer the managed uninstall.
+To disable only remote questions, rerun the installer with your same connection/settings paths **without** `--remote-questions`; it removes the managed question hook and installed helper copy while preserving other Dash integration. The checkout's source helper, including a path resolving to it through a symlink, is never overwritten or removed. Use `--uninstall` to remove all Dash hooks instead. Backups are timestamped beside changed settings/helpers; restoring an old backup can overwrite intervening user changes, so prefer the managed uninstall.
 
 ### Project rules and Telegram topics
 
@@ -257,6 +261,8 @@ The client sends lifecycle/response events and runs `claude agents --json` at lo
 For a hub with Claude question support, opt in separately with `-Questions` on the installer command. This installs a synchronous `PreToolUse` hook matched only to `AskUserQuestion`. `-QuestionWaitSeconds` bounds the remote-answer window (default 120 seconds, range 1–600). The helper supports multiple questions, single/multi-select labels, and custom Unicode answers; it preserves exact question-text keys, including keys differing only by case. Only a fresh answer for that invocation is returned through Claude's `updatedInput.answers` contract. Timeouts, malformed responses, disabled mode, or an unavailable/older hub return no hook decision and leave Claude's native question UI in control. Headless/SDK entrypoints never wait for hidden dashboard controls. Permission requests and approval tools are not intercepted.
 
 The Windows helper accepts 1–16 questions, matching the hub and macOS helper. A multi-select answer with no selections is delivered as an empty string. Empty single-select answers and whitespace-only answers fall back to the terminal.
+
+The one-second minimum window can receive an answer even when registration consumes part of that second. Polls include the remaining fractional second while the HTTP timeout stays bounded by the original deadline.
 
 Keep `-Questions` in subsequent install commands to retain the opt-in; reinstall without it to return entirely to terminal questions. `-NoReply` controls the ordinary Stop waiter independently. For native question boundary checks, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\windows-claude-question.test.ps1`. Then use a fresh signed-in interactive Claude session for a live multi-question answer and verify continuation; synthetic helper checks alone do not prove model-driven delivery.
 

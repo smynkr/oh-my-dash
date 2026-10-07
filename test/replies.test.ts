@@ -87,6 +87,86 @@ describe("Claude question broker", () => {
         answers: { "Which route?": { selectedOptions: [1] } } })).toMatchObject({ refused: true, reason: "stale_question" });
     } finally { f.close(); }
   });
+  test("an answered invocation survives its same-tool duplicate until /question/wait consumes the original answer", async () => {
+    const f = fixture();
+    f.clock.now = Date.now();
+    const toolUseId = "toolu_same_invocation";
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now,toolUseId),
+        id: firstId,toolUseId,timeoutMs:60_000 })).toMatchObject({ ok:true });
+      expect(f.broker.submitQuestion({ key:f.key,questionId:firstId,source:"web",actor:"web:loopback",
+        answers:{ "Which route?":{ selectedOptions:[0] } } })).toEqual({ ok:true });
+      const answeredAt = f.db.questionInvocationsForSession(f.key)[0]?.answeredAt ?? 0;
+
+      f.clock.now += 1;
+      const duplicate = f.db.applyEvent(questionEvent(f.clock.now,toolUseId));
+      expect(duplicate.status).toBe("working");
+      expect(f.db.questionInvocationsForSession(f.key)[0]?.lastHookEventAt).toBeGreaterThan(answeredAt);
+      f.broker.observe(duplicate);
+
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)).toMatchObject({ state:"answered" });
+      expect(await f.broker.waitQuestion(f.key,firstId,toolUseId,1000)).toEqual({
+        status:200,answers:{ "Which route?":"Keep (Recommended)" },
+      });
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)).toMatchObject({ state:"consumed" });
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)?.answers).toBeUndefined();
+    } finally { f.close(); }
+  });
+
+  test("wait rejects an answered invocation after an unobserved new prompt", async () => {
+    const f = fixture();
+    f.clock.now = Date.now();
+    const toolUseId = "toolu_unobserved_prompt";
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now,toolUseId),
+        id:firstId,toolUseId,timeoutMs:60_000 })).toMatchObject({ ok:true });
+      expect(f.broker.submitQuestion({ key:f.key,questionId:firstId,source:"web",actor:"web:loopback",
+        answers:{ "Which route?":{ selectedOptions:[0] } } })).toEqual({ ok:true });
+
+      f.clock.now += 1;
+      const moved = f.db.applyEvent({ host:"synthetic-host",harness:"claude",sessionId:"synthetic-session",
+        kind:"prompt",ts:f.clock.now,interactive:true,text:"synthetic next prompt" });
+      expect(moved.status).toBe("working");
+      expect(await f.broker.waitQuestion(f.key,firstId,toolUseId,1000)).toEqual({ status:409 });
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId))
+        .toMatchObject({ state:"cancelled",cancelReason:"session_moved" });
+    } finally { f.close(); }
+  });
+
+  test.each([
+    ["new prompt","prompt"],
+    ["distinct tool question","distinct-question"],
+    ["permission event","permission"],
+    ["terminal response","response"],
+    ["session end","session_end"],
+    ["expiry","expiry"],
+  ] as const)("%s cancels a previously answered invocation", async (_scenario,movement) => {
+    const f = fixture();
+    f.clock.now = Date.now();
+    const toolUseId = "toolu_answered";
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now,toolUseId),
+        id: firstId,toolUseId,timeoutMs:1000 })).toMatchObject({ ok:true });
+      expect(f.broker.submitQuestion({ key:f.key,questionId:firstId,source:"web",actor:"web:loopback",
+        answers:{ "Which route?":{ selectedOptions:[1] } } })).toEqual({ ok:true });
+
+      f.clock.now += movement === "expiry" ? 1000 : 1;
+      const moved = movement === "distinct-question"
+        ? f.db.applyEvent(questionEvent(f.clock.now,"toolu_distinct"))
+        : movement === "expiry"
+          ? f.db.applyEvent(questionEvent(f.clock.now,toolUseId))
+          : f.db.applyEvent({ host:"synthetic-host",harness:"claude",sessionId:"synthetic-session",
+            kind:movement,ts:f.clock.now,interactive:true,text:"synthetic movement" });
+      f.broker.observe(moved);
+
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)).toMatchObject({
+        state:"cancelled",
+        cancelReason:movement === "session_end" ? "session_ended" : movement === "expiry" ? "expired" : "session_moved",
+      });
+      expect(await f.broker.waitQuestion(f.key,firstId,toolUseId,1000))
+        .toEqual({ status:movement === "session_end" ? 410 : 409 });
+    } finally { f.close(); }
+  });
 });
 
 describe("reply broker", () => {

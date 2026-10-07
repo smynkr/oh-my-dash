@@ -67,7 +67,7 @@ try {
 
     while ($clock.ElapsedMilliseconds -lt $timeoutMs) {
         $remainingMs = $timeoutMs - [int]$clock.ElapsedMilliseconds
-        $pollSeconds = [Math]::Min(50, [Math]::Floor($remainingMs / 1000))
+        $pollSeconds = [Math]::Min(50, [Math]::Ceiling($remainingMs / 1000))
         if ($pollSeconds -lt 1) { break }
         $reply = Invoke-DashWindowsHttp -Uri ($waitUri + '&wait=' + $pollSeconds) -HostLabel $config.HostLabel -Headers $headers -Method GET -TimeoutMilliseconds $remainingMs
         if ($reply.StatusCode -eq 204) { continue }
