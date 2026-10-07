@@ -36,7 +36,7 @@ try {
     $original = $payload['tool_input']
     if ($original -isnot [System.Collections.IDictionary]) { exit 0 }
     $questions = $original['questions']
-    if ($questions -isnot [System.Array] -or $questions.Count -lt 1 -or $questions.Count -gt 4) { exit 0 }
+    if ($questions -isnot [System.Array] -or $questions.Count -lt 1 -or $questions.Count -gt 16) { exit 0 }
     $texts = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($question in $questions) {
         if ($question -isnot [System.Collections.IDictionary] -or
@@ -77,9 +77,12 @@ try {
         $answers = $result['answers']
         if ($answers -isnot [System.Collections.IDictionary] -or $answers.Count -ne $texts.Count) { break }
         $valid = $true
-        foreach ($text in $texts) {
+        foreach ($question in $questions) {
+            $text = [string]$question['question']
             if (-not $answers.ContainsKey($text) -or $answers[$text] -isnot [string] -or
-                [string]::IsNullOrWhiteSpace($answers[$text])) { $valid = $false; break }
+                ([string]::IsNullOrWhiteSpace($answers[$text]) -and
+                    ($answers[$text] -cne '' -or $question['multiSelect'] -isnot [bool] -or
+                        $question['multiSelect'] -ne $true))) { $valid = $false; break }
         }
         if (-not $valid) { break }
         $original['answers'] = $answers

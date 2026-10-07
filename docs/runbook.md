@@ -248,6 +248,8 @@ The client sends lifecycle/response events and runs `claude agents --json` at lo
 
 For a hub with Claude question support, opt in separately with `-Questions` on the installer command. This installs a synchronous `PreToolUse` hook matched only to `AskUserQuestion`. `-QuestionWaitSeconds` bounds the remote-answer window (default 120 seconds, range 1–600). The helper supports multiple questions, single/multi-select labels, and custom Unicode answers; it preserves exact question-text keys, including keys differing only by case. Only a fresh answer for that invocation is returned through Claude's `updatedInput.answers` contract. Timeouts, malformed responses, disabled mode, or an unavailable/older hub return no hook decision and leave Claude's native question UI in control. Headless/SDK entrypoints never wait for hidden dashboard controls. Permission requests and approval tools are not intercepted.
 
+The Windows helper accepts 1–16 questions, matching the hub and macOS helper. A multi-select answer with no selections is delivered as an empty string. Empty single-select answers and whitespace-only answers fall back to the terminal.
+
 Keep `-Questions` in subsequent install commands to retain the opt-in; reinstall without it to return entirely to terminal questions. `-NoReply` controls the ordinary Stop waiter independently. For native question boundary checks, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\windows-claude-question.test.ps1`. Then use a fresh signed-in interactive Claude session for a live multi-question answer and verify continuation; synthetic helper checks alone do not prove model-driven delivery.
 
 For a first opt-in install or upgrade, rerun the normal installer command with `-Questions`; for example:

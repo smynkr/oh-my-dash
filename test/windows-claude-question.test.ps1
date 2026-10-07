@@ -49,8 +49,32 @@ $payload = @{
 # semantics for answers whose question texts differ only by case.
 $validAnswers = $json.DeserializeObject('{"Shade?":"Blue (Recommended)","shade?":"Logging, Metrics","Notes?":""}')
 $validAnswers['Notes?'] = $custom
+$emptyMultiAnswers = $json.DeserializeObject($json.Serialize($validAnswers))
+$emptyMultiAnswers['shade?'] = ''
+$emptySingleAnswers = $json.DeserializeObject($json.Serialize($validAnswers))
+$emptySingleAnswers['Shade?'] = ''
+$blankMultiAnswers = $json.DeserializeObject($json.Serialize($validAnswers))
+$blankMultiAnswers['shade?'] = ' '
+$manyPayload = $json.DeserializeObject($json.Serialize($payload))
+$manyAnswers = $json.DeserializeObject($json.Serialize($validAnswers))
+for ($index = 3; $index -lt 16; $index++) {
+    $text = 'Additional question ' + $index + '?'
+    $manyPayload['tool_input']['questions'] += @{ question = $text; multiSelect = $false; options = @(
+        @{ label = 'Yes'; description = 'Include it' }, @{ label = 'No'; description = 'Exclude it' }
+    ) }
+    $manyAnswers[$text] = 'Yes'
+}
+$tooManyPayload = $json.DeserializeObject($json.Serialize($manyPayload))
+$tooManyPayload['tool_input']['questions'] += @{ question = 'Seventeenth question?'; options = @(
+    @{ label = 'Yes' }, @{ label = 'No' }
+) }
 $cases = @(
     @{ Name = 'exact multi-question labels and Unicode custom text'; Status = 200; Body = $json.Serialize(@{ answers = $validAnswers }); Allows = $true },
+    @{ Name = 'empty multi-select answer is delivered'; Status = 200; Body = $json.Serialize(@{ answers = $emptyMultiAnswers }); Allows = $true; ExpectedAnswers = $emptyMultiAnswers },
+    @{ Name = 'empty single-select answer falls back'; Status = 200; Body = $json.Serialize(@{ answers = $emptySingleAnswers }); Allows = $false },
+    @{ Name = 'whitespace-only multi-select answer falls back'; Status = 200; Body = $json.Serialize(@{ answers = $blankMultiAnswers }); Allows = $false },
+    @{ Name = 'sixteen questions retain every answer'; Status = 200; Body = $json.Serialize(@{ answers = $manyAnswers }); Allows = $true; Payload = $manyPayload; ExpectedAnswers = $manyAnswers },
+    @{ Name = 'seventeen questions never register'; Status = 200; Body = '{}'; Allows = $false; Payload = $tooManyPayload; NoRequests = $true },
     @{ Name = 'incomplete answer falls back'; Status = 200; Body = '{"answers":{"Shade?":"Blue"}}'; Allows = $false },
     @{ Name = 'non-text answer falls back'; Status = 200; Body = '{"answers":{"Shade?":true,"shade?":"Logging","Notes?":"None"}}'; Allows = $false },
     @{ Name = 'malformed answer falls back'; Status = 200; Body = '{'; Allows = $false },
@@ -85,7 +109,9 @@ foreach ($case in $cases) {
             ReplyWaitSeconds = 1; QuestionsEnabled = (-not $case.Disabled); QuestionWaitSeconds = $duration
         }
         [IO.File]::WriteAllText((Join-Path $fixture.InstallPath 'client-config.json'), ($config | ConvertTo-Json), $utf8)
-        $inputBody = $json.DeserializeObject($json.Serialize($payload))
+        $sourcePayload = if ($case.Payload) { $case.Payload } else { $payload }
+        $inputBody = $json.DeserializeObject($json.Serialize($sourcePayload))
+        $expectedQuestionCount = @($inputBody['tool_input']['questions']).Count
         if ($case.Tool) { $inputBody['tool_name'] = $case.Tool }
         if ($case.Event) { $inputBody['hook_event_name'] = $case.Event }
         $entrypoint = if ($case.Entrypoint) { $case.Entrypoint } else { 'cli' }
@@ -119,7 +145,7 @@ foreach ($case in $cases) {
             Assert-Question ($invocationBytes.Length -eq 32) 'Question invocation identity was not 32 random bytes'
             Assert-Question ($registerBody['timeoutMs'] -eq ($duration * 1000)) 'Question registration timeout changed'
             $sentQuestions = @($registerBody['questions'])
-            Assert-Question ($sentQuestions.Count -eq 3 -and
+            Assert-Question ($sentQuestions.Count -eq $expectedQuestionCount -and
                 $sentQuestions[0]['question'] -ceq 'Shade?' -and
                 $sentQuestions[1]['question'] -ceq 'shade?' -and
                 $sentQuestions[2]['question'] -ceq 'Notes?') 'Question text or ordering changed'
@@ -158,13 +184,14 @@ foreach ($case in $cases) {
             Assert-Question ($decision['permissionDecision'] -ceq 'allow' -and $decision['hookEventName'] -ceq 'PreToolUse') 'Answered question did not use the native hook contract'
             $updatedInput = $decision['updatedInput']
             $answers = $updatedInput['answers']
-            Assert-Question ($answers.Count -eq 3 -and
-                $answers['Shade?'] -ceq 'Blue (Recommended)' -and
-                $answers['shade?'] -ceq 'Logging, Metrics' -and
-                $answers['Notes?'] -ceq $custom) 'Question identity, multi-select or Unicode custom text changed'
+            $expectedAnswers = if ($case.ExpectedAnswers) { $case.ExpectedAnswers } else { $validAnswers }
+            Assert-Question ($answers.Count -eq $expectedAnswers.Count) 'Question answer count changed'
+            foreach ($text in $expectedAnswers.Keys) {
+                Assert-Question ($answers.ContainsKey($text) -and $answers[$text] -ceq $expectedAnswers[$text]) 'Question identity, multi-select or Unicode custom text changed'
+            }
             $updatedQuestions = @($updatedInput['questions'])
             Assert-Question ($updatedInput['metadata']['marker'] -ceq 'keep original input' -and
-                $updatedQuestions.Count -eq 3 -and
+                $updatedQuestions.Count -eq $expectedQuestionCount -and
                 $updatedQuestions[0]['question'] -ceq 'Shade?' -and
                 (@($updatedQuestions[0]['options'] | ForEach-Object { $_['label'] }) -join '|') -ceq 'Blue (Recommended)|Green' -and
                 $updatedQuestions[1]['multiSelect'] -eq $true) 'Hook did not preserve the original tool input'
