@@ -23,7 +23,8 @@ beforeEach(async () => {
 });
 afterEach(async () => { await rm(scratch, { recursive: true, force: true }); });
 
-const args = () => claudeArgs(["--settings", settings, "--url", "http://127.0.0.1:4777/ingest/claude", "--host", "synthetic-host"]);
+const args = () => claudeArgs(["--settings", settings, "--url", "http://127.0.0.1:4777/ingest/claude",
+  "--host", "synthetic-host", "--question-helper", join(scratch, "question helper.py")]);
 const settingsDoc = async () => JSON.parse(await readFile(settings, "utf8")) as typeof original;
 const backups = async () => (await readdir(scratch)).filter((file) => file.startsWith("settings.json.bak-dash-"));
 
@@ -46,6 +47,41 @@ describe("Claude hook installer", () => {
     expect(stop.hooks[0]).toEqual({ type: "command", async: true, asyncRewake: true, timeout: 21600, command: `/bin/sh '${args().replyScript}' 'http://127.0.0.1:4777' 'synthetic-host' # dash-hook` });
     expect(hooks.PreToolUse.at(-1)?.matcher).toBe("AskUserQuestion");
     expect(hooks.PostToolUse.at(-1)?.matcher).toBe("AskUserQuestion");
+    expect(hooks.PreToolUse.some(group => group.hooks.some(hook => hook.command.includes("# dash-hook-question")))).toBe(false);
+  });
+
+  test("remote question answering is opt-in and installs a safely quoted helper", async () => {
+    const helper = join(scratch, "question helper's.py");
+    const optIn = claudeArgs(["--settings", settings, "--url", "http://127.0.0.1:4777/ingest/claude",
+      "--host", "synthetic-host", "--remote-questions", "--question-helper", helper, "--python3", "/usr/bin/python3",
+      "--question-timeout-ms", "4000"]);
+    await updateSettings(optIn);
+    const hooks = (await settingsDoc()).hooks as Record<string, Array<{
+      matcher?: string; hooks: Array<{ type: string; command: string; timeout?: number }>;
+    }>>;
+    const questionHook = hooks.PreToolUse.find(group => group.matcher === "AskUserQuestion" &&
+      group.hooks.some(hook => hook.command.includes("# dash-hook-question")));
+    const quotedHelper = helper.replaceAll("'", "'\\''");
+    expect(questionHook?.hooks).toEqual([{
+      type: "command", timeout: 9,
+      command: `'/usr/bin/python3' '${quotedHelper}' --hub-url 'http://127.0.0.1:4777' --host 'synthetic-host' --timeout-ms '4000' # dash-hook-question`,
+    }]);
+    expect(await readFile(helper, "utf8")).toBe(await readFile(join(process.cwd(), "scripts/claude-question.py"), "utf8"));
+    expect((await lstat(helper)).mode & 0o777).toBe(0o700);
+    await updateSettings({ ...optIn, uninstall: true });
+    expect(await Bun.file(helper).exists()).toBe(false);
+    expect(await settingsDoc()).toEqual(original);
+  });
+
+  test("reinstalling without the opt-in removes the question hook and its owned helper", async () => {
+    const helper = join(scratch, "question helper.py");
+    await updateSettings(claudeArgs(["--settings", settings, "--url", "http://127.0.0.1:4777/ingest/claude",
+      "--host", "synthetic-host", "--remote-questions", "--question-helper", helper]));
+    await updateSettings(claudeArgs(["--settings", settings, "--url", "http://127.0.0.1:4777/ingest/claude",
+      "--host", "synthetic-host", "--question-helper", helper]));
+    const hooks = (await settingsDoc()).hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+    expect(hooks.PreToolUse.some(group => group.hooks.some(hook => hook.command.includes("# dash-hook-question")))).toBe(false);
+    expect(await Bun.file(helper).exists()).toBe(false);
   });
 
   test("install preserves unrelated settings values and creates an original backup", async () => {
@@ -88,21 +124,11 @@ describe("Claude hook installer", () => {
     expect(await settingsDoc()).toEqual(original);
   });
 
-  test("no-reply omits the rewake hook and uninstall removes both entries", async () => {
-    const noReply = claudeArgs(["--settings", settings, "--url", "http://127.0.0.1:4777/ingest/claude", "--host", "synthetic-host", "--no-reply"]);
-    const merged = mergeSettings(original, noReply);
-    const noReplyStop = (merged.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>).Stop;
-    expect(noReplyStop).toHaveLength(1);
-    expect(noReplyStop[0].hooks[0].command).toContain("X-Dash-Kind:");
-    await updateSettings(args());
-    await updateSettings({ ...args(), uninstall: true });
-    expect(await settingsDoc()).toEqual(original);
-  });
 
   test("reply options reject shell-sensitive values", () => {
     expect(() => claudeArgs(["--reply-base", "https://hub.example/$(touch-nope)"])).toThrow();
     expect(() => claudeArgs(["--url", "https://hub.example/path;touch-nope"])).toThrow();
-    expect(() => claudeArgs(["--reply-script", "/tmp/reply;touch-nope"])).toThrow();
+    expect(() => claudeArgs(["--host", "bad;touch-nope"])).toThrow();
   });
 
   test("keeps pre-existing empty event arrays", async () => {
@@ -119,7 +145,8 @@ describe("Claude hook installer", () => {
     await writeFile(target, `${JSON.stringify(original)}\n`);
     await chmod(target, 0o640);
     await symlink(target, link);
-    await updateSettings({ ...claudeArgs(["--settings", link, "--url", "http://127.0.0.1:4777/ingest/claude", "--host", "synthetic-host"]) });
+    await updateSettings({ ...claudeArgs(["--settings", link, "--url", "http://127.0.0.1:4777/ingest/claude",
+      "--host", "synthetic-host", "--question-helper", join(scratch, "symlink question helper.py")]) });
     expect((await lstat(link)).isSymbolicLink()).toBe(true);
     expect(await realpath(link)).toBe(target);
     expect((await lstat(target)).mode & 0o777).toBe(0o640);

@@ -2,8 +2,8 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, basename } from "node:path";
-import type { NormalizedEvent, Harness, PendingQuestion } from "./normalize.ts";
-import { clip, describePrompt, sessionKey, normalizeOmpQuestions } from "./normalize.ts";
+import type { AskQuestion, NormalizedEvent, Harness, PendingQuestion } from "./normalize.ts";
+import { clip, describePrompt, sessionKey, normalizeQuestions } from "./normalize.ts";
 import { reduceLiveness, reduceState, type SessionState, type Status } from "./state.ts";
 import type { BackfillSession } from "./backfill.ts";
 import type { LivenessRecord } from "./liveness.ts";
@@ -68,6 +68,17 @@ export type ReplyCommitResult =
   | { ok: false; reason: "stale"; reply: Reply }
   | { ok: false; reason: "not_found" | "not_leased" | "not_commit_capable" | "not_ready" };
 export type CancelReplyFilters = { key?: string; source?: ReplySource; id?: number; reason: string };
+export type QuestionInvocationState = "pending" | "answered" | "consumed" | "cancelled" | "expired";
+export interface QuestionInvocation {
+  id: string; sessionKey: string; toolUseId: string; questions: AskQuestion[]; state: QuestionInvocationState;
+  answers?: Record<string, string>; source?: ReplySource; actor?: string; listener?: ReplyAuditListener;
+  createdAt: number; expiresAt: number; answeredAt?: number; lastHookEventAt?: number; doneAt?: number; cancelReason?: string;
+}
+export type QuestionRegistration = { ok: true; dto: SessionDTO; replaced: string[] } | { ok: false; reason: "duplicate" | "session_ended" };
+export type TelegramQuestionMessage = {
+  questionId: string; sessionKey: string; chatId: string; threadId: number | null;
+  messageId: number; questionIndex: number; createdAt: number; prompt: boolean;
+};
 export type AlertKind = "alert" | "digest";
 export type ProjectRuleError = { index: number; error: "invalid regex" | "invalid JSON" | "invalid rules" };
 export type ProjectRulesState = { rules: ProjectRule[]; errors: ProjectRuleError[] };
@@ -141,6 +152,38 @@ export class DashDB {
       );
       CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
       CREATE INDEX IF NOT EXISTS events_session_kind ON events(session_key, kind);
+      CREATE TABLE IF NOT EXISTS question_invocations (
+        question_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL REFERENCES sessions(key) ON DELETE CASCADE,
+        tool_use_id TEXT NOT NULL,
+        questions_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending','answered','consumed','cancelled','expired')),
+        answers_json TEXT,
+        source TEXT,
+        actor TEXT,
+        listener TEXT,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        answered_at INTEGER,
+        done_at INTEGER,
+        cancel_reason TEXT,
+        UNIQUE(session_key,tool_use_id)
+      );
+      CREATE INDEX IF NOT EXISTS question_invocations_live ON question_invocations(session_key,state,expires_at);
+      CREATE TABLE IF NOT EXISTS tg_question_messages (
+        question_id TEXT NOT NULL,
+        session_key TEXT NOT NULL REFERENCES sessions(key) ON DELETE CASCADE,
+        chat_id TEXT NOT NULL,
+        thread_id INTEGER,
+        message_id INTEGER NOT NULL,
+        question_index INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        is_prompt INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(chat_id,message_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS tg_question_messages_card ON tg_question_messages(question_id,question_index)
+        WHERE is_prompt=0;
+      CREATE INDEX IF NOT EXISTS tg_question_messages_session ON tg_question_messages(session_key,created_at);
       CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS replies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,6 +277,7 @@ export class DashDB {
         if (!responseColumns.has(name)) this.sqlite.exec(`ALTER TABLE responses ADD COLUMN ${name} ${type}`);
       }
       this.sqlite.exec("CREATE INDEX IF NOT EXISTS responses_decision_pending ON responses(decision_state,id)");
+    this.invalidateInterruptedQuestions(Date.now());
     })();
     const alertColumns = new Set((this.sqlite.query("PRAGMA table_info(tg_alerts)").all() as { name: string }[]).map(c => c.name));
     if (!alertColumns.has("chat_id")) {
@@ -538,6 +582,37 @@ export class DashDB {
     const row = this.sqlite.query("SELECT session_key,kind FROM tg_alerts WHERE chat_id=? AND message_id=?").get(chatId,msgId) as Row | null;
     return row ? {sessionKey:s(row.session_key) ?? null,kind:row.kind as AlertKind} : undefined;
   }
+  rememberTelegramQuestionMessage(message: TelegramQuestionMessage): void {
+    this.sqlite.query("DELETE FROM tg_question_messages WHERE created_at<?").run(message.createdAt-7*86400_000);
+    this.sqlite.query(`INSERT OR REPLACE INTO tg_question_messages
+      (question_id,session_key,chat_id,thread_id,message_id,question_index,created_at,is_prompt) VALUES(?,?,?,?,?,?,?,?)`)
+      .run(message.questionId,message.sessionKey,message.chatId,message.threadId,message.messageId,message.questionIndex,message.createdAt,Number(message.prompt));
+  }
+  private telegramQuestionMessageRow(row: Row): TelegramQuestionMessage {
+    return {
+      questionId:String(row.question_id),sessionKey:String(row.session_key),chatId:String(row.chat_id),
+      threadId:row.thread_id == null ? null : n(row.thread_id),messageId:n(row.message_id),
+      questionIndex:n(row.question_index),createdAt:n(row.created_at),prompt:n(row.is_prompt) === 1,
+    };
+  }
+  telegramQuestionMessage(chatId: string, messageId: number): TelegramQuestionMessage | undefined {
+    const row = this.sqlite.query("SELECT * FROM tg_question_messages WHERE chat_id=? AND message_id=?")
+      .get(chatId,messageId) as Row | null;
+    return row ? this.telegramQuestionMessageRow(row) : undefined;
+  }
+  telegramQuestionMessages(sessionKey?: string): TelegramQuestionMessage[] {
+    const rows = (sessionKey === undefined
+      ? this.sqlite.query("SELECT * FROM tg_question_messages ORDER BY created_at").all()
+      : this.sqlite.query("SELECT * FROM tg_question_messages WHERE session_key=? ORDER BY created_at").all(sessionKey)) as Row[];
+    return rows.map(row => this.telegramQuestionMessageRow(row));
+  }
+  telegramQuestionMessagesForQuestion(questionId: string): TelegramQuestionMessage[] {
+    return (this.sqlite.query("SELECT * FROM tg_question_messages WHERE question_id=? ORDER BY question_index")
+      .all(questionId) as Row[]).map(row => this.telegramQuestionMessageRow(row));
+  }
+  deleteTelegramQuestionMessage(chatId: string,messageId: number): void {
+    this.sqlite.query("DELETE FROM tg_question_messages WHERE chat_id=? AND message_id=?").run(chatId,messageId);
+  }
   private cardRow(where: string, ...args: (string | number)[]): Row | null {
     return this.sqlite.query(`SELECT c.*,r.text,r.decisions_json FROM tg_cards c LEFT JOIN responses r ON r.id=c.response_id WHERE ${where}`).get(...args) as Row | null;
   }
@@ -623,7 +698,7 @@ export class DashDB {
     try {
       const parsed: unknown = JSON.parse(detail);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !("questions" in parsed)) return detail;
-      const questions = normalizeOmpQuestions(parsed.questions);
+      const questions = normalizeQuestions(parsed.questions);
       if (questions) return JSON.stringify(questions.map(question => question.options.map((option, index) => ({
         ...option,
         label: question.multi !== true && index === question.recommended && !option.label.endsWith(" (Recommended)")
@@ -666,6 +741,195 @@ export class DashDB {
     return !!this.sqlite.query("SELECT 1 FROM events WHERE session_key=? AND kind='question_answered' AND detail=? LIMIT 1")
       .get(key, JSON.stringify({ questionIdentity: identity }));
   }
+  private questionInvocation(row: Row | null): QuestionInvocation | undefined {
+    if (!row) return undefined;
+    let questions: AskQuestion[] | undefined;
+    try { questions = normalizeQuestions(JSON.parse(String(row.questions_json))); } catch {}
+    if (!questions) return undefined;
+    let answers: Record<string, string> | undefined;
+    if (typeof row.answers_json === "string") {
+      try {
+        const parsed: unknown = JSON.parse(row.answers_json);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
+            Object.values(parsed).every(answer => typeof answer === "string") &&
+            Object.keys(parsed).length === questions.length &&
+            questions.every(question => Object.hasOwn(parsed, question.question))) answers = parsed as Record<string, string>;
+      } catch {}
+    }
+    return {
+      id: String(row.question_id), sessionKey: String(row.session_key), toolUseId: String(row.tool_use_id),
+      questions, state: row.state as QuestionInvocationState, answers,
+      source: s(row.source) as ReplySource | undefined, actor: s(row.actor), listener: s(row.listener) as ReplyAuditListener | undefined,
+      createdAt: n(row.created_at), expiresAt: n(row.expires_at),
+      answeredAt: row.answered_at == null ? undefined : n(row.answered_at),
+      lastHookEventAt: row.session_last_hook_event_ts == null ? undefined : n(row.session_last_hook_event_ts),
+      doneAt: row.done_at == null ? undefined : n(row.done_at), cancelReason: s(row.cancel_reason),
+    };
+  }
+  getQuestionInvocation(id: string, key?: string, toolUseId?: string): QuestionInvocation | undefined {
+    const clauses = ["question_id=?"], args: unknown[] = [id];
+    if (key !== undefined) { clauses.push("session_key=?"); args.push(key); }
+    if (toolUseId !== undefined) { clauses.push("tool_use_id=?"); args.push(toolUseId); }
+    return this.questionInvocation(this.sqlite.query(`SELECT * FROM question_invocations WHERE ${clauses.join(" AND ")}`).get(...args) as Row | null);
+  }
+  questionForToolUse(key: string, toolUseId: string): QuestionInvocation | undefined {
+    return this.questionInvocation(this.sqlite.query("SELECT * FROM question_invocations WHERE session_key=? AND tool_use_id=?")
+      .get(key, toolUseId) as Row | null);
+  }
+  questionInvocationsForSession(key: string): QuestionInvocation[] {
+    return (this.sqlite.query(`SELECT q.*,s.last_hook_event_ts AS session_last_hook_event_ts
+      FROM question_invocations q JOIN sessions s ON s.key=q.session_key
+      WHERE q.session_key=? AND q.state IN ('pending','answered') ORDER BY q.created_at`)
+      .all(key) as Row[]).map(row => this.questionInvocation(row)!).filter((invocation): invocation is QuestionInvocation => !!invocation);
+  }
+  registerQuestion(event: NormalizedEvent, id: string, toolUseId: string, questions: AskQuestion[],
+    now: number, ttlMs: number): QuestionRegistration {
+    const key = sessionKey(event);
+    if (this.getSession(key)?.status === "ended") return { ok: false, reason: "session_ended" };
+    if (this.getQuestionInvocation(id) || this.questionForToolUse(key, toolUseId)) return { ok: false, reason: "duplicate" };
+    this.applyEvent({ ...event, questionIdentity: id, toolUseId, questionData: questions });
+    const replaced = this.sqlite.transaction(() => {
+      const old = this.sqlite.query("SELECT question_id FROM question_invocations WHERE session_key=? AND state IN ('pending','answered')")
+        .all(key) as Row[];
+      this.sqlite.query(`UPDATE question_invocations SET state='cancelled',answers_json=NULL,done_at=?,cancel_reason='replaced'
+        WHERE session_key=? AND state IN ('pending','answered')`).run(now,key);
+      this.sqlite.query(`INSERT INTO question_invocations
+        (question_id,session_key,tool_use_id,questions_json,state,created_at,expires_at)
+        VALUES(?,?,?,?,'pending',?,?)`).run(id,key,toolUseId,JSON.stringify(questions),now,now+ttlMs);
+      return old.map(row => String(row.question_id));
+    })();
+    return { ok: true, dto: this.getSession(key)!, replaced };
+  }
+  answerQuestion(id: string, key: string, toolUseId: string, answers: Record<string, string>,
+    source: ReplySource, actor: string, listener: ReplyAuditListener, now: number,
+    auditContext: PreparedAuditContext): "accepted" | "stale" | "expired" | "ended" {
+    const result = this.sqlite.transaction(() => {
+      const row = this.sqlite.query(`SELECT q.*,s.status AS session_status,s.pending_question_id
+        FROM question_invocations q JOIN sessions s ON s.key=q.session_key
+        WHERE q.question_id=? AND q.session_key=? AND q.tool_use_id=?`).get(id,key,toolUseId) as Row | null;
+      if (!row || row.state !== "pending" || String(row.pending_question_id) !== id) return "stale" as const;
+      if (row.session_status === "ended") return "ended" as const;
+      if (n(row.expires_at) <= now) return "expired" as const;
+      if (auditContext.sessionKey !== key || auditContext.source !== source || auditContext.actor !== actor ||
+          auditContext.listener !== listener) throw new Error("question audit context mismatch");
+      const changed = this.sqlite.query(`UPDATE question_invocations SET state='answered',answers_json=?,source=?,actor=?,listener=?,answered_at=?
+        WHERE question_id=? AND state='pending' AND expires_at>?`).run(JSON.stringify(answers),source,actor,listener,now,id,now).changes;
+      if (changed !== 1) return "stale" as const;
+      this.insertAuditRow(this.auditEntryFromContext(auditContext,null));
+      return "accepted" as const;
+    })();
+    if (result === "expired") this.finishQuestion(id,key,toolUseId,now,"expired","expired");
+    if (result === "accepted") {
+      const dto = this.getSession(key);
+      if (dto) this.applyEvent({ host:dto.host,harness:"claude",sessionId:dto.sessionId,kind:"question_answered",
+        ts:now,interactive:dto.interactive,cwd:dto.cwd,title:dto.title,transcriptPath:dto.transcriptPath,
+        sessionKind:dto.sessionKind,questionIdentity:id,toolUseId });
+    }
+    return result;
+  }
+  consumeQuestion(id: string, key: string, toolUseId: string, now: number):
+    { kind: "pending" | "stale" | "expired" | "ended" } | { kind: "taken"; answers: Record<string, string> } {
+    const invocation = this.getQuestionInvocation(id,key,toolUseId);
+    if (!invocation || invocation.state !== "pending" && invocation.state !== "answered") return { kind: "stale" };
+    if (invocation.expiresAt <= now) {
+      this.finishQuestion(id,key,toolUseId,now,"expired","expired");
+      return { kind: "expired" };
+    }
+    const dto = this.getSession(key);
+    if (!dto || dto.status === "ended") {
+      this.finishQuestion(id,key,toolUseId,now,"cancelled","session_ended");
+      return { kind: "ended" };
+    }
+    if (invocation.state === "pending") return { kind: "pending" };
+    if (!invocation.answers) {
+      this.finishQuestion(id,key,toolUseId,now,"cancelled","invalid_answers");
+      return { kind: "stale" };
+    }
+    const consumed = this.sqlite.transaction(() => this.sqlite.query(`UPDATE question_invocations
+      SET state='consumed',answers_json=NULL,done_at=?,cancel_reason=NULL
+      WHERE question_id=? AND session_key=? AND tool_use_id=? AND state='answered' AND expires_at>?`)
+      .run(now,id,key,toolUseId,now).changes === 1)();
+    return consumed ? { kind: "taken", answers: invocation.answers } : { kind: "stale" };
+  }
+  private finishQuestion(id: string, key: string, toolUseId: string, now: number,
+    state: "cancelled" | "expired", reason: string): SessionDTO | null {
+    const changed = this.sqlite.transaction(() => {
+      const row = this.sqlite.query(`SELECT q.*,s.status AS session_status,s.pending_question_id,s.last_hook_event_ts
+        FROM question_invocations q JOIN sessions s ON s.key=q.session_key
+        WHERE q.question_id=? AND q.session_key=? AND q.tool_use_id=?`).get(id,key,toolUseId) as Row | null;
+      if (!row || row.state !== "pending" && row.state !== "answered") return false;
+      const updated = this.sqlite.query(`UPDATE question_invocations SET state=?,answers_json=NULL,done_at=?,cancel_reason=?
+        WHERE question_id=? AND state IN ('pending','answered')`).run(state,now,reason,id).changes === 1;
+      if (!updated || row.session_status === "ended") return updated;
+      let fallbackText: string | undefined;
+      const answeredFallback = row.state === "answered" && row.session_status === "working" &&
+        n(row.last_hook_event_ts) <= n(row.answered_at);
+      if (answeredFallback) {
+        try {
+          const questions = normalizeQuestions(JSON.parse(String(row.questions_json)));
+          fallbackText = questions?.map(question => question.question).join("\n");
+        } catch {}
+      }
+      if (String(row.pending_question_id) === id) {
+        this.sqlite.query("UPDATE sessions SET last_activity=? WHERE key=?").run(now,key);
+      } else if (answeredFallback && fallbackText) {
+        this.sqlite.query(`UPDATE sessions SET status='needs_input',needs_reason='question',needs_text=?,pending_question_id=?,last_activity=?
+          WHERE key=? AND status='working' AND last_hook_event_ts<=?`)
+          .run(fallbackText,id,now,key,n(row.answered_at));
+      }
+      return true;
+    })();
+    return changed ? this.getSession(key) : null;
+  }
+  cancelQuestion(id: string, key: string, toolUseId: string, now: number, reason: string): SessionDTO | null {
+    return this.finishQuestion(id,key,toolUseId,now,"cancelled",reason);
+  }
+  expireQuestions(now: number): { id: string; key: string; toolUseId: string; dto: SessionDTO }[] {
+    const rows = this.sqlite.query("SELECT question_id,session_key,tool_use_id FROM question_invocations WHERE state IN ('pending','answered') AND expires_at<=?")
+      .all(now) as Row[];
+    const expired: { id: string; key: string; toolUseId: string; dto: SessionDTO }[] = [];
+    for (const row of rows) {
+      const id = String(row.question_id), key = String(row.session_key), toolUseId = String(row.tool_use_id);
+      const dto = this.finishQuestion(id,key,toolUseId,now,"expired","expired");
+      if (dto) expired.push({ id,key,toolUseId,dto });
+    }
+    return expired;
+  }
+  cancelQuestionsForSession(key: string, now: number, reason: string): { id: string; toolUseId: string; dto: SessionDTO }[] {
+    const rows = this.sqlite.query("SELECT question_id,tool_use_id FROM question_invocations WHERE session_key=? AND state IN ('pending','answered')")
+      .all(key) as Row[];
+    const cancelled: { id: string; toolUseId: string; dto: SessionDTO }[] = [];
+    for (const row of rows) {
+      const id = String(row.question_id), toolUseId = String(row.tool_use_id);
+      const dto = this.finishQuestion(id,key,toolUseId,now,"cancelled",reason);
+      if (dto) cancelled.push({ id,toolUseId,dto });
+    }
+    return cancelled;
+  }
+  pruneQuestions(now: number): number {
+    return this.sqlite.query("DELETE FROM question_invocations WHERE state IN ('consumed','cancelled','expired') AND done_at<?")
+      .run(now-7*86400_000).changes;
+  }
+  private invalidateInterruptedQuestions(now: number): void {
+    const rows = this.sqlite.query(`SELECT q.question_id,q.session_key,q.state,q.answered_at,q.questions_json,
+      s.status AS session_status,s.pending_question_id,s.last_hook_event_ts
+      FROM question_invocations q JOIN sessions s ON s.key=q.session_key WHERE q.state IN ('pending','answered')`).all() as Row[];
+    for (const row of rows) {
+      const id = String(row.question_id), key = String(row.session_key);
+      this.sqlite.query(`UPDATE question_invocations SET state='cancelled',answers_json=NULL,done_at=?,cancel_reason='hub_restarted'
+        WHERE question_id=? AND state IN ('pending','answered')`).run(now,id);
+      if (String(row.pending_question_id) === id) {
+        this.sqlite.query("UPDATE sessions SET last_activity=? WHERE key=?").run(now,key);
+      } else if (row.state === "answered" && row.session_status === "working" && n(row.last_hook_event_ts) <= n(row.answered_at)) {
+        let text: string | undefined;
+        try { text = normalizeQuestions(JSON.parse(String(row.questions_json)))?.map(question => question.question).join("\n"); } catch {}
+        if (text) this.sqlite.query(`UPDATE sessions SET status='needs_input',needs_reason='question',needs_text=?,pending_question_id=?,last_activity=?
+          WHERE key=? AND status='working' AND last_hook_event_ts<=?`).run(text,id,now,key,n(row.answered_at));
+      }
+    }
+    this.sqlite.query("DELETE FROM question_invocations WHERE state IN ('consumed','cancelled','expired') AND done_at<?")
+      .run(now-7*86400_000);
+  }
   private ensure(event: Pick<NormalizedEvent, "host" | "harness" | "sessionId" | "ts" | "cwd" | "title" | "interactive" | "transcriptPath" | "sessionKind">): Row {
     const key = sessionKey(event);
     this.sqlite.query(`INSERT OR IGNORE INTO sessions
@@ -675,34 +939,36 @@ export class DashDB {
   }
   applyEvent(event: NormalizedEvent): SessionDTO {
     const key = sessionKey(event);
+    const invocation = event.harness === "claude" && event.toolUseId ? this.questionForToolUse(key,event.toolUseId) : undefined;
+    const current = invocation ? { ...event, questionIdentity: invocation.id } : event;
     this.sqlite.transaction(() => {
-      const row = this.ensure(event);
+      const row = this.ensure(current);
       const previous: SessionState = {
         status: row.status as Status, needsReason: s(row.needs_reason), needsText: s(row.needs_text),
         pendingQuestionId: s(row.pending_question_id),
         lastPrompt: s(row.last_prompt), lastError: s(row.last_error), lastNotification: s(row.last_notification),
         backgroundPending: bool(row.background_pending), lastActivity: n(row.last_activity),
       };
-      const answeredBeforeStart = event.kind === "question" && event.questionIdentity
-        ? this.questionAnswered(key, event.questionIdentity)
+      const answeredBeforeStart = current.kind === "question" && current.questionIdentity
+        ? this.questionAnswered(key, current.questionIdentity)
         : false;
-      const next = answeredBeforeStart ? { ...previous, lastActivity: event.ts } : reduceState(previous, event);
-      const questionDetail = event.kind === "question" && event.questionData && event.questionIdentity
-        ? JSON.stringify({ questionIdentity: event.questionIdentity, questions: event.questionData })
-        : event.kind === "question_answered" && event.questionIdentity
-          ? JSON.stringify({ questionIdentity: event.questionIdentity })
-          : value(event.detail);
+      const next = answeredBeforeStart ? { ...previous, lastActivity: current.ts } : reduceState(previous, current);
+      const questionDetail = current.kind === "question" && current.questionData && current.questionIdentity
+        ? JSON.stringify({ questionIdentity: current.questionIdentity, questions: current.questionData })
+        : current.kind === "question_answered" && current.questionIdentity
+          ? JSON.stringify({ questionIdentity: current.questionIdentity })
+          : value(current.detail);
       this.sqlite.query(`UPDATE sessions SET cwd=COALESCE(?,cwd), title=COALESCE(?,title),
         interactive=?, transcript_path=COALESCE(?,transcript_path), session_kind=COALESCE(NULLIF(?,''),session_kind),
         status=?, needs_reason=?, needs_text=?, pending_question_id=?, last_prompt=?, last_error=?, last_notification=?,
         background_pending=?, last_activity=?, last_hook_event_ts=?, turn_seq=turn_seq+? WHERE key=?`).run(
-        value(event.cwd), value(event.title), event.interactive ? 1 : 0, value(event.transcriptPath), value(event.sessionKind),
+        value(current.cwd), value(current.title), current.interactive ? 1 : 0, value(current.transcriptPath), value(current.sessionKind),
         next.status, value(next.needsReason), value(next.needsText), value(next.pendingQuestionId), value(next.lastPrompt), value(next.lastError),
-        value(next.lastNotification), next.backgroundPending ? 1 : 0, next.lastActivity, event.ts,
-        event.kind === "response" || event.kind === "error" ? 1 : 0, key);
-      this.sqlite.query("INSERT INTO events(session_key,ts,kind,detail) VALUES(?,?,?,?)").run(key, event.ts, event.kind, questionDetail);
-      if (event.kind === "response" && event.text?.trim()) {
-        this.insertResponse(key, clip(event.text)!, describePrompt(next.lastPrompt), event.ts, "hook", n(row.turn_seq) + 1);
+        value(next.lastNotification), next.backgroundPending ? 1 : 0, next.lastActivity, current.ts,
+        current.kind === "response" || current.kind === "error" ? 1 : 0, key);
+      this.sqlite.query("INSERT INTO events(session_key,ts,kind,detail) VALUES(?,?,?,?)").run(key, current.ts, current.kind, questionDetail);
+      if (current.kind === "response" && current.text?.trim()) {
+        this.insertResponse(key, clip(current.text)!, describePrompt(next.lastPrompt), current.ts, "hook", n(row.turn_seq) + 1);
       }
       this.sqlite.query("DELETE FROM events WHERE ts<?").run(Date.now() - 7 * 86400_000);
     })();
@@ -795,16 +1061,22 @@ export class DashDB {
     })();
   }
   private pendingQuestion(row: Row): PendingQuestion | undefined {
-    if (row.harness !== "omp" || row.status !== "needs_input" || row.needs_reason !== "question") return undefined;
-    const id = s(row.pending_question_id);
-    if (!id || this.questionAnswered(String(row.key), id)) return undefined;
+    if (row.status !== "needs_input" || row.needs_reason !== "question") return undefined;
+    const id = s(row.pending_question_id), key = String(row.key);
+    if (!id) return undefined;
+    if (row.harness === "claude") {
+      const invocation = this.getQuestionInvocation(id,key);
+      return invocation?.state === "pending" && invocation.expiresAt > Date.now()
+        ? { id, questions: invocation.questions } : undefined;
+    }
+    if (row.harness !== "omp" || this.questionAnswered(key,id)) return undefined;
     const event = this.sqlite.query("SELECT detail FROM events WHERE session_key=? AND kind='question' ORDER BY id DESC LIMIT 1")
-      .get(String(row.key)) as Row | null;
+      .get(key) as Row | null;
     try {
       const detail: unknown = JSON.parse(String(event?.detail));
       if (!detail || typeof detail !== "object" || Array.isArray(detail) ||
           !("questionIdentity" in detail) || !("questions" in detail) || detail.questionIdentity !== id) return undefined;
-      const questions = normalizeOmpQuestions(detail.questions);
+      const questions = normalizeQuestions(detail.questions);
       return questions ? { id, questions } : undefined;
     } catch { return undefined; }
   }

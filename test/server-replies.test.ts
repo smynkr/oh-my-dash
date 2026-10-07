@@ -538,3 +538,71 @@ test("the dashboard recommendation quote is redacted like the Telegram line", as
   const session = (await (await fetch(baseUrl + "/api/sessions")).json() as any).sessions[0];
   expect(session.lastResponses[0].recommendation).toBe("I recommend the scoped one, token=[redacted] for the deploy.");
 });
+
+const questionId = Buffer.alloc(32, 7).toString("base64url");
+const questionPayload = {
+  sessionId: sid, toolUseId: "toolu_synthetic", invocationId: questionId, timeoutMs: 5000,
+  questions: [
+    { question: "Which route?", options: [{ label: "Keep (Recommended)" }, { label: "Replace" }] },
+    { question: "Which checks?", multiSelect: true, options: [{ label: "Build" }, { label: "Review" }] },
+  ],
+};
+const questionHeaders = { "Content-Type": "application/json", "X-Dash-Entrypoint": "cli" };
+const questionQuery = new URLSearchParams({ session: sid, toolUseId: questionPayload.toolUseId, question: questionId });
+
+test("native question answers are complete, exact, single-use and audited", async () => {
+  setup(true);
+  const registration = await fetch(base + "/question/register", {
+    method: "POST", headers: questionHeaders, body: JSON.stringify(questionPayload),
+  });
+  expect(registration.status).toBe(201);
+  const key = `${localHost()}|claude|${sid}`;
+  const submitUrl = base + `/api/sessions/${encodeURIComponent(key)}/question`;
+  const incomplete = await apiJson(submitUrl, { questionId, answers: { "Which route?": { selectedOptions: [0] } } });
+  expect(incomplete.status).toBe(400);
+  const answer = { questionId, answers: {
+    "Which route?": { selectedOptions: [], customInput: "Route 雪 & café" },
+    "Which checks?": { selectedOptions: [0, 1] },
+  } };
+  expect((await apiJson(submitUrl, answer)).status).toBe(200);
+  expect((await apiJson(submitUrl, answer)).status).toBe(409);
+  const waitUrl = base + "/question/wait?" + questionQuery + "&wait=1";
+  await expectExactJson(await fetch(waitUrl, { headers: questionHeaders }), 200, {
+    answers: { "Which route?": "Route 雪 & café", "Which checks?": "Build, Review" },
+  });
+  expect((await fetch(waitUrl, { headers: questionHeaders })).status).toBe(409);
+  expect(app!.db.getSession(key)?.pendingQuestion).toBeUndefined();
+  expect(app!.db.sqlite.query("SELECT source,actor,listener FROM reply_audit WHERE text_redacted=?")
+    .all(JSON.stringify({ "Which route?": "Route 雪 & café", "Which checks?": "Build, Review" })))
+    .toEqual([{ source: "web", actor: "web:loopback", listener: "loopback" }]);
+});
+
+test("native question registration, wait and cancel enforce peer and invocation identity", async () => {
+  setup(true, { tailnet: true, peers: "peer-a=192.0.2.10,peer-b=192.0.2.11" });
+  const first = { ...questionHeaders, ...remoteHeaders, "X-Dash-Host": "peer-a" };
+  const second = { ...first, "X-Forwarded-For": "192.0.2.11", "X-Dash-Host": "peer-b" };
+  const register = (headers: Record<string, string>) => fetch(tailnetBase + "/question/register", {
+    method: "POST", headers, body: JSON.stringify(questionPayload),
+  });
+  expect((await register({ ...first, "X-Dash-Entrypoint": "sdk" })).status).toBe(403);
+  expect((await register({ ...first, "X-Dash-Host": "peer-b" })).status).toBe(403);
+  expect((await register(first)).status).toBe(201);
+  expect((await register(first)).status).toBe(409);
+  expect((await fetch(tailnetBase + "/question/wait?" + questionQuery + "&wait=1", { headers: second })).status).toBe(409);
+  const cancelUrl = tailnetBase + "/question/cancel?";
+  expect((await fetch(cancelUrl + questionQuery, { method: "DELETE", headers: second })).status).toBe(409);
+  const wrong = new URLSearchParams(questionQuery); wrong.set("toolUseId", "toolu_wrong");
+  expect((await fetch(cancelUrl + wrong, { method: "DELETE", headers: first })).status).toBe(409);
+  expect(app!.db.getQuestionInvocation(questionId, `peer-a|claude|${sid}`, questionPayload.toolUseId)?.state).toBe("pending");
+  expect((await fetch(cancelUrl + questionQuery, { method: "DELETE", headers: first })).status).toBe(200);
+  expect(app!.db.getSession(`peer-a|claude|${sid}`)?.pendingQuestion).toBeUndefined();
+});
+
+test("question mode disabled cannot register or release answers", async () => {
+  setup(false);
+  expect((await fetch(base + "/question/register", {
+    method: "POST", headers: questionHeaders, body: JSON.stringify(questionPayload),
+  })).status).toBe(404);
+  expect((await fetch(base + "/question/wait?" + questionQuery + "&wait=1", { headers: questionHeaders })).status).toBe(404);
+  expect(app!.db.getSession(`${localHost()}|claude|${sid}`)).toBeNull();
+});

@@ -31,6 +31,64 @@ function fixture(harness: "claude" | "omp" = "claude", status: SessionDTO["statu
 }
 const waiter = "waiteraaaaaaaaaa";
 
+describe("Claude question broker", () => {
+  const firstId = Buffer.alloc(32, 1).toString("base64url");
+  const secondId = Buffer.alloc(32, 2).toString("base64url");
+  const questionEvent = (ts: number, toolUseId: string): NormalizedEvent => ({
+    host: "synthetic-host", harness: "claude", sessionId: "synthetic-session",
+    kind: "question", ts, interactive: true, toolUseId,
+    questionData: [{ id: "Which route?", question: "Which route?",
+      options: [{ label: "Keep (Recommended)" }, { label: "Replace" }] }],
+  });
+
+  test("wrong-identity cancellation cannot dislodge the active question waiter", async () => {
+    const f = fixture();
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_current"),
+        id: firstId, toolUseId: "toolu_current", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      const waiting = f.broker.waitQuestion(f.key, firstId, "toolu_current", 1000);
+      expect(f.broker.cancelQuestion(firstId, f.key, "toolu_wrong")).toBe(false);
+      expect(f.broker.submitQuestion({ key: f.key, questionId: firstId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [0] } } })).toEqual({ ok: true });
+      expect(await waiting).toEqual({ status: 200, answers: { "Which route?": "Keep (Recommended)" } });
+      expect(await f.broker.waitQuestion(f.key, firstId, "toolu_current", 1000)).toEqual({ status: 409 });
+    } finally { f.close(); }
+  });
+
+  test("replacement invalidates old controls without losing a new custom Unicode answer", async () => {
+    const f = fixture();
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_old"),
+        id: firstId, toolUseId: "toolu_old", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      const oldWait = f.broker.waitQuestion(f.key, firstId, "toolu_old", 1000);
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_new"),
+        id: secondId, toolUseId: "toolu_new", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      expect(await oldWait).toEqual({ status: 409 });
+      expect(f.broker.submitQuestion({ key: f.key, questionId: firstId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [0] } } })).toMatchObject({ refused: true, reason: "stale_question" });
+      expect(f.broker.submitQuestion({ key: f.key, questionId: secondId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [], customInput: "Route 雪 & café" } } })).toEqual({ ok: true });
+      expect(await f.broker.waitQuestion(f.key, secondId, "toolu_new", 1000)).toEqual({
+        status: 200, answers: { "Which route?": "Route 雪 & café" },
+      });
+    } finally { f.close(); }
+  });
+
+  test("expiry rejects the waiting client and prevents an answer from reviving the invocation", async () => {
+    const f = fixture();
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_expiring"),
+        id: firstId, toolUseId: "toolu_expiring", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      const waiting = f.broker.waitQuestion(f.key, firstId, "toolu_expiring", 1000);
+      f.clock.now += 1000;
+      f.sweep();
+      expect(await waiting).toEqual({ status: 409 });
+      expect(f.broker.submitQuestion({ key: f.key, questionId: firstId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [1] } } })).toMatchObject({ refused: true, reason: "stale_question" });
+    } finally { f.close(); }
+  });
+});
+
 describe("reply broker", () => {
   test("validates every refusal without queueing and records attributable refusals once", () => {
     const badShapes = [
