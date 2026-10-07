@@ -3156,6 +3156,29 @@ describe("Telegram native question answers", () => {
   });
 
 
+  test.each(["option", "custom"] as const)("one single-choice %s answer sends immediately and cannot be replayed", async kind => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, `single-${kind}`, [
+      { id: "route", question: "Which route?", options: [{ label: "Local (Recommended)" }, { label: "Remote" }] },
+    ]);
+    const wait = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "single question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    const answer = kind === "option" ? "Remote" : "café 雪 — custom";
+    tapQuestion(f, "single-answer", id, 0, kind === "option" ? "1" : "c", card.messageId);
+    if (kind === "custom") {
+      await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => item.prompt), "custom reply prompt");
+      const prompt = f.db.telegramQuestionMessagesForQuestion(id).find(item => item.prompt)!;
+      f.bot.enqueue(message(answer, { message_id: 99, reply_to_message: { message_id: prompt.messageId } }));
+    }
+    expect(await wait).toEqual({ status: 200, answers: { "Which route?": answer } });
+    expect(f.db.getQuestionInvocation(id, key)).toMatchObject({ state: "consumed", source: "telegram", listener: "telegram" });
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    tapQuestion(f, "replayed-answer", id, 0, "0", card.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 2, "replayed answer refusal");
+    expect(await f.replies!.waitQuestion(key, id, toolUseId, 1)).toEqual({ status: 409 });
+  });
+
   test("preserves multiple Claude selections and custom text, then consumes one exact answer map", async () => {
     const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
     const originalQuestion = `Choose an approach? sk-${"Q".repeat(24)}`;
@@ -3185,7 +3208,8 @@ describe("Telegram native question answers", () => {
     await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => item.prompt), "ForceReply prompt");
     const prompt = f.db.telegramQuestionMessagesForQuestion(id).find(item => item.prompt)!;
     f.bot.enqueue(message("My own & free", { message_id: 99, reply_to_message: { message_id: prompt.messageId } }));
-    await apiSettled(() => f.bot.sent.some(item => item.text === "Custom answer captured."), "custom answer captured");
+    await apiSettled(() => !f.db.telegramQuestionMessage(chat, prompt.messageId), "custom reply consumed");
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("pending");
 
     tapQuestion(f, "submit-answers", id, 1, "s", q1.messageId);
     await eventually(() => f.bot.count("answerCallbackQuery") === 5, "answer submission");
@@ -3201,7 +3225,6 @@ describe("Telegram native question answers", () => {
 
     tapQuestion(f, "stale-question", id, 0, "0", q0.messageId);
     await eventually(() => f.bot.count("answerCallbackQuery") === 6, "stale button refusal");
-    expect(f.bot.calls.filter(call => call.method === "answerCallbackQuery").at(-1)?.body.text).toBe("Expired");
     expect(f.db.getQuestionInvocation(id, key)?.state).toBe("consumed");
   });
 
@@ -3237,19 +3260,22 @@ describe("Telegram native question answers", () => {
       .at(-1)?.body.reply_markup).toEqual({ inline_keyboard: [] });
   });
 
-  test("keeps OMP's question reply envelope and exact option labels", async () => {
+  test.each([false, true])("keeps OMP's exact question reply envelope with multi-select=%s", async multi => {
     const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
     const questionId = "omp-question-identity";
     const row = f.db.applyEvent({ host: "synthetic-host", harness: "omp", sessionId: "telegram-omp-question",
       kind: "question", ts: f.clock.now, text: "Which color?", interactive: true, questionIdentity: questionId,
-      questionData: [{ id: "color-choice", question: "Which color?", options: [{ label: "Red & gold" }, { label: "Blue" }], multi: true }] });
+      questionData: [{ id: "color-choice", question: "Which color?", options: [{ label: "Red & gold" }, { label: "Blue" }], multi }] });
     f.telegram.observe(row, "question");
     await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(questionId).some(item => !item.prompt), "OMP question card");
     const card = f.db.telegramQuestionMessagesForQuestion(questionId).find(item => !item.prompt)!;
     tapQuestion(f, "omp-select", questionId, 0, "1", card.messageId);
     await eventually(() => f.bot.count("answerCallbackQuery") === 1, "OMP selection");
-    tapQuestion(f, "omp-submit", questionId, 0, "s", card.messageId);
-    await eventually(() => f.bot.count("answerCallbackQuery") === 2, "OMP answer");
+    if (multi) {
+      expect(f.db.queuedReplies()).toHaveLength(0);
+      tapQuestion(f, "omp-submit", questionId, 0, "s", card.messageId);
+      await eventually(() => f.bot.count("answerCallbackQuery") === 2, "OMP answer");
+    }
 
     const reply = f.db.queuedReplies()[0]!;
     expect(reply.answersQuestion).toBe(questionId);

@@ -820,19 +820,23 @@ export function createTelegram(opts: TelegramOptions) {
     const visibleEnd = text === clean ? text.length : text.length - 1;
     return lastLabelEnd <= visibleEnd ? text : undefined;
   };
+  const questionSendsOnPick = (card: QuestionCard) =>
+    card.questions.length === 1 && card.questions[0]!.multi !== true;
+  const appendQuestionButton = (rows: { text: string; callback_data: string }[][], text: string, data: string) => {
+    let row = rows.at(-1);
+    if (!row || row.length === 5) { row = []; rows.push(row); }
+    row.push({ text, callback_data: data });
+  };
   const questionKeyboard = (card: QuestionCard, index: number) => {
     const question = card.questions[index]!, pick = card.picks[index]!;
     const rows: { text: string; callback_data: string }[][] = [];
-    for (let option = 0; option < question.options.length; option += 2) {
-      rows.push([option, option + 1].filter(value => value < question.options.length).map(value => ({
-        text: `${pick.selected.has(value) ? "✓ " : ""}${value + 1}`,
-        callback_data: `q:${card.id}:${index}:${value}`,
-      })));
-    }
-    rows.push([{ text: `${pick.useCustom ? "✓ " : ""}✍️ Custom answer`, callback_data: `q:${card.id}:${index}:c` }]);
-    if (index === card.questions.length - 1) rows.push([{ text: "✅ Submit answers", callback_data: `q:${card.id}:${index}:s` }]);
+    for (let option = 0; option < question.options.length; option++)
+      appendQuestionButton(rows, `${pick.selected.has(option) ? "✓ " : ""}${option + 1}`, `q:${card.id}:${index}:${option}`);
+    appendQuestionButton(rows, `${pick.useCustom ? "✓ " : ""}Custom`, `q:${card.id}:${index}:c`);
+    if (!questionSendsOnPick(card) && index === card.questions.length - 1)
+      appendQuestionButton(rows, "Send", `q:${card.id}:${index}:s`);
     if (db.getSession(card.key)?.harness === "claude")
-      rows.push([{ text: "✖ Use terminal instead", callback_data: `q:${card.id}:${index}:x` }]);
+      appendQuestionButton(rows, "Terminal", `q:${card.id}:${index}:x`);
     return { inline_keyboard: rows };
   };
   const questionDestination = (message: TelegramQuestionMessage): Destination => {
@@ -987,6 +991,11 @@ export function createTelegram(opts: TelegramOptions) {
     return replies.submit({ key: card.key, text, source: "telegram", actor: `telegram:${userId}`,
       listener: "telegram", answersQuestion: card.id });
   };
+  const finishQuestionCard = (card: QuestionCard) => {
+    const submitted = submitQuestionCard(card);
+    if (!("refused" in submitted) || submitted.reason === "stale_question") invalidateQuestionCard(card);
+    return submitted;
+  };
   const questionRefusal = (reason: string) => reason === "disabled" ? "Replies are off on the hub." :
     reason === "invalid_question" ? "Choose an answer for every question, then submit." :
       "This question has expired or was replaced.";
@@ -1019,8 +1028,14 @@ export function createTelegram(opts: TelegramOptions) {
     }
     pick.customInput = text;
     clearTelegramQuestionMessage(record);
-    void updateQuestionKeyboard(card, record.questionIndex);
-    await retrySendAt(destination, "Custom answer captured.", undefined, message.message_id);
+    if (questionSendsOnPick(card)) {
+      const submitted = finishQuestionCard(card);
+      await retrySendAt(destination, "refused" in submitted ? questionRefusal(submitted.reason) :
+        `Answer sent to ${dtoHarness(card) === "claude" ? "Claude" : "OMP"}.`, undefined, message.message_id);
+    } else {
+      void updateQuestionKeyboard(card, record.questionIndex);
+      await retrySendAt(destination, "Custom answer captured.", undefined, message.message_id);
+    }
     return true;
   };
   const updateQuestionKeyboard = (card: QuestionCard, index: number) => {
@@ -1071,14 +1086,12 @@ export function createTelegram(opts: TelegramOptions) {
     }
     if (action === "s") {
       if (index !== card.questions.length - 1) { await answerCallback(callback, "Submit from the last question."); return; }
-      const submitted = submitQuestionCard(card);
+      const submitted = finishQuestionCard(card);
       if ("refused" in submitted) {
-        if (submitted.reason === "stale_question") invalidateQuestionCard(card);
         await answerCallback(callback, questionRefusal(submitted.reason));
         return;
       }
       const harness = dtoHarness(card);
-      invalidateQuestionCard(card);
       await answerCallback(callback, harness === "claude" ? "Answers sent to Claude." : "Answers sent to OMP.");
       return;
     }
@@ -1090,6 +1103,12 @@ export function createTelegram(opts: TelegramOptions) {
       if (pick.selected.has(option)) pick.selected.delete(option); else pick.selected.add(option);
     } else {
       pick.selected.clear(); pick.selected.add(option); pick.useCustom = false; pick.customInput = undefined;
+    }
+    if (questionSendsOnPick(card)) {
+      const submitted = finishQuestionCard(card);
+      await answerCallback(callback, "refused" in submitted ? questionRefusal(submitted.reason) :
+        `Answer sent to ${dtoHarness(card) === "claude" ? "Claude" : "OMP"}.`);
+      return;
     }
     void updateQuestionKeyboard(card, index);
     await answerCallback(callback, `${pick.selected.has(option) ? "Selected" : "Cleared"} option ${option + 1}.`);
