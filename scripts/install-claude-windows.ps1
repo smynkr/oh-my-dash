@@ -379,11 +379,11 @@ try {
             return
         }
         $settings = Get-SettingsOutput -Path $SettingsPath -Install:$false -Groups @()
+        Remove-DashLivenessTask -Path $livenessPath -TaskName $TaskName
         if ($settings.Changed) {
             $backup = Write-ManagedBytes -Path $SettingsPath -Bytes $settings.Bytes
             if ($backup) { Write-Output "Settings backup: $backup" }
         }
-        Remove-DashLivenessTask -Path $livenessPath -TaskName $TaskName
         Remove-InstalledHelpers $InstallPath
         Write-Output 'Uninstalled Windows Claude hooks and liveness task.'
         return
@@ -438,11 +438,11 @@ try {
     }
     $configBackup = Write-ManagedBytes -Path $configPath -Bytes $configBytes
     if ($configBackup) { Write-Output "Client config backup: $configBackup" }
-    Register-DashLivenessTask -Path $livenessPath -TaskName $TaskName
     if ($settings.Changed) {
         $settingsBackup = Write-ManagedBytes -Path $SettingsPath -Bytes $settings.Bytes
         if ($settingsBackup) { Write-Output "Settings backup: $settingsBackup" }
     }
+    Register-DashLivenessTask -Path $livenessPath -TaskName $TaskName
     Write-Output "Installed Windows Claude hooks and per-user liveness task '$TaskName'."
 }
 catch {

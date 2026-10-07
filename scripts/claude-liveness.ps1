@@ -7,6 +7,7 @@ try {
     $claudePath = [string]$config.ClaudePath
     if ([string]::IsNullOrWhiteSpace($claudePath) -or -not [System.IO.Path]::IsPathRooted($claudePath)) { exit 0 }
 
+    [System.Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $global:LASTEXITCODE = 0
     $rawOutput = (& $claudePath agents --json 2>$null | Out-String)
     if ($LASTEXITCODE -ne 0) { exit 0 }

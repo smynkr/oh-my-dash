@@ -38,6 +38,26 @@ function Read-DashWindowsStdin {
     }
 }
 
+function Wait-DashWindowsHttpTask {
+    param(
+        [System.Threading.Tasks.Task]$Task,
+        [System.Diagnostics.Stopwatch]$Clock,
+        [int]$TimeoutMilliseconds,
+        [System.Net.HttpWebRequest]$Request
+    )
+    $remaining = $TimeoutMilliseconds - [int][Math]::Ceiling($Clock.Elapsed.TotalMilliseconds)
+    if ($remaining -gt 0) {
+        try {
+            if ($Task.Wait($remaining)) { return $Task.GetAwaiter().GetResult() }
+        }
+        catch [System.AggregateException] {
+            throw $_.Exception.GetBaseException()
+        }
+    }
+    $Request.Abort()
+    throw [System.TimeoutException]::new('The HTTP exchange exceeded its total deadline.')
+}
+
 function Invoke-DashWindowsHttp {
     [CmdletBinding()]
     param(
@@ -50,6 +70,7 @@ function Invoke-DashWindowsHttp {
         [switch]$HasBody
     )
 
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $request = [System.Net.HttpWebRequest]::Create($Uri)
     $request.Method = $Method
     $request.Timeout = $TimeoutMilliseconds
@@ -68,9 +89,9 @@ function Invoke-DashWindowsHttp {
         $request.ContentType = 'application/json'
         $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Body)
         $request.ContentLength = $bytes.Length
-        $requestStream = $request.GetRequestStream()
+        $requestStream = Wait-DashWindowsHttpTask ($request.GetRequestStreamAsync()) $clock $TimeoutMilliseconds $request
         try {
-            $requestStream.Write($bytes, 0, $bytes.Length)
+            Wait-DashWindowsHttpTask ($requestStream.WriteAsync($bytes, 0, $bytes.Length)) $clock $TimeoutMilliseconds $request
         }
         finally {
             $requestStream.Dispose()
@@ -80,7 +101,7 @@ function Invoke-DashWindowsHttp {
     $response = $null
     try {
         try {
-            $response = [System.Net.HttpWebResponse]$request.GetResponse()
+            $response = [System.Net.HttpWebResponse](Wait-DashWindowsHttpTask ($request.GetResponseAsync()) $clock $TimeoutMilliseconds $request)
         }
         catch [System.Net.WebException] {
             if ($null -eq $_.Exception.Response) { throw }
@@ -91,7 +112,7 @@ function Invoke-DashWindowsHttp {
         if ($null -ne $responseStream) {
             $responseReader = [System.IO.StreamReader]::new($responseStream, [System.Text.Encoding]::UTF8, $true)
             try {
-                $responseBody = $responseReader.ReadToEnd()
+                $responseBody = Wait-DashWindowsHttpTask ($responseReader.ReadToEndAsync()) $clock $TimeoutMilliseconds $request
             }
             finally {
                 $responseReader.Dispose()
