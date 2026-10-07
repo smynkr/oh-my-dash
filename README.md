@@ -8,14 +8,15 @@ This public source snapshot is software documentation, not an operational histor
 
 - Live session feed and timeline for Claude Code and OMP, with current status and recent assistant responses.
 - Session filters for host, harness, **Repository** (host + working-directory identity, not Git-root/worktree detection; when no path is available the project label is used, and duplicate labels are disambiguated), and headless/ended visibility. They compose across Sessions and Timeline; Repository selection updates with live sessions and persists in this browser. Unchanged repository options remain in place during live updates. Cards support unread tracking and resume commands; browser notifications are optional.
-- Optional first-match project path rules with a path preview; with Telegram topics enabled, resolved projects can route alerts to bound topics.
+- Optional first-match project path rules with a path preview. With Telegram topics enabled, project traffic stays in its bound group topic; unmatched projects and failed topic sends use bound General, never a private-chat fallback. Urgent alerts use Urgent or General. Commands, questions and answers stay in the group after initial private pairing.
 - Optional Telegram alerts and replies. When replies are enabled, current-turn decision choices can appear as buttons; a ⭐ marks a recommended option when one is identified. Single-question buttons show the actual option labels, such as **Yes** / **No** when those choices were supplied, rather than bare A/B keys. Labels are redacted and shortened to fit; binary choices are never invented. Telegram cards have no generic “accept recommendation” button: tapping an option sends that choice, and multi-decision cards provide **Send picks**. The dashboard has its own quick actions, including **⭐ Rec · auth'd**, which explicitly authorizes the action asked about in the current response.
-- Interactive OMP TUI `ask` questions appear with their original question and ordered option labels, including numbering gaps; supplied descriptions and expandable previews are shown too. A single-select recommended option is marked `(Recommended)`; multi-select options are not marked. For one single-select question, tapping an option sends it immediately. **Other (type your own)** accepts custom text; use **Send answer** for custom or multi-select answers. Multi-select supports several choices, custom text, or no selections; multiple questions are sent together with **Send answers**. Answers bind to the exact pending question, and stale answers are rejected without retry. If structured options are invalid, safely bound free text remains available. No extra feature flag is needed beyond `DASH_REPLIES=1`; reinstall the updated OMP extension and restart existing OMP sessions. Claude dialogs and OMP tool approvals remain terminal-only.
+- In the dashboard, interactive OMP TUI `ask` questions appear with their original question and ordered option labels, including numbering gaps; supplied descriptions and expandable previews are shown too. A single-select recommended option is marked `(Recommended)`; multi-select options are not marked. For one single-select question, tapping an option sends it immediately. **Other (type your own)** accepts custom text; use **Send answer** for custom or multi-select answers. Multi-select supports several choices, custom text, or no selections; multiple questions are sent together with **Send answers**. Answers bind to the exact pending question, and stale answers are rejected without retry. If structured options are invalid, safely bound free text remains available. No extra feature flag is needed beyond `DASH_REPLIES=1`; reinstall the updated OMP extension and restart existing OMP sessions. Claude permission dialogs and OMP tool approvals remain terminal-only.
+- Opt-in native Claude `AskUserQuestion` answers on macOS, using the original structured questions rather than inferred prose. Dashboard and Telegram choices bind to the exact invocation and preserve single/multi-select labels and custom text. Telegram question buttons share compact rows: one single-choice option or custom reply sends immediately, while multi-select and multiple questions retain **Send**. The bounded synchronous hook falls back to Claude's terminal without approving anything on timeout or failure; permission dialogs remain terminal-only. See [setup, verification and rollback](docs/runbook.md#optional-claude-question-answers-on-macos).
 - A local SQLite feed database. By default, startup backfill scans recent Claude Code and OMP transcript files from the current account.
 
 ## Requirements and local quick start
 
-macOS is the supported hub platform: its optional LaunchAgent template, Keychain-backed Telegram token, and Claude liveness polling via `claude agents --json` are macOS-specific. Install [Bun 1.3.14 or newer](https://bun.sh/), then clone and start the project:
+macOS is the supported hub platform: its optional LaunchAgent template and Keychain-backed Telegram token are macOS-specific. Native Windows clients can connect to an existing hub. Install [Bun 1.3.14 or newer](https://bun.sh/), then clone and start the project:
 
 ```sh
 git clone https://github.com/smynkr/oh-my-dash.git
@@ -49,7 +50,7 @@ bun run scripts/install-omp-extension.ts --target "$HOME/.omp/agent/extensions" 
 bun run scripts/install-omp-extension.ts --target "$HOME/.omp/agent/extensions"
 ```
 
-The default hook and OMP ingest URL is `http://127.0.0.1:4777`. Restart OMP sessions to load an updated extension. Claude hooks are added asynchronously and do not require a Claude Code restart. To uninstall only these integrations, use the same settings/target paths:
+The default hook and OMP ingest URL is `http://127.0.0.1:4777`. Restart OMP sessions to load an updated extension. Default Claude event hooks are asynchronous; opt-in question hooks are synchronous and should be checked in a fresh Claude session after installation. To uninstall only these integrations, use the same settings/target paths:
 
 ```sh
 bun run scripts/install-claude-hooks.ts --settings "$HOME/.claude/settings.json" --uninstall
@@ -60,7 +61,16 @@ Uninstalling integrations does not erase the collector database or the original 
 
 ### Windows
 
-Windows support is currently limited to the OMP extension connecting to an already-running hub. The documented hub service, macOS Keychain token storage, LaunchAgent setup, Claude Code hooks, and Claude CLI liveness polling are macOS-specific; Claude Code integration on Windows is not supported here. Set `DASH_URL` to the hub's allowed OMP ingest URL and `DASH_HOST` to the exact peer label configured on that hub before starting OMP.
+Windows clients support both the OMP extension and native Claude Code hooks connecting to an already-running hub. The collector service, Keychain token storage, and LaunchAgent setup remain macOS-specific.
+
+For Claude Code, use its supported native Windows platform (Windows 10 1809+ or Windows Server 2019+), Windows PowerShell 5.1, and a working, signed-in Claude CLI. From the repository root, preview the installation, then repeat without `-DryRun`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://your-hub.tailnet.ts.net:4777" -HostLabel "windows-peer" -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://your-hub.tailnet.ts.net:4777" -HostLabel "windows-peer"
+```
+
+Use the exact peer label authorized on your hub; remote URLs require HTTPS. The installer preserves unrelated Claude settings, backs up changed files, installs native event/reply helpers, and registers a per-user liveness task. Normal stopped turns can receive dashboard/Telegram replies when the hub enables `DASH_REPLIES=1`. On a hub with Claude question support, add `-Questions` to opt in to remote `AskUserQuestion` answers; `-QuestionWaitSeconds` sets the bounded remote-answer window (default 120, range 1–600 seconds). Reinstall without `-Questions` to disable it. Permission dialogs always remain terminal-only. This installer does not require Bun or install a Windows hub. See the [Windows client runbook](docs/runbook.md#windows-claude-code-client) for prerequisites, custom paths, verification, and uninstall.
 
 From PowerShell in the repository root, install the extension and set the hub's Tailscale Serve URL and this device's exact allowlisted label:
 
@@ -71,7 +81,7 @@ setx DASH_URL "https://your-hub.tailnet.ts.net:4777/ingest/omp"
 setx DASH_HOST "windows-peer"
 ```
 
-Replace the example host/label with the values configured on your hub, open a new terminal so the environment is refreshed, and restart OMP. This does not install the hub or add Claude Code support on Windows.
+Replace the example host/label with the values configured on your hub, open a new terminal so the environment is refreshed, and restart OMP. The OMP extension and Claude installer are separate client integrations; neither installs the hub on Windows.
 
 ## Optional Telegram and replies
 

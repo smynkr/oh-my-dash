@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
-import { chmod, copyFile, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { hostname, homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const EVENTS: Array<[string, string?]> = [
   ["SessionStart"], ["UserPromptSubmit"], ["PreToolUse", "AskUserQuestion"],
@@ -10,7 +11,11 @@ const EVENTS: Array<[string, string?]> = [
 ];
 const URL_RE = /^https?:\/\/[A-Za-z0-9._:[\]%-]+(?::\d+)?(?:\/[A-Za-z0-9._~:/?#[\]@!&*+,=%-]*)?$/;
 
-type Args = { settings: string; url: string; host: string; replyBase: string; replyScript: string; noReply: boolean; dryRun: boolean; uninstall: boolean };
+type Args = {
+  settings: string; url: string; host: string; replyBase: string; replyScript: string;
+  questionHelper: string; python3: string; questionTimeoutMs: number; remoteQuestions: boolean;
+  noReply: boolean; dryRun: boolean; uninstall: boolean;
+};
 
 export function parseArgs(argv: string[]): Args {
   const result: Args = {
@@ -19,6 +24,10 @@ export function parseArgs(argv: string[]): Args {
     host: hostname().split(".")[0] || "localhost",
     replyBase: "",
     replyScript: join(homedir(), ".local/share/dash/scripts/reply-wait.sh"),
+    questionHelper: join(homedir(), ".local/share/dash/scripts/claude-question.py"),
+    python3: "/usr/bin/python3",
+    questionTimeoutMs: 120_000,
+    remoteQuestions: false,
     noReply: false,
     dryRun: false,
     uninstall: false,
@@ -28,7 +37,9 @@ export function parseArgs(argv: string[]): Args {
     if (flag === "--dry-run") result.dryRun = true;
     else if (flag === "--uninstall") result.uninstall = true;
     else if (flag === "--no-reply") result.noReply = true;
-    else if (["--settings", "--url", "--host", "--reply-base", "--reply-script"].includes(flag)) {
+    else if (flag === "--remote-questions") result.remoteQuestions = true;
+    else if (["--settings", "--url", "--host", "--reply-base", "--reply-script",
+      "--question-helper", "--python3", "--question-timeout-ms"].includes(flag)) {
       const value = argv[++i];
       if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
       if (flag === "--settings") result.settings = value;
@@ -36,6 +47,12 @@ export function parseArgs(argv: string[]): Args {
       if (flag === "--host") result.host = value.split(".")[0];
       if (flag === "--reply-base") result.replyBase = value;
       if (flag === "--reply-script") result.replyScript = value;
+      if (flag === "--question-helper") result.questionHelper = value;
+      if (flag === "--python3") result.python3 = value;
+      if (flag === "--question-timeout-ms") {
+        if (!/^\d+$/.test(value)) throw new Error("--question-timeout-ms must be an integer");
+        result.questionTimeoutMs = Number(value);
+      }
     } else throw new Error(`Unknown option: ${flag}`);
   }
   if (!URL_RE.test(result.url)) {
@@ -43,24 +60,35 @@ export function parseArgs(argv: string[]): Args {
   }
   if (!result.replyBase) result.replyBase = new URL(result.url).origin;
   if (!URL_RE.test(result.replyBase)) throw new Error("--reply-base must be an http(s) URL without shell-sensitive characters");
-  if (!/^\/[A-Za-z0-9._/-]+$/.test(result.replyScript)) throw new Error("--reply-script must be an absolute path without shell-sensitive characters");
-  if (!/^[A-Za-z0-9._-]+$/.test(result.host)) throw new Error("--host contains unsupported characters");
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(result.host)) throw new Error("--host must be a short alphanumeric host label");
+  if (!isAbsolute(result.replyScript)) throw new Error("--reply-script must be an absolute path");
+  if (!isAbsolute(result.questionHelper)) throw new Error("--question-helper must be an absolute path");
+  if (!isAbsolute(result.python3)) throw new Error("--python3 must be an absolute path");
+  if (!Number.isSafeInteger(result.questionTimeoutMs) || result.questionTimeoutMs < 1000 || result.questionTimeoutMs > 600_000)
+    throw new Error("--question-timeout-ms must be between 1000 and 600000");
   return result;
 }
 
 function shellQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
-function dashGroups(options: Pick<Args, "url" | "host" | "replyBase" | "replyScript" | "noReply">) {
+function dashGroups(options: Pick<Args, "url" | "host" | "replyBase" | "replyScript" | "noReply" |
+  "remoteQuestions" | "questionTimeoutMs" | "questionHelper" | "python3">) {
   const { url, host } = options;
   const command = `curl -s -m 3 -o /dev/null -X POST -H 'Content-Type: application/json' -H 'X-Dash-Host: ${host}' -H "X-Dash-Entrypoint: \${CLAUDE_CODE_ENTRYPOINT:-}" -H "X-Dash-Attended: \${CLAUDE_CODE_SESSION_ATTENDED:-}" -H "X-Dash-Kind: \${CLAUDE_CODE_SESSION_KIND:-}" --data-binary @- ${shellQuote(url)} >/dev/null 2>&1; true # dash-hook`;
   return EVENTS.flatMap(([event, matcher]) => {
     const groups: Array<readonly [string, unknown]> = [[event, { ...(matcher ? { matcher } : {}), hooks: [{ type: "command", async: true, timeout: 5, command }] }]];
+    if (event === "PreToolUse" && options.remoteQuestions) {
+      const timeoutSeconds = Math.ceil(options.questionTimeoutMs / 1000) + 5;
+      const questionCommand = `${shellQuote(options.python3)} ${shellQuote(options.questionHelper)} --hub-url ${shellQuote(options.replyBase)} --host ${shellQuote(host)} --timeout-ms ${shellQuote(String(options.questionTimeoutMs))} # dash-hook-question`;
+      groups.push([event, { matcher:"AskUserQuestion",hooks:[{ type:"command",timeout:timeoutSeconds,command:questionCommand }] }]);
+    }
     if (event === "Stop" && !options.noReply) groups.push([event, { hooks: [{ type: "command", async: true, asyncRewake: true, timeout: 21600, command: `/bin/sh ${shellQuote(options.replyScript)} ${shellQuote(options.replyBase)} ${shellQuote(host)} # dash-hook` }] }]);
     return groups;
   });
 }
 
-export function mergeSettings(input: unknown, options: Pick<Args, "url" | "host" | "replyBase" | "replyScript" | "noReply" | "uninstall">): Record<string, unknown> {
+export function mergeSettings(input: unknown, options: Pick<Args, "url" | "host" | "replyBase" | "replyScript" | "noReply" |
+  "remoteQuestions" | "questionTimeoutMs" | "questionHelper" | "python3" | "uninstall">): Record<string, unknown> {
   if (input === null || typeof input !== "object" || Array.isArray(input)) throw new Error("settings JSON must be an object");
   const doc = structuredClone(input) as Record<string, unknown>;
   if (doc.hooks === undefined) {
@@ -100,6 +128,54 @@ async function backupPath(path: string): Promise<string> {
   return candidate;
 }
 
+const questionHelperSource = fileURLToPath(new URL("./claude-question.py",import.meta.url));
+const questionHelperMarker = "Synchronous Claude PreToolUse bridge";
+
+function hasQuestionHook(input: unknown): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const hooks = (input as Record<string, unknown>).hooks;
+  if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return false;
+  const preToolUse = (hooks as Record<string, unknown>).PreToolUse;
+  if (!Array.isArray(preToolUse)) return false;
+  return preToolUse.some(group => {
+    if (!group || typeof group !== "object" || Array.isArray(group)) return false;
+    const entries = (group as Record<string, unknown>).hooks;
+    return Array.isArray(entries) && entries.some(hook => {
+      if (!hook || typeof hook !== "object" || Array.isArray(hook)) return false;
+      const command = (hook as Record<string, unknown>).command;
+      return typeof command === "string" && command.includes("# dash-hook-question");
+    });
+  });
+}
+async function isQuestionHelperSource(path: string): Promise<boolean> {
+  try { return await realpath(path) === await realpath(questionHelperSource); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+}
+async function installQuestionHelper(path: string): Promise<void> {
+  if (await isQuestionHelperSource(path)) return;
+  await mkdir(dirname(path),{ recursive:true,mode:0o700 });
+  let current: string | undefined;
+  try { current = await readFile(path,"utf8"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (current !== undefined && !current.includes(questionHelperMarker))
+    throw new Error(`Refusing to overwrite a non-Dash Claude question helper: ${path}`);
+  const temp = join(dirname(path),`.${process.pid}.${Date.now()}.claude-question.tmp`);
+  try {
+    await copyFile(questionHelperSource,temp);
+    await chmod(temp,0o700);
+    await rename(temp,path);
+  } catch (error) {
+    await unlink(temp).catch(() => {});
+    throw error;
+  }
+}
+async function removeQuestionHelper(path: string): Promise<void> {
+  if (await isQuestionHelperSource(path)) return;
+  let current: string;
+  try { current = await readFile(path,"utf8"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  if (current.includes(questionHelperMarker)) await unlink(path);
+}
 export async function updateSettings(args: Args): Promise<{ output: string; changed: boolean; backup?: string }> {
   const target = await realpath(args.settings);
   const originalStat = await stat(target);
@@ -109,7 +185,13 @@ export async function updateSettings(args: Args): Promise<{ output: string; chan
   const output = `${JSON.stringify(merged, null, 2)}\n`;
   JSON.parse(output);
   const changed = output !== `${JSON.stringify(parsed, null, 2)}\n`;
-  if (args.dryRun || !changed) return { output, changed };
+  const removeHelper = hasQuestionHook(parsed) && (args.uninstall || !args.remoteQuestions);
+  if (args.dryRun) return { output, changed };
+  if (!args.uninstall && args.remoteQuestions) await installQuestionHelper(args.questionHelper);
+  if (!changed) {
+    if (removeHelper) await removeQuestionHelper(args.questionHelper);
+    return { output, changed };
+  }
   const backup = await backupPath(target);
   await copyFile(target, backup);
   const temp = join(dirname(target), `.${process.pid}.${Date.now()}.dash-settings.tmp`);
@@ -122,6 +204,7 @@ export async function updateSettings(args: Args): Promise<{ output: string; chan
     await unlink(temp).catch(() => {});
     throw error;
   }
+  if (removeHelper) await removeQuestionHelper(args.questionHelper);
   return { output, changed, backup };
 }
 

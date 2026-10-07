@@ -31,6 +31,144 @@ function fixture(harness: "claude" | "omp" = "claude", status: SessionDTO["statu
 }
 const waiter = "waiteraaaaaaaaaa";
 
+describe("Claude question broker", () => {
+  const firstId = Buffer.alloc(32, 1).toString("base64url");
+  const secondId = Buffer.alloc(32, 2).toString("base64url");
+  const questionEvent = (ts: number, toolUseId: string): NormalizedEvent => ({
+    host: "synthetic-host", harness: "claude", sessionId: "synthetic-session",
+    kind: "question", ts, interactive: true, toolUseId,
+    questionData: [{ id: "Which route?", question: "Which route?",
+      options: [{ label: "Keep (Recommended)" }, { label: "Replace" }] }],
+  });
+
+  test("wrong-identity cancellation cannot dislodge the active question waiter", async () => {
+    const f = fixture();
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_current"),
+        id: firstId, toolUseId: "toolu_current", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      const waiting = f.broker.waitQuestion(f.key, firstId, "toolu_current", 1000);
+      expect(f.broker.cancelQuestion(firstId, f.key, "toolu_wrong")).toBe(false);
+      expect(f.broker.submitQuestion({ key: f.key, questionId: firstId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [0] } } })).toEqual({ ok: true });
+      expect(await waiting).toEqual({ status: 200, answers: { "Which route?": "Keep (Recommended)" } });
+      expect(await f.broker.waitQuestion(f.key, firstId, "toolu_current", 1000)).toEqual({ status: 409 });
+    } finally { f.close(); }
+  });
+
+  test("replacement invalidates old controls without losing a new custom Unicode answer", async () => {
+    const f = fixture();
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_old"),
+        id: firstId, toolUseId: "toolu_old", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      const oldWait = f.broker.waitQuestion(f.key, firstId, "toolu_old", 1000);
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_new"),
+        id: secondId, toolUseId: "toolu_new", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      expect(await oldWait).toEqual({ status: 409 });
+      expect(f.broker.submitQuestion({ key: f.key, questionId: firstId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [0] } } })).toMatchObject({ refused: true, reason: "stale_question" });
+      expect(f.broker.submitQuestion({ key: f.key, questionId: secondId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [], customInput: "Route 雪 & café" } } })).toEqual({ ok: true });
+      expect(await f.broker.waitQuestion(f.key, secondId, "toolu_new", 1000)).toEqual({
+        status: 200, answers: { "Which route?": "Route 雪 & café" },
+      });
+    } finally { f.close(); }
+  });
+
+  test("expiry rejects the waiting client and prevents an answer from reviving the invocation", async () => {
+    const f = fixture();
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now, "toolu_expiring"),
+        id: firstId, toolUseId: "toolu_expiring", timeoutMs: 1000 })).toMatchObject({ ok: true });
+      const waiting = f.broker.waitQuestion(f.key, firstId, "toolu_expiring", 1000);
+      f.clock.now += 1000;
+      f.sweep();
+      expect(await waiting).toEqual({ status: 409 });
+      expect(f.broker.submitQuestion({ key: f.key, questionId: firstId, source: "web", actor: "web:loopback",
+        answers: { "Which route?": { selectedOptions: [1] } } })).toMatchObject({ refused: true, reason: "stale_question" });
+    } finally { f.close(); }
+  });
+  test("an answered invocation survives its same-tool duplicate until /question/wait consumes the original answer", async () => {
+    const f = fixture();
+    f.clock.now = Date.now();
+    const toolUseId = "toolu_same_invocation";
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now,toolUseId),
+        id: firstId,toolUseId,timeoutMs:60_000 })).toMatchObject({ ok:true });
+      expect(f.broker.submitQuestion({ key:f.key,questionId:firstId,source:"web",actor:"web:loopback",
+        answers:{ "Which route?":{ selectedOptions:[0] } } })).toEqual({ ok:true });
+      const answeredAt = f.db.questionInvocationsForSession(f.key)[0]?.answeredAt ?? 0;
+
+      f.clock.now += 1;
+      const duplicate = f.db.applyEvent(questionEvent(f.clock.now,toolUseId));
+      expect(duplicate.status).toBe("working");
+      expect(f.db.questionInvocationsForSession(f.key)[0]?.lastHookEventAt).toBeGreaterThan(answeredAt);
+      f.broker.observe(duplicate);
+
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)).toMatchObject({ state:"answered" });
+      expect(await f.broker.waitQuestion(f.key,firstId,toolUseId,1000)).toEqual({
+        status:200,answers:{ "Which route?":"Keep (Recommended)" },
+      });
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)).toMatchObject({ state:"consumed" });
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)?.answers).toBeUndefined();
+    } finally { f.close(); }
+  });
+
+  test("wait rejects an answered invocation after an unobserved new prompt", async () => {
+    const f = fixture();
+    f.clock.now = Date.now();
+    const toolUseId = "toolu_unobserved_prompt";
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now,toolUseId),
+        id:firstId,toolUseId,timeoutMs:60_000 })).toMatchObject({ ok:true });
+      expect(f.broker.submitQuestion({ key:f.key,questionId:firstId,source:"web",actor:"web:loopback",
+        answers:{ "Which route?":{ selectedOptions:[0] } } })).toEqual({ ok:true });
+
+      f.clock.now += 1;
+      const moved = f.db.applyEvent({ host:"synthetic-host",harness:"claude",sessionId:"synthetic-session",
+        kind:"prompt",ts:f.clock.now,interactive:true,text:"synthetic next prompt" });
+      expect(moved.status).toBe("working");
+      expect(await f.broker.waitQuestion(f.key,firstId,toolUseId,1000)).toEqual({ status:409 });
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId))
+        .toMatchObject({ state:"cancelled",cancelReason:"session_moved" });
+    } finally { f.close(); }
+  });
+
+  test.each([
+    ["new prompt","prompt"],
+    ["distinct tool question","distinct-question"],
+    ["permission event","permission"],
+    ["terminal response","response"],
+    ["session end","session_end"],
+    ["expiry","expiry"],
+  ] as const)("%s cancels a previously answered invocation", async (_scenario,movement) => {
+    const f = fixture();
+    f.clock.now = Date.now();
+    const toolUseId = "toolu_answered";
+    try {
+      expect(f.broker.registerQuestion({ event: questionEvent(f.clock.now,toolUseId),
+        id: firstId,toolUseId,timeoutMs:1000 })).toMatchObject({ ok:true });
+      expect(f.broker.submitQuestion({ key:f.key,questionId:firstId,source:"web",actor:"web:loopback",
+        answers:{ "Which route?":{ selectedOptions:[1] } } })).toEqual({ ok:true });
+
+      f.clock.now += movement === "expiry" ? 1000 : 1;
+      const moved = movement === "distinct-question"
+        ? f.db.applyEvent(questionEvent(f.clock.now,"toolu_distinct"))
+        : movement === "expiry"
+          ? f.db.applyEvent(questionEvent(f.clock.now,toolUseId))
+          : f.db.applyEvent({ host:"synthetic-host",harness:"claude",sessionId:"synthetic-session",
+            kind:movement,ts:f.clock.now,interactive:true,text:"synthetic movement" });
+      f.broker.observe(moved);
+
+      expect(f.db.getQuestionInvocation(firstId,f.key,toolUseId)).toMatchObject({
+        state:"cancelled",
+        cancelReason:movement === "session_end" ? "session_ended" : movement === "expiry" ? "expired" : "session_moved",
+      });
+      expect(await f.broker.waitQuestion(f.key,firstId,toolUseId,1000))
+        .toEqual({ status:movement === "session_end" ? 410 : 409 });
+    } finally { f.close(); }
+  });
+});
+
 describe("reply broker", () => {
   test("validates every refusal without queueing and records attributable refusals once", () => {
     const badShapes = [

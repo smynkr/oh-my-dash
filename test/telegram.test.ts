@@ -10,6 +10,7 @@ import { createDashServer } from "../src/server.ts";
 import { CONTINUE_LABEL, CONTINUE_TEXT } from "../src/actions.ts";
 import { validateDecisionSet } from "../src/decisions.ts";
 
+import type { AskQuestion } from "../src/normalize.ts";
 const token = `123456789:${"A".repeat(32)}`;
 const owner = 712345;
 const chat = 812345;
@@ -30,6 +31,7 @@ class FakeBot {
   sendSequence: { status: number; body: unknown }[] = [];
   editSequence: { status: number; body: unknown }[] = [];
   beforeEdit?: () => Promise<void>;
+  beforeSend?: (body: Record<string, any>) => Promise<void>;
   nextCallbackAnswer: { status: number; body: unknown } | undefined;
   private updates: Record<string, any>[] = [];
   private pending: { resolve: (updates: Record<string, any>[]) => void; offset: number } | undefined;
@@ -59,6 +61,7 @@ class FakeBot {
       if (method === "sendMessage") {
         this.sent.push(body);
         this.sendTimes.push(this.now());
+        await this.beforeSend?.(body);
         const response = this.sendSequence.shift() ?? this.nextSend;
         if (response) {
           if (response === this.nextSend) this.nextSend = undefined;
@@ -72,6 +75,7 @@ class FakeBot {
         return response ? Response.json(response.body, { status: response.status }) : Response.json(ok({ message_id: body.message_id }));
       }
       if (method === "editMessageReplyMarkup") return Response.json(ok(true));
+      if (method === "deleteMessage") return Response.json(ok(true));
       if (method === "answerCallbackQuery") {
         if (this.nextCallbackAnswer) {
           const response = this.nextCallbackAnswer;
@@ -165,6 +169,21 @@ async function pairedFixture(options: Parameters<typeof fixture>[0] = {}) {
 }
 async function topicFixture(options: Omit<Parameters<typeof fixture>[0], "topicsEnabled"> = {}) {
   return pairedFixture({ ...options, topicsEnabled: true, bindings: options.bindings ?? { groupChatId: String(group), topics: defaultTopics } });
+}
+function registerClaudeQuestion(f: Awaited<ReturnType<typeof pairedFixture>>, sessionId: string, questions: AskQuestion[], observe = true) {
+  const id = Buffer.alloc(32, sessionId.length).toString("base64url"), toolUseId = `tool-${sessionId}`;
+  const event: Parameters<NonNullable<typeof f.replies>["registerQuestion"]>[0]["event"] = {
+    host: "synthetic-host", harness: "claude", sessionId, kind: "question", ts: f.clock.now, interactive: true,
+    toolUseId, questionData: questions,
+  };
+  const result = f.replies!.registerQuestion({ event, id, toolUseId, timeoutMs: 60_000 });
+  if (!("ok" in result)) throw new Error(`question registration refused: ${result.reason}`);
+  const key = `synthetic-host|claude|${sessionId}`;
+  f.db.sqlite.query("UPDATE sessions SET alive=1 WHERE key=?").run(key);
+  const row = f.db.getSession(key);
+  if (!row) throw new Error("registered question session is missing");
+  if (observe) f.telegram.observe(row, "question");
+  return { id, key, toolUseId };
 }
 const groupMessage = (text: string, threadId?: number, overrides: Record<string, any> = {}) => message(text, {
   chat: { id: group, type: "supergroup", title: "Ops <group>" },
@@ -353,10 +372,10 @@ describe("Telegram alerts", () => {
   test("retries exhausted alert edits without a restart or another session event", async () => {
     let sweep!: () => void;
     const reports: string[] = [];
-    const f = await pairedFixture({ topicsEnabled: true, setTimer: fn => { sweep = fn; return () => {}; },
+    const f = await topicFixture({ setTimer: fn => { sweep = fn; return () => {}; },
       reportError: area => reports.push(area) });
     f.telegram.observe(dto("needs_input"));
-    await eventually(() => !!f.db.alertFor(String(chat), 1));
+    await eventually(() => !!f.db.alertFor(String(group), 1));
     f.bot.editSequence = Array.from({ length: 4 }, () => ({ status: 503, body: { ok: false, error_code: 503 } }));
     f.telegram.observe(dto("working"), "question_answered");
     await eventually(() => reports.includes("telegram send"));
@@ -393,6 +412,26 @@ describe("Telegram alerts", () => {
     expect(edit.message_id).toBe(1);
     expect(edit.text).toContain("Answered");
     expect(edit.text).toContain("Keep this question");
+  });
+  test("does not update historical DM content after restarting in topic mode", async () => {
+    const f = await pairedFixture();
+    const row = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "dm-cutover",
+      kind: "question", text: "Synthetic old question", ts: f.clock.now, interactive: true });
+    f.telegram.observe(row);
+    await apiSettled(() => !!f.db.alertFor(String(chat), 1));
+    f.telegram.close();
+    f.db.setSetting("telegram.topics", JSON.stringify({ groupChatId: String(group), topics: defaultTopics }));
+    const resumed = f.db.applyEvent({ host: row.host, harness: row.harness, sessionId: row.sessionId,
+      kind: "question_answered", ts: ++f.clock.now, interactive: true });
+    const again = createTelegram({ db: f.db, topicsEnabled: true, apiBase: f.bot.base, fetch: trackedFetch,
+      now: () => f.clock.now, readToken: async () => token, sleep: async ms => { f.clock.now += ms; } });
+    resources.push(() => again.close());
+    again.start();
+    await eventually(() => again.health().state === "ok");
+    again.observe(resumed, "question_answered");
+    expect(await again.sendUrgent("synthetic", "Group synchronization marker")).toBe(true);
+    expect(f.bot.calls.filter(call => call.method === "editMessageText")).toEqual([]);
+    expect(f.bot.sent.slice(1).map(send => send.chat_id)).toEqual([String(group)]);
   });
   test("updates digest entries independently without answering a later question", async () => {
     const f = await pairedFixture();
@@ -902,15 +941,12 @@ describe("Telegram topic delivery", () => {
     expect(call.body).not.toHaveProperty("message_thread_id");
   });
 
-  test("omits the thread ID when a project has no group binding and falls back to DM", async () => {
-    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { invest: 42 } } });
+  test.each([false, true])("withholds unmatched alerts and urgent bodies without General (group bound: %s)", async bound => {
+    const f = await pairedFixture({ topicsEnabled: true,
+      bindings: bound ? { groupChatId: String(group), topics: { invest: 42 } } : undefined });
     f.telegram.observe(dto("needs_input", { project: "unbound" }));
-    await apiSettled(() => sendCalls(f.bot).length === 1, "DM alert");
-
-    const call = sendCalls(f.bot)[0];
-    expect(call.method).toBe("sendMessage");
-    expect(call.body.chat_id).toBe(String(chat));
-    expect(call.body).not.toHaveProperty("message_thread_id");
+    expect(await f.telegram.sendUrgent("unbound", "Synthetic urgent body")).toBe(false);
+    expect(sendCalls(f.bot)).toEqual([]);
   });
 
   test("forms one project digest and preserves the first destination order", async () => {
@@ -936,24 +972,16 @@ describe("Telegram topic delivery", () => {
     expect(visibleText(calls[2].body.text)).toContain("Invest three");
   });
 
-  test("stores equal numeric alert IDs separately for DM and group chats", async () => {
-    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { invest: 42 } } });
-    f.bot.sendSequence = [
-      { status: 200, body: ok({ message_id: 7 }) },
-      { status: 200, body: ok({ message_id: 7 }) },
-    ];
+  test("preserves a historical DM alert with the same numeric ID as a new group alert", async () => {
+    const f = await topicFixture();
+    f.bot.sendSequence = [{ status: 200, body: ok({ message_id: 7 }) }];
     const invest = dto("needs_input", { key: "synthetic-host|claude|invest-alert", project: "invest" });
     const dm = dto("needs_input", { key: "synthetic-host|claude|dm-alert", project: "unbound" });
+    f.db.rememberAlert(String(chat), 7, dm.key, "alert", f.clock.now);
     f.telegram.observe(invest);
-    await apiSettled(() => sendCalls(f.bot).length === 1, "group alert");
-    f.telegram.observe(dm);
-    await apiSettled(() => sendCalls(f.bot).length === 2, "DM alert");
-    await eventually(() => f.db.alertFor(String(group), 7)?.sessionKey === invest.key &&
-      f.db.alertFor(String(chat), 7)?.sessionKey === dm.key, "chat-keyed alert references");
+    await apiSettled(() => f.db.alertFor(String(group), 7)?.sessionKey === invest.key, "group alert");
 
-    expect(sendCalls(f.bot).map(call => call.method)).toEqual(["sendMessage", "sendMessage"]);
-    expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
-    expect(sendCalls(f.bot)[1].body.chat_id).toBe(String(chat));
+    expect(sendCalls(f.bot).map(call => call.body.chat_id)).toEqual([String(group)]);
     expect(f.db.alertFor(String(group), 7)?.sessionKey).toBe(invest.key);
     expect(f.db.alertFor(String(chat), 7)?.sessionKey).toBe(dm.key);
   });
@@ -983,36 +1011,34 @@ describe("Telegram topic delivery", () => {
     expect(sendCalls(f.bot)[1].body).not.toHaveProperty("message_thread_id");
   });
 
-  test("falls back from a rejected General reply to DM without the reply reference", async () => {
+  test("drops a reply confirmation when its topic and General reject it, without sending a DM", async () => {
     const f = await topicFixture({ repliesEnabled: true });
     const row = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "replyable", cwd: "/projects/invest/reply", kind: "question", ts: f.clock.now, text: "Synthetic question", interactive: true });
     f.db.sqlite.query("UPDATE sessions SET needs_reason='waiting' WHERE key=?").run(row.key);
     f.db.rememberAlert(String(group), 9, row.key, "alert", f.clock.now);
     f.bot.sendSequence = [failed(400), failed(400)];
     f.bot.enqueue(groupMessage("Answer", 42, { message_id: 55, reply_to_message: { message_id: 9 } }));
-    await apiSettled(() => sendCalls(f.bot).length === 3, "DM reply fallback");
+    await apiSettled(() => f.telegram.health().dropped === 1, "group-only reply failure");
 
     const calls = sendCalls(f.bot);
-    expect(calls.map(call => call.method)).toEqual(["sendMessage", "sendMessage", "sendMessage"]);
+    expect(calls.map(call => call.body.chat_id)).toEqual([String(group), String(group)]);
     expect(calls[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42,
       reply_parameters: { message_id: 55, allow_sending_without_reply: true } });
     expect(calls[1].body.chat_id).toBe(String(group));
     expect(calls[1].body).not.toHaveProperty("message_thread_id");
     expect(calls[1].body).not.toHaveProperty("reply_parameters");
-    expect(calls[2].body.chat_id).toBe(String(chat));
-    expect(calls[2].body).not.toHaveProperty("message_thread_id");
-    expect(calls[2].body).not.toHaveProperty("reply_parameters");
+    expect(f.db.queuedReplies().map(reply => reply.sessionKey)).toEqual([row.key]);
   });
 
-  test("sends the complete urgent body to DM in numbered Telegram-safe parts when no urgent binding exists", async () => {
+  test("sends the complete urgent body to General in numbered Telegram-safe parts when no urgent binding exists", async () => {
     const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { invest: 42, general: null } } });
     const body = `${"🧪".repeat(3_500)} FINAL-URGENT-TAIL`;
     expect(await f.telegram.sendUrgent("invest", body)).toBe(true);
-    await apiSettled(() => sendCalls(f.bot).length === 3, "all urgent DM parts");
+    await apiSettled(() => sendCalls(f.bot).length === 3, "all urgent General parts");
 
     const calls = sendCalls(f.bot);
     const parts = calls.map(call => visibleText(call.body.text));
-    expect(calls.every(call => call.body.chat_id === String(chat) && call.body.parse_mode === "HTML"
+    expect(calls.every(call => call.body.chat_id === String(group) && call.body.parse_mode === "HTML"
       && !("message_thread_id" in call.body))).toBe(true);
     expect(parts.map((text, index) => text.includes(`Part ${index + 1}/3`))).toEqual([true, true, true]);
     expect(parts.every(text => text.length <= 4096)).toBe(true);
@@ -1194,15 +1220,15 @@ describe("Telegram topic delivery", () => {
     expect(calls[1].body).not.toHaveProperty("message_thread_id");
   });
 
-  test("does not retry a terminal 400 sent directly to DM", async () => {
-    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { invest: 42 } } });
+  test("drops a rejected General alert without retrying it or sending a DM", async () => {
+    const f = await topicFixture();
     f.bot.sendSequence = [failed(400)];
     f.telegram.observe(dto("needs_input", { project: "unbound" }));
-    await eventually(() => f.telegram.health().dropped === 1, "dropped DM alert");
+    await eventually(() => f.telegram.health().dropped === 1, "dropped General alert");
 
     expect(sendCalls(f.bot)).toHaveLength(1);
     expect(sendCalls(f.bot)[0].method).toBe("sendMessage");
-    expect(sendCalls(f.bot)[0].body.chat_id).toBe(String(chat));
+    expect(sendCalls(f.bot)[0].body.chat_id).toBe(String(group));
     expect(sendCalls(f.bot)[0].body).not.toHaveProperty("message_thread_id");
   });
 
@@ -1271,9 +1297,7 @@ describe("Telegram topic binding and forum replies", () => {
 
     expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { invest: 42 } });
     const call = sendCalls(f.bot)[0];
-    expect(call.method).toBe("sendMessage");
-    expect(call.body).toEqual({ chat_id: String(chat),
-      text: "Bound <b>Ops &lt;group&gt;</b> / <b>invest</b>.", parse_mode: "HTML", disable_web_page_preview: true });
+    expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
   });
 
   test("binds from inside a topic when Telegram marks the command as a reply to the topic root", async () => {
@@ -1284,7 +1308,7 @@ describe("Telegram topic binding and forum replies", () => {
     await apiSettled(() => sendCalls(f.bot).length === 1, "binding confirmation");
 
     expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { invest: 42 } });
-    expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(chat), text: "Bound <b>Ops &lt;group&gt;</b> / <b>invest</b>." });
+    expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
   });
 
   test("answers /status in a bound topic when Telegram marks it as a reply to the topic root", async () => {
@@ -1322,7 +1346,7 @@ describe("Telegram topic binding and forum replies", () => {
 
     expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { invest: 42 } });
     expect(sendCalls(f.bot).map(call => call.method)).toEqual(["sendMessage"]);
-    expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(chat), text: "Bound <b>Ops &lt;group&gt;</b> / <b>invest</b>." });
+    expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
   });
 
   test("stores a topic bound from General as null and confirms the General placement", async () => {
@@ -1332,9 +1356,8 @@ describe("Telegram topic binding and forum replies", () => {
     await apiSettled(() => sendCalls(f.bot).length === 1, "General binding confirmation");
 
     const call = sendCalls(f.bot)[0];
-    expect(call.method).toBe("sendMessage");
-    expect(call.body).toEqual({ chat_id: String(chat),
-      text: "Bound <b>Ops &lt;group&gt;</b> / <b>general</b>. (General)", parse_mode: "HTML", disable_web_page_preview: true });
+    expect(call.body.chat_id).toBe(String(group));
+    expect(call.body).not.toHaveProperty("message_thread_id");
   });
 
   test("normalizes inbound General thread ID one to a null binding", async () => {
@@ -1344,8 +1367,8 @@ describe("Telegram topic binding and forum replies", () => {
     await apiSettled(() => sendCalls(f.bot).length === 1, "thread one confirmation");
 
     const call = sendCalls(f.bot)[0];
-    expect(call.method).toBe("sendMessage");
-    expect(call.body.text).toBe("Bound <b>Ops &lt;group&gt;</b> / <b>rogue</b>. (General)");
+    expect(call.body.chat_id).toBe(String(group));
+    expect(call.body).not.toHaveProperty("message_thread_id");
     expect(JSON.parse(f.db.getSetting("telegram.topics")!).topics).toMatchObject({ rogue: null });
   });
 
@@ -1403,20 +1426,15 @@ describe("Telegram topic binding and forum replies", () => {
     ["/status", true],
     ["/status@OtherBot", false],
   ] as const)("handles %s according to getMe username", async (command, accepted) => {
-    const f = await pairedFixture({ topicsEnabled: true });
-    f.bot.enqueue(message(command));
+    const f = await topicFixture();
+    f.bot.enqueue(groupMessage(command, 42));
     await eventually(() => f.db.getSetting("telegram.offset") === "2", "status update offset");
     if (accepted) await apiSettled(() => sendCalls(f.bot).length === 1, "authorized status send");
 
     expect(f.bot.calls.some(call => call.method === "getMe")).toBe(true);
     if (accepted) {
       const call = sendCalls(f.bot)[0];
-      expect(call.method).toBe("sendMessage");
-      expect(call.body).toMatchObject({ chat_id: String(chat), parse_mode: "HTML", disable_web_page_preview: true });
-      const status = visibleText(call.body.text);
-      expect(status.match(/\b0\b/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
-      expect(status).toMatch(/need you|needs? input|waiting/i);
-      expect(status).toMatch(/your turn|working/i);
+      expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
     } else expect(sendCalls(f.bot)).toHaveLength(0);
   });
 
@@ -1492,22 +1510,22 @@ describe("Telegram topic binding and forum replies", () => {
     } }]);
   });
 
-  test("looks up same-numbered DM and group alert replies by their source chat", async () => {
+  test("ignores historical DM replies and resolves a same-numbered group alert in its own chat", async () => {
     const f = await topicFixture({ repliesEnabled: true });
     const dm = seedTopicQuestion(f.db, "dm-alert", "unbound", f.clock.now);
     const groupRow = seedTopicQuestion(f.db, "group-alert", "invest", f.clock.now + 1);
     f.db.rememberAlert(String(chat), 9, dm.key, "alert", f.clock.now);
     f.db.rememberAlert(String(group), 9, groupRow.key, "alert", f.clock.now);
     f.bot.enqueue(message("DM answer", { message_id: 56, reply_to_message: { message_id: 9 } }));
-    await eventually(() => f.db.queuedReplies().length === 1, "DM reply queued");
-    await apiSettled(() => sendCalls(f.bot).length === 1, "DM reply confirmation");
+    await eventually(() => f.db.getSetting("telegram.offset") === "2", "ignored DM reply");
+    expect(f.db.queuedReplies()).toEqual([]);
+    expect(sendCalls(f.bot)).toEqual([]);
+    f.bot.enqueue(groupMessage("Group answer", 42, { message_id: 57, reply_to_message: { message_id: 9 } }));
+    await apiSettled(() => sendCalls(f.bot).length === 1, "group reply confirmation");
 
-    expect(f.db.queuedReplies()[0].sessionKey).toBe(dm.key);
-    const call = sendCalls(f.bot)[0];
-    expect(call.method).toBe("sendMessage");
-    expect(call.body).toMatchObject({ chat_id: String(chat), text: "📨 Queued for <b>Session dm-alert</b> · synthetic-host",
-      reply_parameters: { message_id: 56, allow_sending_without_reply: true } });
-    expect(call.body).not.toHaveProperty("message_thread_id");
+    expect(f.db.queuedReplies().map(reply => reply.sessionKey)).toEqual([groupRow.key]);
+    expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42,
+      reply_parameters: { message_id: 57, allow_sending_without_reply: true } });
   });
 
   test("edits a persisted reply confirmation in its actual group chat after restart", async () => {
@@ -1584,25 +1602,29 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
     expect(status).not.toContain("Session rogue-exact");
   });
 
-  test("keeps invest status topic-scoped while DM status remains global", async () => {
+  test("keeps project status topic-scoped and global status in General, never in DM", async () => {
     const f = await topicFixture();
     seedTopicQuestion(f.db, "invest-status", "invest", f.clock.now);
     seedTopicQuestion(f.db, "defense-status", "defense", f.clock.now - 1);
     f.bot.enqueue(groupMessage("/status", 42));
     await apiSettled(() => sendCalls(f.bot).length === 1, "invest status");
     f.bot.enqueue(message("/status"));
-    await apiSettled(() => sendCalls(f.bot).length === 2, "DM status");
+    await eventually(() => f.db.getSetting("telegram.offset") === "3", "ignored DM status");
+    expect(sendCalls(f.bot)).toHaveLength(1);
+    f.bot.enqueue(groupMessage("/status"));
+    await apiSettled(() => sendCalls(f.bot).length === 2, "General status");
 
     const calls = sendCalls(f.bot);
     expect(calls.map(call => call.method)).toEqual(["sendMessage", "sendMessage"]);
     expect(calls[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
     const investStatus = visibleText(calls[0].body.text);
-    expect(investStatus).toMatch(/1\.\s+Session invest-status\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
+    expect(investStatus).toContain("invest-status");
     expect(investStatus).not.toContain("defense-status");
     const globalStatus = visibleText(calls[1].body.text);
-    expect(calls[1].body).toMatchObject({ chat_id: String(chat), parse_mode: "HTML", disable_web_page_preview: true });
-    expect(globalStatus).toMatch(/1\.\s+Session invest-status\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
-    expect(globalStatus).toMatch(/2\.\s+Session defense-status\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
+    expect(calls[1].body.chat_id).toBe(String(group));
+    expect(calls[1].body).not.toHaveProperty("message_thread_id");
+    expect(globalStatus).toContain("invest-status");
+    expect(globalStatus).toContain("defense-status");
   });
   test("caps status at 15 numbered sessions and reports the total shown", async () => {
     const f = await pairedFixture();
@@ -1690,7 +1712,7 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
       text: "📨 Queued for <b>Session invest-index</b> · synthetic-host" });
   });
 
-  test("stores scoped topic mode and keeps DM mode global", async () => {
+  test("stores scoped topic mode and changes global mode only from the group", async () => {
     const f = await topicFixture();
     f.bot.enqueue(groupMessage("/mode turns", 42));
     await eventually(() => f.db.getSetting("telegram.mode.invest") === "turns", "invest mode override");
@@ -1698,15 +1720,17 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
     f.bot.enqueue(groupMessage("/mode", 56));
     await apiSettled(() => sendCalls(f.bot).length === 2, "inherited defense mode");
     f.bot.enqueue(message("/mode off"));
-    await eventually(() => f.db.getSetting("telegram.mode") === "off", "global DM mode");
+    await eventually(() => f.db.getSetting("telegram.offset") === "4", "ignored DM mode");
+    expect(f.db.getSetting("telegram.mode")).toBeUndefined();
+    f.bot.enqueue(groupMessage("/mode off"));
+    await eventually(() => f.db.getSetting("telegram.mode") === "off", "global General mode");
     await apiSettled(() => sendCalls(f.bot).length === 3, "global mode confirmation");
 
     expect(f.db.getSetting("telegram.mode")).toBe("off");
     expect(f.db.getSetting("telegram.mode.defense")).toBeUndefined();
-    expect(sendCalls(f.bot)).toEqual([
-      { method: "sendMessage", body: { chat_id: String(group), message_thread_id: 42, text: "Mode: turns", parse_mode: "HTML", disable_web_page_preview: true } },
-      { method: "sendMessage", body: { chat_id: String(group), message_thread_id: 56, text: "Mode: input", parse_mode: "HTML", disable_web_page_preview: true } },
-      { method: "sendMessage", body: { chat_id: String(chat), text: "Mode: off", parse_mode: "HTML", disable_web_page_preview: true } },
+    expect(f.db.getSetting("telegram.mode.invest")).toBe("turns");
+    expect(sendCalls(f.bot).map(call => [call.body.chat_id, call.body.message_thread_id ?? null])).toEqual([
+      [String(group), 42], [String(group), 56], [String(group), null],
     ]);
   });
 });
@@ -1872,7 +1896,7 @@ describe("Telegram reply routing", () => {
       f.bot.enqueue(answer("reply", alertId, alertId + 100));
       const count = f.bot.sent.length + 1;
       await apiSettled(() => f.bot.sent.length === count);
-      expect(f.bot.sent.at(-1)!.text).toBe("Claude questions and permission prompts can't be answered from dash yet. Answer in the terminal or Remote Control.");
+      expect(f.bot.sent.at(-1)!.text).toBe("Claude dialogs can't be answered by a free-text reply. Use AskUserQuestion buttons when available; answer permission prompts in the terminal or Remote Control.");
     }
     const omp = seed(f.db, "omp", "omp", "permission");
     f.db.rememberAlert(String(chat), 99, omp.key, "alert", f.clock.now);
@@ -2086,14 +2110,14 @@ describe("Telegram turn alerts and card lifecycle", () => {
     expect(f.db.cardForTurn(row.key, row.turnSeq)!.state).toBe("active");
   });
 
-  test("a DM card tapped from the bound group with the same message id answers Expired", async () => {
-    const f = await topicFixture({ repliesEnabled: true, decisionsEnabled: true, ttlMs: 600_000, bindings: { groupChatId: String(group), topics: { invest: 42 } } });
-    const row = respond(f, "dm-card", ask);
+  test("ignores a group card replayed in DM with the same message id", async () => {
+    const f = await topicFixture({ repliesEnabled: true, decisionsEnabled: true, ttlMs: 600_000 });
+    const row = respond(f, "group-card", ask);
     await apiSettled(() => f.bot.sent.length === 1);
-    expect(f.db.cardForTurn(row.key, row.turnSeq)).toMatchObject({ chatId: String(chat), messageId: 1, state: "active" });
-    tap(f, goData(f, row), 1, { message: { message_id: 1, chat: { id: group, type: "supergroup" } } });
-    await eventually(() => f.bot.count("answerCallbackQuery") === 1);
-    expect(answers(f)).toEqual(["Expired, use /status"]);
+    expect(f.db.cardForTurn(row.key, row.turnSeq)).toMatchObject({ chatId: String(group), messageId: 1, state: "active" });
+    tap(f, goData(f, row), 1);
+    await eventually(() => f.db.getSetting("telegram.offset") === "2", "ignored DM callback");
+    expect(answers(f)).toEqual([]);
     expect(replyRows(f)).toBe(0);
     expect(f.db.cardForTurn(row.key, row.turnSeq)!.state).toBe("active");
   });
@@ -2887,7 +2911,8 @@ describe("Telegram decision cards", () => {
     await apiSettled(() => f.bot.sent.length === 1);
     f.bot.enqueue(message("free text from dm", { message_id: 31, reply_to_message: { message_id: 1 } }));
     f.bot.enqueue(groupMessage("free text from topic", 42, { message_id: 32, reply_to_message: { message_id: 1 } }));
-    await apiSettled(() => f.bot.sent.length === 3);
+    await apiSettled(() => f.bot.sent.length === 2);
+    expect(f.bot.sent.every(body => body.chat_id === String(group))).toBe(true);
     expect(f.db.queuedReplies().map(reply => [reply.sessionKey, reply.text, reply.answersTurn ?? null])).toEqual([[row.key, "free text from topic", null]]);
     f.replies!.cancelAll();
     const next = respond(f, "routed", single, "/projects/invest/synthetic");
@@ -2956,6 +2981,457 @@ describe("Telegram decision cards", () => {
       for (const name of names) if (old[name] === undefined) delete process.env[name]; else process.env[name] = old[name];
       rmSync(scratch, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Telegram native question answers", () => {
+  const tapQuestion = (f: Awaited<ReturnType<typeof pairedFixture>>, callbackId: string, questionId: string,
+    questionIndex: number, action: string, messageId: number, chatId = chat, threadId?: number) =>
+    f.bot.enqueueUpdate({ callback_query: {
+      id: callbackId, from: { id: owner },
+      message: { message_id: messageId, chat: { id: chatId, type: chatId === chat ? "private" : "supergroup" },
+        ...(threadId === undefined ? {} : { message_thread_id: threadId }) },
+      data: `q:${questionId}:${questionIndex}:${action}`,
+    } });
+  const questionMessages = (bot: FakeBot) =>
+    bot.sent.filter(send => typeof send.text === "string" && send.text.includes("Claude / OMP question"));
+
+  test("deletes a custom-answer prompt sent after its question is cancelled", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, observeReplies: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "late-custom-prompt", [
+      { id: "route", question: "Which route?", options: [{ label: "Local" }, { label: "Remote" }] },
+    ]);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "question controls");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    const promptStarted = Promise.withResolvers<void>(), finishPrompt = Promise.withResolvers<void>();
+    let promptMessageId: number | undefined;
+    f.bot.beforeSend = async body => {
+      if (!body.reply_markup?.force_reply) return;
+      promptMessageId = f.bot.sent.indexOf(body) + 1;
+      f.bot.beforeSend = undefined;
+      promptStarted.resolve();
+      await finishPrompt.promise;
+    };
+
+    tapQuestion(f, "late-custom-prompt", id, 0, "c", card.messageId);
+    await promptStarted.promise;
+    expect(f.replies!.cancelQuestion(id, key, toolUseId)).toBe(true);
+    finishPrompt.resolve();
+    await apiSettled(() => promptMessageId !== undefined && f.bot.calls.some(call =>
+      call.method === "deleteMessage" && call.body.chat_id === String(chat) && call.body.message_id === promptMessageId),
+    "stale custom prompt deletion");
+
+    const prompt = f.bot.sent.find(send => send.reply_markup?.force_reply)!;
+    expect(prompt.chat_id).toBe(String(chat));
+    expect(prompt.reply_parameters.message_id).toBe(card.messageId);
+    expect(prompt.reply_markup).toEqual({ force_reply: true, selective: true });
+    expect(f.bot.calls.filter(call => call.method === "deleteMessage" && call.body.message_id === promptMessageId)).toHaveLength(1);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+  });
+
+  test("re-pairs an in-flight question send without letting the old generation own or clear the new card", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const nextOwner = owner + 1, nextChat = chat + 1;
+    const oldSendStarted = Promise.withResolvers<void>(), finishOldSend = Promise.withResolvers<void>();
+    const newSendStarted = Promise.withResolvers<void>(), finishNewSend = Promise.withResolvers<void>();
+    let oldCardBody: Record<string, any> | undefined;
+    f.bot.beforeSend = async body => {
+      const buttons = body.reply_markup?.inline_keyboard?.flat() ?? [];
+      if (!buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))) return;
+      if (body.chat_id === String(chat)) {
+        oldCardBody = body;
+        oldSendStarted.resolve();
+        await finishOldSend.promise;
+      } else if (body.chat_id === String(nextChat)) {
+        newSendStarted.resolve();
+        await finishNewSend.promise;
+      }
+    };
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "repaired-inflight-question", [
+      { id: "route", question: "Which route?", options: [{ label: "Local" }, { label: "Remote" }] },
+    ]);
+    const answer = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await oldSendStarted.promise;
+    const oldCardMessageId = f.bot.sent.indexOf(oldCardBody!) + 1;
+
+    f.telegram.unpair();
+    const pairingCode = f.telegram.info(true).pairingCode!;
+    f.bot.enqueue(message(`/pair ${pairingCode}`, {
+      from: { id: nextOwner, username: "synthetic_next_owner" }, chat: { id: nextChat, type: "private" },
+    }));
+    await eventually(() => f.db.getSetting("telegram.user_id") === String(nextOwner), "new owner pairing");
+    finishOldSend.resolve();
+    await newSendStarted.promise;
+    f.telegram.observe(f.db.getSession(key)!, "question");
+    finishNewSend.resolve();
+
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt && item.chatId === String(nextChat)) &&
+      f.bot.calls.some(call => call.method === "editMessageReplyMarkup" &&
+        call.body.chat_id === String(chat) && call.body.message_id === oldCardMessageId),
+    "new owner question controls and old keyboard cleanup");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt && item.chatId === String(nextChat))!;
+    const newOwnerCards = sendCalls(f.bot).filter(call => call.body.chat_id === String(nextChat) &&
+      call.body.reply_markup?.inline_keyboard?.flat().some((button: { callback_data?: string }) => button.callback_data?.startsWith(`q:${id}:`)));
+    expect(newOwnerCards).toHaveLength(1);
+    expect(f.bot.calls.find(call => call.method === "editMessageReplyMarkup" &&
+      call.body.chat_id === String(chat) && call.body.message_id === oldCardMessageId)?.body.reply_markup)
+      .toEqual({ inline_keyboard: [] });
+    expect(f.bot.calls.some(call => call.method === "editMessageReplyMarkup" &&
+      call.body.chat_id === String(nextChat) && call.body.message_id === card.messageId)).toBe(false);
+
+    const offset = Number(f.db.getSetting("telegram.offset") ?? "0");
+    f.bot.enqueueUpdate({ callback_query: {
+      id: "old-owner-tap", from: { id: owner },
+      message: { message_id: card.messageId, chat: { id: nextChat, type: "private" } }, data: `q:${id}:0:1`,
+    } });
+    await eventually(() => Number(f.db.getSetting("telegram.offset") ?? "0") > offset, "rejected old-owner callback");
+    expect(f.bot.count("answerCallbackQuery")).toBe(0);
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("pending");
+
+    f.bot.enqueueUpdate({ callback_query: {
+      id: "new-owner-tap", from: { id: nextOwner },
+      message: { message_id: card.messageId, chat: { id: nextChat, type: "private" } }, data: `q:${id}:0:1`,
+    } });
+    expect(await answer).toEqual({ status: 200, answers: { "Which route?": "Remote" } });
+    expect(f.db.getQuestionInvocation(id, key)).toMatchObject({ state: "consumed", source: "telegram", listener: "telegram" });
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).length === 0, "consumed question cleanup");
+  });
+
+  test("redacts every displayed question field before pagination", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const headerSecret = `sk-${"H".repeat(24)}`, questionSecret = `sk-${"Q".repeat(24)}`;
+    const labelSecret = `sk-${"L".repeat(24)}`, descriptionSecret = `sk-${"D".repeat(24)}`;
+    const previewSecret = `sk-${"P".repeat(24)}`;
+    const { id } = registerClaudeQuestion(f, "redacted-question", [{
+      id: "choice", header: `Header ${headerSecret}`, question: `${"q".repeat(535)}${questionSecret}`,
+      options: [{ label: `Label ${labelSecret}`, description: `Description ${descriptionSecret}`, preview: `Preview ${previewSecret}` },
+        { label: "Other choice" }],
+    }]);
+    await apiSettled(() => questionMessages(f.bot).length === 2, "redacted question pages");
+    const rendered = questionMessages(f.bot).map(send => visibleText(send.text)).join("\n");
+    for (const secret of [headerSecret, questionSecret, labelSecret, descriptionSecret, previewSecret]) {
+      expect(rendered).not.toContain(secret);
+    }
+    expect(rendered.match(/\[redacted\]/g)).toHaveLength(5);
+    expect(rendered).not.toContain(questionSecret.slice(0, 8));
+    expect(rendered).not.toContain(questionSecret.slice(8));
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(1);
+  });
+
+  test("zero content budget keeps native question details and answer controls off Telegram", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, snippetChars: 0, clock: { now: Date.now() } });
+    const secret = `sk-${"Z".repeat(24)}`;
+    const { id } = registerClaudeQuestion(f, "zero-question-content", [{
+      id: "private-route", header: `Private header ${secret}`, question: `Should this be shown? ${secret}`,
+      options: [{ label: `Use secure route (Recommended) ${secret}`, description: `Private detail ${secret}` },
+        { label: "Fallback route", preview: `Private preview ${secret}` }],
+    }]);
+    await apiSettled(() => f.bot.sent.length > 0, "metadata-only needs-input alert");
+    const rendered = visibleText(f.bot.sent.map(send => send.text).join("\n"));
+    for (const hidden of ["Private header", "Should this be shown?", "Use secure route", "Private detail", "Private preview"]) {
+      expect(rendered).not.toContain(hidden);
+    }
+    expect(questionMessages(f.bot)).toHaveLength(0);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    const buttons = f.bot.sent.flatMap(send => send.reply_markup?.inline_keyboard?.flat() ?? []);
+    expect(buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))).toBe(false);
+  });
+
+  test("positive budget clips one complete question before pagination and hides choices it cannot fit", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, snippetChars: 160, clock: { now: Date.now() } });
+    registerClaudeQuestion(f, "bounded-question", [{
+      id: "route", header: "Route selection", question: "Which path should be used?",
+      options: [{ label: "Keep local", description: "No rewrite" },
+        { label: "Use remote", preview: `Overflow sample ${"excerpt ".repeat(100)}UNSENT-OVERFLOW-TAIL` }],
+    }]);
+    await apiSettled(() => questionMessages(f.bot).length === 1, "bounded question card");
+    const content = visibleText(questionMessages(f.bot)[0]!.text).split("\n").slice(1).join("\n");
+    expect([...content].length).toBeLessThanOrEqual(160);
+    expect(content).toContain("1. Keep local");
+    expect(content).toContain("2. Use remote");
+    expect(content).not.toContain("UNSENT-OVERFLOW-TAIL");
+
+    const hidden = await pairedFixture({ repliesEnabled: true, snippetChars: 16, clock: { now: Date.now() } });
+    const { id } = registerClaudeQuestion(hidden, "hidden-choice-question", [{
+      id: "route", question: "Which path?", options: [{ label: "Keep local" }, { label: "Use remote" }],
+    }]);
+    await apiSettled(() => hidden.bot.sent.length > 0, "bounded metadata-only alert");
+    expect(questionMessages(hidden.bot)).toHaveLength(0);
+    expect(hidden.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    const buttons = hidden.bot.sent.flatMap(send => send.reply_markup?.inline_keyboard?.flat() ?? []);
+    expect(buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))).toBe(false);
+  });
+
+  test.each(["question", "description", "redaction"] as const)(
+    "repeated option text in %s cannot stand in for the actual option labels", async source => {
+      const f = await pairedFixture({
+        repliesEnabled: true, snippetChars: source === "redaction" ? Infinity : 100, clock: { now: Date.now() },
+      });
+      const keyType = "PRIVATE KEY";
+      const beginKey = `-----BEGIN ${keyType}-----`, endKey = `-----END ${keyType}-----`;
+      const { id } = registerClaudeQuestion(f, `repeated-label-${source}`, [{
+        id: "route",
+        question: source === "question"
+          ? `Examples: 1. Keep, 2. Replace. ${"context ".repeat(40)}`
+          : source === "redaction" ? `Examples: 1. Keep, 2. Replace ${endKey}.` : "Which route?",
+        options: [
+          { label: "Keep", description: source === "description"
+            ? `Example: 2. Replace. ${"context ".repeat(40)}`
+            : source === "redaction" ? `${beginKey}\nsynthetic-key-material` : undefined },
+          { label: source === "redaction" ? `Replace ${endKey}` : "Replace" },
+        ],
+      }]);
+      await apiSettled(() => f.bot.sent.length > 0, "metadata-only hidden-option alert");
+      expect(questionMessages(f.bot)).toHaveLength(0);
+      expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+      const buttons = f.bot.sent.flatMap(send => send.reply_markup?.inline_keyboard?.flat() ?? []);
+      expect(buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))).toBe(false);
+    },
+  );
+
+  test.each(["global", "session"] as const)("does not create native question cards during a %s mute", async mute => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const sessionId = `native-${mute}-mute`;
+    if (mute === "global") f.db.setSetting("telegram.mute_until", String(f.clock.now + 60_000));
+    else {
+      const row = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId, kind: "question",
+        ts: f.clock.now, text: "Synthetic waiting question", interactive: true });
+      f.telegram.observe(row);
+      await apiSettled(() => f.bot.sent.length === 1, "session alert with mute action");
+      const data = f.bot.sent[0]!.reply_markup.inline_keyboard[0][0].callback_data;
+      f.bot.enqueueUpdate({ callback_query: {
+        id: "mute-native-question", from: { id: owner },
+        message: { chat: { id: chat, type: "private" } }, data,
+      } });
+      await eventually(() => f.bot.count("answerCallbackQuery") === 1, "session mute callback");
+    }
+    const { id } = registerClaudeQuestion(f, sessionId, [{
+      id: "choice", question: "Should this stay muted?", options: [{ label: "Yes" }, { label: "No" }],
+    }]);
+    await apiSettled(() => questionMessages(f.bot).length === 0);
+    expect(questionMessages(f.bot)).toHaveLength(0);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+  });
+
+  test("a queued question send rechecks mute after pacing and replay does not resend it", async () => {
+    const clock = { now: Date.now() };
+    let holdNextSleep = false, releaseSleep: (() => void) | undefined, markSleepStarted: (() => void) | undefined;
+    const sleepStarted = new Promise<void>(resolve => { markSleepStarted = resolve; });
+    const sleep = async (ms: number) => {
+      if (holdNextSleep) {
+        holdNextSleep = false;
+        await new Promise<void>(resolve => {
+          releaseSleep = () => { clock.now += ms; resolve(); };
+          markSleepStarted?.();
+        });
+      } else clock.now += ms;
+    };
+    const f = await topicFixture({ repliesEnabled: true, clock, sleep });
+    const rateLimitRow = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "rate-limit",
+      cwd: "/projects/invest/synthetic", kind: "question", ts: clock.now, text: "Synthetic waiting text", interactive: true });
+    f.telegram.observe(rateLimitRow);
+    await apiSettled(() => f.bot.sent.length === 1, "prior paced send");
+
+    const { id, key } = registerClaudeQuestion(f, "queued-question", [{
+      id: "choice", question: "Queued synthetic question?", options: [{ label: "First" }, { label: "Second" }],
+    }], false);
+    const row = f.db.getSession(key)!;
+    f.db.setSetting("telegram.mute_until", String(clock.now + 60_000));
+    f.telegram.observe(row, "question");
+    f.db.setSetting("telegram.mute_until", "0");
+    holdNextSleep = true;
+    f.telegram.observe(row, "question");
+    await sleepStarted;
+    f.db.setSetting("telegram.mute_until", String(clock.now + 60_000));
+    const marker = f.telegram.sendUrgent("invest", "Synthetic queue synchronization marker");
+    releaseSleep!();
+    expect(await marker).toBe(true);
+    expect(questionMessages(f.bot)).toHaveLength(0);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+
+    f.db.setSetting("telegram.mute_until", "0");
+    f.telegram.observe(row, "question");
+    await apiSettled(() => questionMessages(f.bot).length === 1, "unmuted question card");
+    const beforeReplay = questionMessages(f.bot).length;
+    f.db.setSetting("telegram.mute_until", String(clock.now + 60_000));
+    f.telegram.close();
+    const again = createTelegram({ db: f.db, apiBase: f.bot.base, fetch: trackedFetch, now: () => clock.now, replies: f.replies,
+      readToken: async () => token, sleep: async ms => { clock.now += ms; } });
+    resources.push(() => again.close());
+    again.start();
+    await eventually(() => again.health().state === "ok", "muted question replay startup");
+    await apiSettled(() => questionMessages(f.bot).length === beforeReplay, "muted question replay");
+    expect(questionMessages(f.bot)).toHaveLength(beforeReplay);
+  });
+
+
+  test.each([
+    ["option", false], ["custom", false], ["option", true], ["custom", true],
+  ] as const)("one single-choice %s answer sends once (group topics: %s)", async (kind, topics) => {
+    const f = await (topics ? topicFixture : pairedFixture)({ repliesEnabled: true, clock: { now: Date.now() } });
+    const recipient = topics ? group : chat;
+    const { id, key, toolUseId } = registerClaudeQuestion(f, `single-${kind}`, [
+      { id: "route", question: "Which route?", options: [{ label: "Local (Recommended)" }, { label: "Remote" }] },
+    ]);
+    const wait = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "single question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    const answer = kind === "option" ? "Remote" : "café 雪 — custom";
+    expect(card.chatId).toBe(String(recipient));
+    tapQuestion(f, "single-answer", id, 0, kind === "option" ? "1" : "c", card.messageId, recipient);
+    if (kind === "custom") {
+      await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => item.prompt), "custom reply prompt");
+      const prompt = f.db.telegramQuestionMessagesForQuestion(id).find(item => item.prompt)!;
+      expect(prompt.chatId).toBe(String(recipient));
+      // Selective ForceReply targets mentions or the original message's sender.
+      // This prompt replies to our own bot card, so it must mention the owner.
+      const sentPrompt = f.bot.calls.filter(call => call.method === "sendMessage" && call.body.reply_markup?.force_reply).at(-1)!.body;
+      expect(sentPrompt.reply_markup.selective).toBe(true);
+      const replyTargets = [...String(sentPrompt.text).matchAll(/<a href="tg:\/\/user\?id=(\d+)">/g)].map(match => match[1]);
+      expect(replyTargets).toEqual([String(owner)]);
+      f.bot.enqueue(message(answer, { message_id: 99, chat: { id: recipient, type: topics ? "supergroup" : "private" },
+        reply_to_message: { message_id: prompt.messageId } }));
+    }
+    expect(await wait).toEqual({ status: 200, answers: { "Which route?": answer } });
+    expect(f.db.getQuestionInvocation(id, key)).toMatchObject({ state: "consumed", source: "telegram", listener: "telegram" });
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    tapQuestion(f, "replayed-answer", id, 0, "0", card.messageId, recipient);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 2, "replayed answer refusal");
+    expect(await f.replies!.waitQuestion(key, id, toolUseId, 1)).toEqual({ status: 409 });
+    expect(f.bot.sent.every(send => send.chat_id === String(recipient))).toBe(true);
+  });
+
+  test("moves a pending private question into the group when topic mode is enabled", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "question-group-cutover", [
+      { id: "route", question: "Which route?", options: [{ label: "Local" }, { label: "Remote" }] },
+    ]);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt));
+    const oldCard = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    f.telegram.close();
+    f.db.setSetting("telegram.topics", JSON.stringify({ groupChatId: String(group), topics: defaultTopics }));
+    const again = createTelegram({ db: f.db, topicsEnabled: true, replies: f.replies, apiBase: f.bot.base,
+      fetch: trackedFetch, now: () => f.clock.now, readToken: async () => token,
+      sleep: async ms => { f.clock.now += ms; } });
+    resources.push(() => again.close());
+    again.start();
+    await eventually(() => again.health().state === "ok");
+    expect(await again.sendUrgent("synthetic", "Group synchronization marker")).toBe(true);
+    const cards = f.db.telegramQuestionMessagesForQuestion(id).filter(item => !item.prompt);
+    expect(cards.map(card => card.chatId)).toEqual([String(group)]);
+    expect(f.bot.calls.filter(call => call.method === "editMessageReplyMarkup" &&
+      call.body.chat_id === String(chat) && call.body.message_id === oldCard.messageId)
+      .at(-1)?.body.reply_markup.inline_keyboard).toEqual([]);
+    tapQuestion(f, "group-cutover-answer", id, 0, "1", cards[0]!.messageId, group);
+    expect(await f.replies!.waitQuestion(key, id, toolUseId, 30_000)).toEqual({
+      status: 200, answers: { "Which route?": "Remote" },
+    });
+  });
+
+  test("preserves multiple Claude selections and custom text, then consumes one exact answer map", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const originalQuestion = `Choose an approach? sk-${"Q".repeat(24)}`;
+    const originalLabel = `Replace (Recommended) sk-${"O".repeat(24)}`;
+    const questions: AskQuestion[] = [
+      { id: "approach", question: originalQuestion, header: "Implementation",
+        options: [{ label: "Keep <existing> & tested", description: "No rewrite" }, { label: originalLabel }] },
+      { id: "colors", question: "Which colors?", options: [{ label: "Red & blue" }, { label: "Green" }], multi: true },
+    ];
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "telegram-claude-question", questions);
+    const wait = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).filter(item => !item.prompt).length === 2,
+      "two question cards");
+    const q0 = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt && item.questionIndex === 0)!;
+    const q1 = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt && item.questionIndex === 1)!;
+    expect(f.bot.sent.some(item => visibleText(item.text).includes("Keep <existing> & tested") &&
+      visibleText(item.text).includes("Replace (Recommended)"))).toBe(true);
+
+    tapQuestion(f, "select-single", id, 0, "1", q0.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 1, "single selection");
+    tapQuestion(f, "select-multi", id, 1, "0", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 2, "first multi selection");
+    tapQuestion(f, "select-multi-second", id, 1, "1", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 3, "second multi selection");
+    tapQuestion(f, "custom-button", id, 1, "c", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 4, "custom-answer prompt");
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => item.prompt), "ForceReply prompt");
+    const prompt = f.db.telegramQuestionMessagesForQuestion(id).find(item => item.prompt)!;
+    f.bot.enqueue(message("My own & free", { message_id: 99, reply_to_message: { message_id: prompt.messageId } }));
+    await apiSettled(() => !f.db.telegramQuestionMessage(chat, prompt.messageId), "custom reply consumed");
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("pending");
+
+    tapQuestion(f, "submit-answers", id, 1, "s", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 5, "answer submission");
+    expect(await wait).toEqual({
+      status: 200,
+      answers: {
+        [originalQuestion]: originalLabel,
+        "Which colors?": "Red & blue, Green, My own & free",
+      },
+    });
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("consumed");
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+
+    tapQuestion(f, "stale-question", id, 0, "0", q0.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 6, "stale button refusal");
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("consumed");
+  });
+
+  test("cancel returns Claude to its native terminal question without approving anything", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "telegram-terminal-fallback", [
+      { id: "continue", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }] },
+    ]);
+    const wait = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    tapQuestion(f, "cancel-question", id, 0, "x", card.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 1, "terminal fallback cancellation");
+    expect(await wait).toEqual({ status: 409 });
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("cancelled");
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+  });
+
+  test.each(["cancel", "expire"] as const)("%s from the hook removes the Telegram keyboard while terminal input remains pending", async action => {
+    const f = await pairedFixture({ repliesEnabled: true, observeReplies: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, `hook-${action}`, [
+      { id: "route", question: "Which route?", options: [{ label: "Local" }, { label: "Remote" }] },
+    ]);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    if (action === "cancel") expect(f.replies!.cancelQuestion(id, key, toolUseId)).toBe(true);
+    else { f.clock.now += 60_000; f.replies!.sweep(); }
+    await apiSettled(() => f.bot.calls.some(call => call.method === "editMessageReplyMarkup" &&
+      call.body.message_id === card.messageId), "terminal fallback keyboard removal");
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    expect(f.db.getSession(key)).toMatchObject({ status: "needs_input", needsReason: "question" });
+    expect(f.bot.calls.filter(call => call.method === "editMessageReplyMarkup" && call.body.message_id === card.messageId)
+      .at(-1)?.body.reply_markup).toEqual({ inline_keyboard: [] });
+  });
+
+  test.each([false, true])("keeps OMP's exact question reply envelope with multi-select=%s", async multi => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const questionId = "omp-question-identity";
+    const row = f.db.applyEvent({ host: "synthetic-host", harness: "omp", sessionId: "telegram-omp-question",
+      kind: "question", ts: f.clock.now, text: "Which color?", interactive: true, questionIdentity: questionId,
+      questionData: [{ id: "color-choice", question: "Which color?", options: [{ label: "Red & gold" }, { label: "Blue" }], multi }] });
+    f.telegram.observe(row, "question");
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(questionId).some(item => !item.prompt), "OMP question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(questionId).find(item => !item.prompt)!;
+    tapQuestion(f, "omp-select", questionId, 0, "1", card.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 1, "OMP selection");
+    if (multi) {
+      expect(f.db.queuedReplies()).toHaveLength(0);
+      tapQuestion(f, "omp-submit", questionId, 0, "s", card.messageId);
+      await eventually(() => f.bot.count("answerCallbackQuery") === 2, "OMP answer");
+    }
+
+    const reply = f.db.queuedReplies()[0]!;
+    expect(reply.answersQuestion).toBe(questionId);
+    expect(reply.text).toBe('"color-choice": {"selectedOptions":["Blue"]}');
+    expect(reply.source).toBe("telegram");
+    expect(reply.actor).toBe(`telegram:${owner}`);
+    expect(f.db.telegramQuestionMessagesForQuestion(questionId)).toHaveLength(0);
   });
 });
 

@@ -264,7 +264,12 @@
   function replyDialogCopy(s) {
     if (statusOf(s) !== 'needs_input') return '';
     const reason = byId(s, 'needsReason', 'needs_reason');
-    if (byId(s, 'harness') === 'claude' && ['question','permission','permission_prompt','elicitation_dialog','elicitation_url_dialog'].includes(reason)) return 'Answer in the terminal or Remote Control (dialog answering: Step 6)';
+    if (byId(s, 'harness') === 'claude' && reason === 'question') {
+      const id = s.pendingQuestion?.id ?? s.pendingQuestionId;
+      if (id && s.pendingQuestion?.id === id) return '';
+      return 'Answer in the terminal or Remote Control (remote questions are opt-in)';
+    }
+    if (byId(s, 'harness') === 'claude' && ['permission','permission_prompt','elicitation_dialog','elicitation_url_dialog'].includes(reason)) return 'Answer in the terminal or Remote Control (dialog answering: Step 6)';
     if (byId(s, 'harness') === 'omp' && reason === 'permission') return 'Approve in the terminal (dialog answering: Step 6)';
     return '';
   }
@@ -273,7 +278,10 @@
     const session = state.sessions.find(item => responseKey(item) === key);
     if (session) patchSessionCard(session, session);
   }
-  function replyApiPath(key, suffix = '') { return `/api/sessions/${encodeURIComponent(key)}/replies${suffix}`; }
+  function replyApiPath(key, suffix = '') {
+    const endpoint = suffix === '/reply' ? suffix : `/replies${suffix}`;
+    return `/api/sessions/${encodeURIComponent(key)}${endpoint}`;
+  }
   async function refreshReplyAvailability() {
     const response = await fetch('/healthz');
     if (!response.ok) throw new Error('Reply status unavailable');
@@ -380,23 +388,24 @@
       await loadSessions().catch(() => {});
       return;
     }
-    state.replyPending.add(key);
     state.replyNotices.delete(key);
+    state.replyPending.add(key);
     patchSessionCard(session, session);
     try {
-      const body = { text, ...(answersTurn === undefined ? {} : { answersTurn }), ...(answersQuestion === undefined ? {} : { answersQuestion }) };
-      const response = await postJson(`/api/sessions/${encodeURIComponent(key)}/reply`, body);
-      let payload = {};
-      try { payload = await response.json(); } catch {}
+      const response = await postJson(replyApiPath(key, '/reply'), {
+        text,
+        ...(answersTurn !== undefined ? { answersTurn } : {}),
+        ...(answersQuestion !== undefined ? { answersQuestion } : {})
+      });
+      const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        if (response.status === 404 && payload.error === 'not found') {
-          await refreshReplyAvailability().catch(() => {});
-          return;
+        if (response.status === 404 && payload?.error === 'not found') {
+          state.repliesEnabled = false; stopAllReplyRefreshes(); renderSessions(); return;
         }
         if (response.status === 409 && ['stale_turn', 'stale_question'].includes(payload?.reason)) {
           await loadSessions().catch(() => {});
           replyNotice(key, payload.reason === 'stale_question' ? 'Out of date: the question has been answered or replaced' : 'Out of date: the session has moved on');
-        } else replyNotice(key, payload?.reason === 'invalid_question' ? 'Could not send this answer. Keep it under 4,000 characters and refresh the question.' : 'Could not send this reply.');
+        } else replyNotice(key, payload?.reason === 'invalid_question' ? 'Could not send this answer. Refresh the question and try again.' : 'Could not send this reply.');
         return;
       }
       const draftKey = answersQuestion === undefined ? key : `${key}#${answersQuestion}`;
@@ -411,33 +420,76 @@
     }
   }
 
+  async function submitQuestion(key, questionId, answers) {
+    if (state.replyPending.has(key)) return;
+    const session = state.sessions.find(item => responseKey(item) === key);
+    if (!session || statusOf(session) !== 'needs_input' || byId(session, 'harness') !== 'claude' ||
+        replyDialogCopy(session) || (session.pendingQuestion?.id ?? session.pendingQuestionId) !== questionId) {
+      await loadSessions().catch(() => {});
+      replyNotice(key, 'Out of date: the question has been answered or replaced');
+      return;
+    }
+    state.replyNotices.delete(key);
+    state.replyPending.add(key);
+    patchSessionCard(session, session);
+    try {
+      const response = await postJson(`/api/sessions/${encodeURIComponent(key)}/question`, { questionId, answers });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        if (response.status === 404 && payload?.error === 'not found') {
+          state.repliesEnabled = false; stopAllReplyRefreshes(); renderSessions(); return;
+        }
+        if (response.status === 409 && payload?.reason === 'stale_question') {
+          await loadSessions().catch(() => {});
+          replyNotice(key, 'Out of date: the question has been answered or replaced');
+        } else replyNotice(key, payload?.reason === 'invalid_question'
+          ? 'Could not send this answer. Check the selections and try again.'
+          : 'Could not send this answer.');
+        return;
+      }
+      questionPicks.delete(`${key}#${questionId}`);
+      await loadSessions().catch(() => {});
+    } catch { replyNotice(key, 'Could not send this answer.'); }
+    finally {
+      state.replyPending.delete(key);
+      const current = state.sessions.find(item => responseKey(item) === key);
+      if (current) patchSessionCard(current, current);
+    }
+  }
+
   function renderReplyControls(s, key, status, responses) {
     if (!state.repliesEnabled || status === 'ended') return null;
     const controls = el('section', 'reply-controls');
     const dialogCopy = replyDialogCopy(s), busy = state.replyPending.has(key);
-    const pendingId = byId(s, 'harness') === 'omp' && status === 'needs_input' && !dialogCopy ? s.pendingQuestion?.id ?? s.pendingQuestionId : undefined;
-    const pending = pendingId ? s.pendingQuestion : undefined;
+    const harness = byId(s, 'harness'), reason = byId(s, 'needsReason', 'needs_reason');
+    const pendingId = harness === 'omp' && status === 'needs_input' && !dialogCopy
+      ? s.pendingQuestion?.id ?? s.pendingQuestionId
+      : harness === 'claude' && status === 'needs_input' && reason === 'question' &&
+        s.pendingQuestion && s.pendingQuestion.id === s.pendingQuestionId ? s.pendingQuestion.id : undefined;
+    const pending = pendingId ? s.pendingQuestion : undefined, claudeQuestion = harness === 'claude' && Boolean(pending);
     const draftKey = pendingId ? `${key}#${pendingId}` : key;
-    if (pending) controls.append(renderPendingQuestion(key, pending, busy));
-    const reason = byId(s, 'needsReason', 'needs_reason');
-    const hint = dialogCopy || (byId(s, 'harness') === 'claude' && status === 'working' ? 'Queues until the next safe point' : byId(s, 'harness') === 'omp' && status === 'needs_input' && reason === 'question' ? "Answers omp's pending question" : 'Cmd/Ctrl+Enter to send');
-    const label = el('label', 'reply-label', `Reply to ${nameOf(s)}`), textarea = el('textarea', 'reply-input');
-    textarea.rows = 3; textarea.value = state.drafts.get(draftKey) ?? ''; textarea.disabled = Boolean(dialogCopy);
-    textarea.setAttribute('aria-label', `Reply to ${nameOf(s)}`); textarea.dataset.replyFocus = 'input';
-    textarea.addEventListener('keydown', event => {
-      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-        event.preventDefault();
-        if (!textarea.disabled && textarea.value.trim()) submitReply(key, textarea.value, undefined, pendingId);
-      }
-    });
-    label.append(textarea); controls.append(label, el('p', `reply-hint${dialogCopy ? ' reply-dialog-note' : ''}`, hint));
-    const actions = el('div', 'reply-actions'), send = el('button', 'button button-primary', 'Send reply');
-    send.type = 'button'; send.disabled = Boolean(dialogCopy) || busy || !textarea.value.trim(); send.dataset.replyFocus = 'send';
-    textarea.addEventListener('input', () => {
-      state.drafts.set(draftKey, textarea.value);
-      send.disabled = Boolean(dialogCopy) || state.replyPending.has(key) || !textarea.value.trim();
-    });
-    send.addEventListener('click', () => submitReply(key, textarea.value, undefined, pendingId)); actions.append(send);
+    if (pending) controls.append(renderPendingQuestion(key, pending, busy, harness));
+    const actions = el('div', 'reply-actions');
+    if (!claudeQuestion) {
+      const hint = dialogCopy || (harness === 'claude' && status === 'working' ? 'Queues until the next safe point' : harness === 'omp' && status === 'needs_input' && reason === 'question' ? "Answers omp's pending question" : 'Cmd/Ctrl+Enter to send');
+      const label = el('label', 'reply-label', `Reply to ${nameOf(s)}`), textarea = el('textarea', 'reply-input');
+      textarea.rows = 3; textarea.value = state.drafts.get(draftKey) ?? ''; textarea.disabled = Boolean(dialogCopy);
+      textarea.setAttribute('aria-label', `Reply to ${nameOf(s)}`); textarea.dataset.replyFocus = 'input';
+      textarea.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+          event.preventDefault();
+          if (!textarea.disabled && textarea.value.trim()) submitReply(key, textarea.value, undefined, pendingId);
+        }
+      });
+      label.append(textarea); controls.append(label, el('p', `reply-hint${dialogCopy ? ' reply-dialog-note' : ''}`, hint));
+      const send = el('button', 'button button-primary', 'Send reply');
+      send.type = 'button'; send.disabled = Boolean(dialogCopy) || busy || !textarea.value.trim(); send.dataset.replyFocus = 'send';
+      textarea.addEventListener('input', () => {
+        state.drafts.set(draftKey, textarea.value);
+        send.disabled = Boolean(dialogCopy) || state.replyPending.has(key) || !textarea.value.trim();
+      });
+      send.addEventListener('click', () => submitReply(key, textarea.value, undefined, pendingId)); actions.append(send);
+    }
     const turnSeq = Number(byId(s, 'turnSeq', 'turn_seq') || 0), current = currentTurnResponse(responses, turnSeq);
     if (!pendingId && responses.length > 0 && turnSeq > 0) {
       const ready = status === 'your_turn' && !dialogCopy && !busy && Boolean(current);
@@ -451,7 +503,7 @@
       recommendationButton.addEventListener('click', () => submitReply(key, 'Go with your recommendation(s) in your last message. You are authorized for the action(s) you asked about there, including any approval, additional review waves, or destructive steps they require. This authorization covers only what your last message asked about.', turnSeq));
       actions.append(continueButton, recommendationButton);
     }
-    controls.append(actions);
+    if (actions.children.length) controls.append(actions);
     const replies = state.replyStates.get(key) || [];
     if (replies.length) {
       const list = el('ul', 'reply-history'); list.setAttribute('aria-label', 'Recent replies');
@@ -475,24 +527,39 @@
     return controls;
   }
 
-  function renderPendingQuestion(key, pending, busy) {
-    const pickKey = `${key}#${pending.id}`, questions = pending.questions;
+  function renderPendingQuestion(key, pending, busy, harness) {
+    const isClaude = harness === 'claude', pickKey = `${key}#${pending.id}`, questions = pending.questions;
     let answers = questionPicks.get(pickKey);
     if (!answers) {
       answers = questions.map(() => ({ selected: new Set(), other: false, custom: '' }));
       questionPicks.set(pickKey, answers);
     }
     const box = el('div', 'decisions');
-    box.dataset.ompQuestionId = pending.id;
+    if (isClaude) box.dataset.claudeQuestionId = pending.id;
+    else box.dataset.ompQuestionId = pending.id;
     box.setAttribute('role', 'group');
-    box.setAttribute('aria-label', 'Pending OMP questions');
+    box.setAttribute('aria-label', `Pending ${isClaude ? 'Claude' : 'OMP'} questions`);
     const send = el('button', 'button button-primary', questions.length === 1 ? 'Send answer' : 'Send answers');
-    send.type = 'button'; send.dataset.ompSubmit = ''; send.dataset.replyFocus = `question-${pending.id}-send`;
+    send.type = 'button';
+    if (isClaude) send.dataset.claudeQuestionSubmit = ''; else send.dataset.ompSubmit = '';
+    send.dataset.replyFocus = `question-${pending.id}-send`;
     const ready = () => questions.every((question, index) => question.multi === true ||
       answers[index].selected.size === 1 || answers[index].other && answers[index].custom.trim());
     const refreshSend = () => { send.disabled = busy || !ready(); };
     const submit = () => {
       if (!ready()) return;
+      if (isClaude) {
+        const selections = Object.create(null);
+        questions.forEach((question, index) => {
+          const answer = answers[index];
+          selections[question.question] = {
+            selectedOptions: [...answer.selected].sort((left, right) => left - right),
+            ...(answer.other && answer.custom.trim() ? { customInput: answer.custom } : {}),
+          };
+        });
+        submitQuestion(key, pending.id, selections);
+        return;
+      }
       const text = questions.map((question, index) => {
         const answer = answers[index], result = {
           selectedOptions: question.options.filter((_, option) => answer.selected.has(option)).map(option => option.label),
@@ -505,7 +572,7 @@
     };
     questions.forEach((question, index) => {
       const answer = answers[index], group = el('div', 'omp-question'), options = el('div', 'decision-options');
-      group.dataset.ompQuestionIndex = String(index);
+      group.dataset[isClaude ? 'claudeQuestionIndex' : 'ompQuestionIndex'] = String(index);
       group.setAttribute('role', 'group'); group.setAttribute('aria-label', question.question);
       if (question.header) group.append(el('p', 'reply-hint', question.header));
       group.append(el('p', 'decision-title', question.question));
@@ -519,7 +586,8 @@
       question.options.forEach((option, optionIndex) => {
         const recommended = question.multi !== true && question.recommended === optionIndex;
         const button = el('button', 'button button-secondary decision-option', `${option.label}${recommended && !option.label.endsWith(' (Recommended)') ? ' (Recommended)' : ''}`);
-        button.type = 'button'; button.disabled = busy; button.dataset.ompOptionIndex = String(optionIndex);
+        button.type = 'button'; button.disabled = busy;
+        button.dataset[isClaude ? 'claudeOptionIndex' : 'ompOptionIndex'] = String(optionIndex);
         button.dataset.replyFocus = `question-${pending.id}-${index}-${optionIndex}`;
         if (option.description) button.append(el('span', 'omp-option-description', option.description));
         button.addEventListener('click', () => {
@@ -541,12 +609,14 @@
         optionButtons.push(button); options.append(row);
       });
       const other = el('button', 'button button-secondary decision-option', 'Other (type your own)');
-      other.type = 'button'; other.disabled = busy; other.dataset.ompOther = '';
+      other.type = 'button'; other.disabled = busy;
+      if (isClaude) other.dataset.claudeOther = ''; else other.dataset.ompOther = '';
       other.dataset.replyFocus = `question-${pending.id}-${index}-other`;
       other.setAttribute('aria-pressed', String(answer.other));
       const custom = el('textarea', 'reply-input');
-      custom.rows = 2; custom.value = answer.custom; custom.hidden = !answer.other; custom.disabled = busy;
-      custom.dataset.ompCustom = ''; custom.dataset.replyFocus = `question-${pending.id}-${index}-custom`;
+      custom.rows = 2; custom.value = answer.custom; custom.hidden = !answer.other; custom.disabled = busy; custom.maxLength = 4000;
+      if (isClaude) custom.dataset.claudeCustom = ''; else custom.dataset.ompCustom = '';
+      custom.dataset.replyFocus = `question-${pending.id}-${index}-custom`;
       custom.setAttribute('aria-label', `Custom answer: ${question.question}`);
       other.addEventListener('click', () => {
         answer.other = !answer.other;
