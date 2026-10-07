@@ -79,8 +79,21 @@ function Get-BackupPath([string]$Path) {
     }
     return $candidate
 }
+function Get-ManagedEmptyHookEvents([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+    try {
+        $config = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)) -ErrorAction Stop
+    }
+    catch { return @() }
+    if ($null -eq $config -or $config -is [System.Array] -or $config -is [string] -or $config -is [ValueType]) { return @() }
+    $managedBy = $config.PSObject.Properties['ManagedBy']
+    $emptyEvents = $config.PSObject.Properties['EmptyHookEvents']
+    if ($null -eq $managedBy -or $managedBy.Value -cne 'oh-my-dash-claude-windows' -or
+        $null -eq $emptyEvents -or $emptyEvents.Value -isnot [System.Array]) { return @() }
+    return @($emptyEvents.Value | Where-Object { $_ -is [string] -and $_.Length -gt 0 } | Select-Object -Unique)
+}
 
-function Write-ManagedBytes([string]$Path, [byte[]]$Bytes, $Journal = $null) {
+function Write-ManagedBytes([string]$Path, [byte[]]$Bytes, $Journal = $null, [switch]$SkipBackup) {
     $directory = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
@@ -96,8 +109,11 @@ function Write-ManagedBytes([string]$Path, [byte[]]$Bytes, $Journal = $null) {
             }
         }
         if ($same) { return $null }
-        $backup = Get-BackupPath $Path
-        Copy-Item -LiteralPath $Path -Destination $backup
+        if ($SkipBackup) { $backup = $null }
+        else {
+            $backup = Get-BackupPath $Path
+            Copy-Item -LiteralPath $Path -Destination $backup
+        }
     }
     else { $backup = $null }
 
@@ -152,7 +168,7 @@ function Restore-FailedInstall($Journal, $TaskSnapshot, [string]$TaskName) {
             if ($currentHash -cne $entry.WrittenHash) {
                 throw "File changed outside this installation; preserved it: $($entry.Path)"
             }
-            if ($entry.Existed) { Write-ManagedBytes -Path $entry.Path -Bytes $entry.Original | Out-Null }
+            if ($entry.Existed) { Write-ManagedBytes -Path $entry.Path -Bytes $entry.Original -SkipBackup | Out-Null }
             else { Remove-Item -LiteralPath $entry.Path }
         }
         catch { [Console]::Error.WriteLine("File rollback incomplete: $($_.Exception.Message)") }
@@ -184,7 +200,9 @@ function Test-DashHookMarker($Hook) {
     if ($null -eq $Hook -or $Hook -is [System.Array]) { return $false }
     $commandProperty = $Hook.PSObject.Properties['command']
     if ($null -ne $commandProperty -and $commandProperty.Value -is [string] -and
-        $commandProperty.Value.Contains('# dash-hook')) { return $true }
+        $commandProperty.Value -match '^\s*(?:"(?:[^"]*[\\/])?powershell\.exe"|(?:[^\s"]*[\\/])?powershell\.exe)\s+-NoLogo\s+-NoProfile\s+-NonInteractive\s+-ExecutionPolicy\s+Bypass\s+-File\s+"[^"]*[\\/]claude-hook\.ps1"\s+-DashHookMarker\s+"# dash-hook"\s*$') {
+        return $true
+    }
 
     $argumentsProperty = $Hook.PSObject.Properties['args']
     if ($null -eq $argumentsProperty -or $argumentsProperty.Value -isnot [System.Array]) {
@@ -200,7 +218,28 @@ function Test-DashHookMarker($Hook) {
     return $false
 }
 
-function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups, [ref]$Changed) {
+function Get-SettingsHookMetadata($Document) {
+    $eventNames = New-Object 'System.Collections.Generic.List[string]'
+    $emptyEvents = New-Object 'System.Collections.Generic.List[string]'
+    $hooksProperty = $Document.PSObject.Properties['hooks']
+    if ($null -ne $hooksProperty) {
+        $hooks = $hooksProperty.Value
+        if ($null -ne $hooks -and $hooks -isnot [System.Array] -and $hooks -isnot [string] -and $hooks -isnot [ValueType]) {
+            foreach ($property in @($hooks.PSObject.Properties)) {
+                $eventNames.Add([string]$property.Name)
+                if ($property.Value -is [System.Array] -and $property.Value.Count -eq 0) {
+                    $emptyEvents.Add([string]$property.Name)
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        EventNames = [string[]]$eventNames.ToArray()
+        EmptyEvents = [string[]]$emptyEvents.ToArray()
+    }
+}
+
+function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups, [ref]$Changed, [string[]]$PreserveEmptyEvents = @()) {
     $Changed.Value = $false
     $hooksProperty = $Document.PSObject.Properties['hooks']
     if ($null -eq $hooksProperty) {
@@ -255,7 +294,10 @@ function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups, [
         if ($remainingGroups.Count -gt 0) {
             $eventProperty.Value = [object[]]$remainingGroups.ToArray()
         }
-        elseif (-not $preexistingEmpty.ContainsKey($eventName)) {
+        elseif ($preexistingEmpty.ContainsKey($eventName) -or $PreserveEmptyEvents -contains $eventName) {
+            $eventProperty.Value = [object[]]@()
+        }
+        else {
             $hooks.PSObject.Properties.Remove($eventName)
         }
     }
@@ -331,7 +373,7 @@ function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [switch]$NoR
     return $groups.ToArray()
 }
 
-function Get-SettingsOutput([string]$Path, [switch]$Install, [object[]]$Groups) {
+function Get-SettingsOutput([string]$Path, [switch]$Install, [object[]]$Groups, [string[]]$PreserveEmptyEvents = @()) {
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         $originalText = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
         try { $document = ConvertFrom-Json -InputObject $originalText -ErrorAction Stop }
@@ -346,15 +388,27 @@ function Get-SettingsOutput([string]$Path, [switch]$Install, [object[]]$Groups) 
     if ($null -eq $document -or $document -is [System.Array] -or $document -is [string] -or $document -is [ValueType]) {
         throw 'Claude settings JSON must contain an object at the root; no settings were changed.'
     }
+    $hookMetadata = Get-SettingsHookMetadata -Document $document
     $hookChanges = $false
-    $merged = Remove-DashHookGroups -Document $document -Install:$Install -Groups $Groups -Changed ([ref]$hookChanges)
+    $merged = Remove-DashHookGroups -Document $document -Install:$Install -Groups $Groups `
+        -PreserveEmptyEvents $PreserveEmptyEvents -Changed ([ref]$hookChanges)
     if (-not $Install -and -not $hookChanges) {
-        return [pscustomobject]@{ Changed = $false; Bytes = $null }
+        return [pscustomobject]@{
+            Changed = $false
+            Bytes = $null
+            HookEventNamesBeforeMerge = $hookMetadata.EventNames
+            EmptyHookEventsBeforeMerge = $hookMetadata.EmptyEvents
+        }
     }
     $text = (ConvertTo-Json -InputObject $merged -Depth 100) + [Environment]::NewLine
     $changed = $Install -and ($null -eq $originalText -or $text -cne $originalText)
     if (-not $Install) { $changed = $true }
-    return [pscustomobject]@{ Changed = $changed; Bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($text) }
+    return [pscustomobject]@{
+        Changed = $changed
+        Bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($text)
+        HookEventNamesBeforeMerge = $hookMetadata.EventNames
+        EmptyHookEventsBeforeMerge = $hookMetadata.EmptyEvents
+    }
 }
 
 function Quote-TaskArgument([string]$Value) {
@@ -474,7 +528,8 @@ try {
             Write-Output "Would remove owned helper copies from $InstallPath (preserving modified or unrelated files and backups)"
             return
         }
-        $settings = Get-SettingsOutput -Path $SettingsPath -Install:$false -Groups @()
+        $emptyHookEvents = @(Get-ManagedEmptyHookEvents -Path (Join-Path $InstallPath 'client-config.json'))
+        $settings = Get-SettingsOutput -Path $SettingsPath -Install:$false -Groups @() -PreserveEmptyEvents $emptyHookEvents
         Remove-DashLivenessTask -Path $livenessPath -TaskName $TaskName
         if ($settings.Changed) {
             $backup = Write-ManagedBytes -Path $SettingsPath -Bytes $settings.Bytes
@@ -502,9 +557,21 @@ try {
     $waiterPath = Join-Path $InstallPath 'reply-wait.ps1'
     $livenessPath = Join-Path $InstallPath 'claude-liveness.ps1'
     $groups = New-DashHookGroups -HookPath $hookPath -WaiterPath $waiterPath -NoReply:$NoReply
-    $settings = Get-SettingsOutput -Path $SettingsPath -Install:$true -Groups $groups
+    $existingEmptyHookEvents = @(Get-ManagedEmptyHookEvents -Path (Join-Path $InstallPath 'client-config.json'))
+    $settings = Get-SettingsOutput -Path $SettingsPath -Install:$true -Groups $groups -PreserveEmptyEvents $existingEmptyHookEvents
+    $emptyHookEvents = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($eventName in @($settings.EmptyHookEventsBeforeMerge)) {
+        if (-not $emptyHookEvents.Contains($eventName)) { $emptyHookEvents.Add($eventName) }
+    }
+    $currentHookEventNames = @($settings.HookEventNamesBeforeMerge)
+    foreach ($eventName in $existingEmptyHookEvents) {
+        if ($currentHookEventNames -contains $eventName -and -not $emptyHookEvents.Contains($eventName)) {
+            $emptyHookEvents.Add($eventName)
+        }
+    }
     $config = [ordered]@{
         ManagedBy = 'oh-my-dash-claude-windows'
+        EmptyHookEvents = [string[]]$emptyHookEvents.ToArray()
         SchemaVersion = 1
         HubBase = $hubBase
         HostLabel = $HostLabel
