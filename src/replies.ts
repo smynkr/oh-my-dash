@@ -1,7 +1,8 @@
 import type { DashDB, Reply, SessionDTO, ReplySource } from "./db.ts";
 import { createAudit } from "./audit.ts";
 import { GO_REC_AUTH_TEXT } from "./actions.ts";
-
+import type { EventKind, NormalizedEvent } from "./normalize.ts";
+import { normalizeQuestionSelections } from "./normalize.ts";
 export type { ReplySource } from "./db.ts";
 type Harness = "claude" | "omp";
 type Outcome = "delivered" | "expired" | "cancelled";
@@ -10,12 +11,21 @@ type WaitResult = { status: 200; reply: string | { id: number; text: string; sou
 type Pending = { resolve: (result: WaitResult) => void; timer: ReturnType<typeof setTimeout>; signal?: AbortSignal; abort?: () => void };
 type Waiter = { harness: Harness; waiterId: string; started: number; commitCapable: boolean; peer: string; pending?: Pending };
 type Lease = { waiterId: string; peer: string };
+export type QuestionWaitResult = { status: 200; answers: Record<string, string> } | { status: 204 | 409 | 410 };
+type QuestionPending = { resolve: (result: QuestionWaitResult) => void; timer: ReturnType<typeof setTimeout>; signal?: AbortSignal; abort?: () => void };
+type QuestionWaiter = { key: string; toolUseId: string; pending?: QuestionPending };
 
 export type SubmitArgs = { key: string; text: string; source: ReplySource; actor: string; answersTurn?: number; answersQuestion?: string; listener?: Listener };
 export type RefusalReason = "disabled" | "invalid_key" | "invalid_source" | "invalid_actor" |
   "invalid_text" | "empty_text" | "invalid_turn" | "invalid_question" | "stale_turn" | "stale_question" | "session_not_found" |
   "session_ended" | "claude_dialog" | "omp_approval" | "not_deliverable";
 export type SubmitResult = { ok: true; replyId: number } | { refused: true; reason: RefusalReason };
+export type RegisterQuestionArgs = { event: NormalizedEvent; id: string; toolUseId: string; timeoutMs: number };
+export type QuestionSubmitArgs = { key: string; questionId: string; answers: unknown; source: "web" | "telegram"; actor: string; listener?: Listener };
+export type QuestionSubmitResult = { ok: true } | { refused: true; reason: "disabled" | "invalid_key" | "invalid_question" | "invalid_source" | "invalid_actor" | "session_not_found" | "session_ended" | "stale_question" };
+export type QuestionRegisterResult =
+  | { ok: true; questionId: string; expiresAt: number }
+  | { refused: true; reason: "disabled" | "invalid_question" | "session_ended" | "duplicate" };
 
 export interface RepliesOptions {
   db: DashDB;
@@ -25,11 +35,13 @@ export interface RepliesOptions {
   setTimer?: (fn: () => void, ms: number) => () => void;
   onQueued?: (reply: Reply) => void;
   onOutcome?: (reply: Reply, outcome: Outcome, dto?: SessionDTO) => void;
-  send?: (dto: SessionDTO, eventKind?: "prompt") => void;
+  send?: (dto: SessionDTO, eventKind?: EventKind) => void;
 }
 
 const keyPattern = /^[A-Za-z0-9_-]{1,64}\|(claude|omp)\|[A-Za-z0-9_-]{1,128}$/;
 const questionIdentityPattern = /^[A-Za-z0-9_-]{8,128}$/;
+const claudeQuestionIdentityPattern = /^[A-Za-z0-9_-]{43}$/;
+const toolUseIdPattern = /^[A-Za-z0-9_-]{1,256}$/;
 const actorPattern: Record<ReplySource, RegExp> = {
   web: /^web:[A-Za-z0-9_-]{1,64}$/,
   telegram: /^telegram:[1-9]\d*$/,
@@ -128,6 +140,89 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       tryDispatch(key);
     });
   };
+  const questionWaiters = new Map<string, QuestionWaiter>();
+  const finishQuestionWaiter = (id: string, result: QuestionWaitResult) => {
+    const waiter = questionWaiters.get(id);
+    if (!waiter) return;
+    questionWaiters.delete(id);
+    const pending = waiter.pending;
+    if (!pending) return;
+    waiter.pending = undefined;
+    clearTimeout(pending.timer);
+    if (pending.abort) pending.signal?.removeEventListener("abort",pending.abort);
+    pending.resolve(result);
+  };
+  const cancelQuestion = (id: string, key: string, toolUseId: string, reason: string, status: 409 | 410 = 409) => {
+    const dto = db.cancelQuestion(id,key,toolUseId,now(),reason);
+    if (!dto) return null;
+    finishQuestionWaiter(id,{ status });
+    send?.(dto);
+    return dto;
+  };
+  const consumeQuestion = (id: string, key: string, toolUseId: string): QuestionWaitResult | undefined => {
+    const result = db.consumeQuestion(id,key,toolUseId,now());
+    if (result.kind === "pending") return undefined;
+    if (result.kind === "taken") return { status: 200, answers: result.answers };
+    const status = result.kind === "ended" ? 410 : 409;
+    if (result.kind === "expired" || result.kind === "ended") {
+      const dto = db.getSession(key);
+      if (dto) send?.(dto);
+    }
+    return { status };
+  };
+  const waitQuestion = (key: string, id: string, toolUseId: string, waitMs: number,
+    signal?: AbortSignal): Promise<QuestionWaitResult> => {
+    if (!enabled || !Number.isInteger(waitMs) || waitMs < 1 || waitMs > 55_000) return Promise.resolve({ status: 409 });
+    if (signal?.aborted) return Promise.resolve({ status: 204 });
+    const dto = db.getSession(key);
+    const invocation = db.getQuestionInvocation(id,key,toolUseId);
+    if (!invocation) return Promise.resolve({ status: 409 });
+    if (!dto || dto.status === "ended") {
+      cancelQuestion(id,key,toolUseId,"session_ended",410);
+      return Promise.resolve({ status: 410 });
+    }
+    if (invocation.expiresAt <= now()) {
+      cancelQuestion(id,key,toolUseId,"expired");
+      return Promise.resolve({ status: 409 });
+    }
+    if (questionWaiters.has(id)) return Promise.resolve({ status: 409 });
+    const result = consumeQuestion(id,key,toolUseId);
+    if (result) return Promise.resolve(result);
+    const waiter: QuestionWaiter = { key, toolUseId };
+    questionWaiters.set(id,waiter);
+    const { promise, resolve } = Promise.withResolvers<QuestionWaitResult>();
+    const pending: QuestionPending = { resolve,signal,timer:setTimeout(() => finishQuestionWaiter(id,{ status:204 }),waitMs) };
+    pending.abort = () => {
+      finishQuestionWaiter(id,{ status:204 });
+      cancelQuestion(id,key,toolUseId,"hook_disconnected");
+    };
+    signal?.addEventListener("abort",pending.abort,{ once:true });
+    waiter.pending = pending;
+    if (signal?.aborted) pending.abort();
+    else {
+      const arrived = consumeQuestion(id,key,toolUseId);
+      if (arrived) finishQuestionWaiter(id,arrived);
+    }
+    return promise;
+  };
+  const registerQuestion = (args: RegisterQuestionArgs): QuestionRegisterResult => {
+    if (!enabled) return { refused:true,reason:"disabled" };
+    const { event,id,toolUseId,timeoutMs } = args, questions = event.questionData;
+    let token: Buffer;
+    try { token = Buffer.from(id,"base64url"); } catch { return { refused:true,reason:"invalid_question" }; }
+    if (event.harness !== "claude" || event.kind !== "question" || !event.interactive ||
+        !event.toolUseId || event.toolUseId !== toolUseId || !toolUseIdPattern.test(toolUseId) ||
+        !claudeQuestionIdentityPattern.test(id) || token.byteLength !== 32 || token.toString("base64url") !== id ||
+        !Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000 ||
+        !questions?.length || !keyPattern.test(`${event.host}|claude|${event.sessionId}`))
+      return { refused:true,reason:"invalid_question" };
+    const registeredAt = now();
+    const result = db.registerQuestion(event,id,toolUseId,questions,registeredAt,timeoutMs);
+    if (!result.ok) return { refused:true,reason:result.reason };
+    for (const replaced of result.replaced) finishQuestionWaiter(replaced,{ status:409 });
+    send?.(result.dto,"question");
+    return { ok:true,questionId:id,expiresAt:registeredAt+timeoutMs };
+  };
   const cancelled = (items: Reply[], dto?: SessionDTO) => {
     for (const reply of items) { leases.delete(reply.id); outcome(reply, "cancelled", dto ?? db.getSession(reply.sessionKey)); }
     return items;
@@ -143,8 +238,14 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       syntheticPrompt(dto, reply.source);
     }
     for (const key of retry) tryDispatch(key);
-    db.pruneReplies(now());
-    audit.prune(now());
+    const questionNow = now();
+    for (const expired of db.expireQuestions(questionNow)) {
+      finishQuestionWaiter(expired.id,{ status:409 });
+      send?.(expired.dto);
+    }
+    db.pruneQuestions(questionNow);
+    db.pruneReplies(questionNow);
+    audit.prune(questionNow);
   };
   stopTimer = timer(sweep, 30_000);
 
@@ -156,6 +257,42 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     }
     else counts.invalid++;
     return { refused: true, reason };
+  };
+  const refuseQuestion = (reason: "disabled" | "invalid_key" | "invalid_question" | "invalid_source" |
+    "invalid_actor" | "session_not_found" | "session_ended" | "stale_question",
+    args: QuestionSubmitArgs, listener?: Listener): QuestionSubmitResult => {
+    if (listener && (args.source === "web" || args.source === "telegram") && typeof args.actor === "string") {
+      let text = "";
+      try { text = JSON.stringify(args.answers) ?? ""; } catch {}
+      const ts = now();
+      audit.record({ ts,sessionKey:args.key,source:args.source,actor:args.actor,listener,text,
+        outcome:`refused:${reason}`,outcomeTs:ts });
+    } else counts.invalid++;
+    return { refused:true,reason };
+  };
+  const validQuestionId = (id: unknown): id is string => {
+    if (typeof id !== "string" || !claudeQuestionIdentityPattern.test(id)) return false;
+    try {
+      const token = Buffer.from(id,"base64url");
+      return token.byteLength === 32 && token.toString("base64url") === id;
+    } catch { return false; }
+  };
+  const observeQuestions = (dto: SessionDTO) => {
+    if (dto.status === "ended") {
+      for (const cancelled of db.cancelQuestionsForSession(dto.key,now(),"session_ended"))
+        finishQuestionWaiter(cancelled.id,{ status:410 });
+      return;
+    }
+    for (const invocation of db.questionInvocationsForSession(dto.key)) {
+      const pending = invocation.state === "pending" && dto.status === "needs_input" &&
+        dto.needsReason === "question" && dto.pendingQuestionId === invocation.id;
+      const answered = invocation.state === "answered" && dto.status === "working" &&
+        invocation.answeredAt !== undefined && invocation.lastHookEventAt !== undefined &&
+        invocation.lastHookEventAt <= invocation.answeredAt;
+      if (pending || answered) continue;
+      db.cancelQuestion(invocation.id,dto.key,invocation.toolUseId,now(),"session_moved");
+      finishQuestionWaiter(invocation.id,{ status:409 });
+    }
   };
 
   return {
@@ -172,7 +309,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       if ((args.answersTurn !== undefined && (!Number.isSafeInteger(args.answersTurn) || args.answersTurn < 0)) ||
         (args.source === "autopilot" && args.answersTurn === undefined)) return refuse("invalid_turn", args);
       if (args.answersQuestion !== undefined && (typeof args.answersQuestion !== "string" ||
-          !questionIdentityPattern.test(args.answersQuestion) || args.source !== "web" || args.answersTurn !== undefined)) {
+          !questionIdentityPattern.test(args.answersQuestion) || (args.source !== "web" && args.source !== "telegram") || args.answersTurn !== undefined)) {
         return refuse("invalid_question", args);
       }
       const listener = args.listener ?? (args.source === "telegram" ? "telegram" : args.source === "web" ? "loopback" : "internal");
@@ -196,8 +333,53 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       tryDispatch(args.key);
       return { ok: true, replyId: reply.id };
     },
+    submitQuestion(args: QuestionSubmitArgs): QuestionSubmitResult {
+      if (!enabled) return refuseQuestion("disabled",args);
+      if (typeof args.key !== "string" || !keyPattern.test(args.key)) return refuseQuestion("invalid_key",args);
+      if (args.source !== "web" && args.source !== "telegram") return refuseQuestion("invalid_source",args);
+      if (typeof args.actor !== "string" || !actorPattern[args.source].test(args.actor))
+        return refuseQuestion("invalid_actor",args);
+      if (!validQuestionId(args.questionId)) return refuseQuestion("invalid_question",args);
+      const listener = args.listener ?? (args.source === "telegram" ? "telegram" : "loopback");
+      if (args.source === "telegram" ? listener !== "telegram" : listener !== "loopback" && listener !== "tailnet")
+        return refuseQuestion("invalid_actor",args,listener);
+      const dto = db.getSession(args.key);
+      if (!dto) return refuseQuestion("session_not_found",args,listener);
+      if (dto.status === "ended") return refuseQuestion("session_ended",args,listener);
+      const invocation = db.getQuestionInvocation(args.questionId,args.key);
+      if (!invocation || invocation.state !== "pending" || dto.harness !== "claude" ||
+          dto.status !== "needs_input" || dto.needsReason !== "question" || dto.pendingQuestionId !== args.questionId)
+        return refuseQuestion("stale_question",args,listener);
+      const answers = normalizeQuestionSelections(invocation.questions,args.answers);
+      if (!answers) return refuseQuestion("invalid_question",args,listener);
+      const ts = now();
+      const auditContext = audit.prepare({ ts,sessionKey:args.key,source:args.source,actor:args.actor,listener,
+        text:JSON.stringify(answers) });
+      const result = db.answerQuestion(invocation.id,args.key,invocation.toolUseId,answers,args.source,args.actor,
+        listener,ts,auditContext);
+      if (result !== "accepted") {
+        if (result === "expired") {
+          const current = db.getSession(args.key);
+          if (current) send?.(current);
+        }
+        return refuseQuestion(result === "ended" ? "session_ended" : "stale_question",args,listener);
+      }
+      const updated = db.getSession(args.key);
+      if (updated) send?.(updated,"question_answered");
+      const waiter = questionWaiters.get(invocation.id);
+      if (waiter?.pending) {
+        const delivered = consumeQuestion(invocation.id,args.key,invocation.toolUseId);
+        if (delivered) finishQuestionWaiter(invocation.id,delivered);
+      }
+      return { ok:true };
+    },
     cancel(key: string, id?: number) { return cancelled(db.cancelReplies({ key, id, reason: "owner_cancelled" }, now())); },
     cancelAll() { return cancelled(db.cancelReplies({ reason: "owner_cancelled" }, now())); },
+    registerQuestion,
+    waitQuestion,
+    cancelQuestion(id: string,key: string,toolUseId: string) {
+      return !!cancelQuestion(id,key,toolUseId,"hook_cancelled");
+    },
     waitClaude: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal) => wait("claude", key, waiterId, started, waitMs, signal),
     waitOmp: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal, commitCapable = false, peer = "loopback") =>
       wait("omp", key, waiterId, started, waitMs, signal, commitCapable, peer),
@@ -229,6 +411,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       return true;
     },
     observe(dto: SessionDTO) {
+      observeQuestions(dto);
       if (dto.status === "ended") {
         cancelled(db.cancelReplies({ key: dto.key, reason: "ended" }, now()), dto);
         const waiter = waiters.get(dto.key);
@@ -242,6 +425,14 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       return { enabled, queued: count.queued, leased: count.leased,
         waiters: { claude: active.filter(w => w.harness === "claude").length, omp: active.filter(w => w.harness === "omp").length }, ...counts };
     },
-    close() { stopTimer(); for (const waiter of waiters.values()) finish(waiter, { status: 410 }); waiters.clear(); leases.clear(); },
+    close() {
+      stopTimer();
+      for (const [id,waiter] of questionWaiters) {
+        db.cancelQuestion(id,waiter.key,waiter.toolUseId,now(),"hub_closed");
+        finishQuestionWaiter(id,{ status:410 });
+      }
+      for (const waiter of waiters.values()) finish(waiter,{ status:410 });
+      waiters.clear(); leases.clear();
+    },
   };
 }

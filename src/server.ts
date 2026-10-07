@@ -207,6 +207,71 @@ export function createDashServer(options: ServerOptions = {}) {
       if (!jsonContentType(request.headers.get("content-type"))) return json({ error: "unsupported media type" }, 415);
     }
     if ((projectRulesRoute || projectPreviewRoute) && !topicsEnabled) return json({ error: "not found" }, 404);
+    if (path === "/question/register" || path === "/question/wait" || path === "/question/cancel") {
+      if (!replies) return json({ error:"not found" },404);
+      const entrypoint = request.headers.get("X-Dash-Entrypoint");
+      if (entrypoint !== "cli") return json({ error:"forbidden" },403);
+      const label = request.headers.get("X-Dash-Host");
+      if (listener === "loopback" ? label !== null && label !== localHost() :
+        (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer))))
+        return json({ error:"forbidden" },403);
+      const host = listener === "loopback" ? localHost() : label!;
+      const sessionKeyFor = (session: string) => `${host}|claude|${session}`;
+      if (path === "/question/register" && request.method === "POST") {
+        if (!jsonContentType(request.headers.get("content-type"))) return json({ error:"unsupported media type" },415);
+        const body = await boundedJson(request) as Record<string, unknown> | null;
+        if (!body || Object.keys(body).some(field =>
+          !["sessionId","toolUseId","invocationId","questions","timeoutMs"].includes(field)) ||
+          typeof body.sessionId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.sessionId) ||
+          typeof body.toolUseId !== "string" || !/^[A-Za-z0-9_-]{1,256}$/.test(body.toolUseId) ||
+          typeof body.invocationId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(body.invocationId) ||
+          !Array.isArray(body.questions) || !Number.isSafeInteger(body.timeoutMs))
+          return json({ error:"bad request" },400);
+        const event = normalizeClaude({
+          session_id:body.sessionId,hook_event_name:"PreToolUse",tool_name:"AskUserQuestion",
+          tool_use_id:body.toolUseId,tool_input:{ questions:body.questions },
+        },request.headers,now());
+        if (!event) return json({ error:"invalid question" },400);
+        const result = replies.registerQuestion({ event,id:body.invocationId,toolUseId:body.toolUseId,
+          timeoutMs:Number(body.timeoutMs) });
+        if ("ok" in result) return json({ questionId:result.questionId,expiresAt:result.expiresAt },201);
+        const status = result.reason === "disabled" ? 404 :
+          result.reason === "invalid_question" ? 400 : 409;
+        return json(result,status);
+      }
+      if (path === "/question/wait" && request.method === "GET") {
+        const names = ["session","toolUseId","question","wait"];
+        if (names.some(name => url.searchParams.getAll(name).length !== 1) ||
+            [...url.searchParams.keys()].some(name => !names.includes(name)))
+          return json({ error:"bad request" },400);
+        const session = url.searchParams.get("session")!, toolUseId = url.searchParams.get("toolUseId")!;
+        const question = url.searchParams.get("question")!, rawWait = url.searchParams.get("wait")!;
+        const waitSec = Number(rawWait);
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(session) || !/^[A-Za-z0-9_-]{1,256}$/.test(toolUseId) ||
+            !/^[A-Za-z0-9_-]{43}$/.test(question) || !/^\d+$/.test(rawWait) ||
+            !Number.isInteger(waitSec) || waitSec < 1 || waitSec > 55)
+          return json({ error:"bad request" },400);
+        disableTimeout();
+        const result = await replies.waitQuestion(sessionKeyFor(session),question,toolUseId,waitSec*1000,request.signal);
+        return result.status === 200
+          ? json({ answers:result.answers })
+          : new Response(null,{ status:result.status,headers:headers({ "Cache-Control":"no-store" }) });
+      }
+      if (path === "/question/cancel" && request.method === "DELETE") {
+        const names = ["session","toolUseId","question"];
+        if (names.some(name => url.searchParams.getAll(name).length !== 1) ||
+            [...url.searchParams.keys()].some(name => !names.includes(name)))
+          return json({ error:"bad request" },400);
+        const session = url.searchParams.get("session")!, toolUseId = url.searchParams.get("toolUseId")!;
+        const question = url.searchParams.get("question")!;
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(session) || !/^[A-Za-z0-9_-]{1,256}$/.test(toolUseId) ||
+            !/^[A-Za-z0-9_-]{43}$/.test(question))
+          return json({ error:"bad request" },400);
+        return replies.cancelQuestion(question,sessionKeyFor(session),toolUseId)
+          ? json({ ok:true }) : json({ error:"stale question" },409);
+      }
+      return json({ error:"not found" },404);
+    }
     if (path === "/reply/wait/claude" || path === "/reply/wait/omp" || path === "/reply/ack" || path === "/reply/commit") {
       if (!replies) return json({ error: "not found" }, 404);
       if (request.method === "GET" && path.startsWith("/reply/wait/")) {
@@ -325,6 +390,25 @@ export function createDashServer(options: ServerOptions = {}) {
       if (listener !== "loopback") return json({ error: "forbidden" }, 403);
       telegram?.unpair();
       return json({ ok: true });
+    }
+    const questionRoute = request.method === "POST" && path.match(/^\/api\/sessions\/([^/]+)\/question$/);
+    if (questionRoute) {
+      if (!replies) return json({ error:"not found" },404);
+      let key: string;
+      try { key = decodeURIComponent(questionRoute[1]); } catch { return json({ error:"invalid key" },400); }
+      const body = await boundedJson(request) as Record<string, unknown> | null;
+      if (!body || typeof body !== "object" || Array.isArray(body) ||
+          Object.keys(body).some(field => field !== "questionId" && field !== "answers") ||
+          typeof body.questionId !== "string" || !Object.hasOwn(body,"answers"))
+        return json({ error:"bad request" },400);
+      const actor = listener === "loopback" ? "web:loopback" :
+        `web:${peers.get(peer) === "*" ? `tailnet-peer-${peer.replace(/[^A-Za-z0-9_-]/g,"-")}` : peers.get(peer)}`;
+      const result = replies.submitQuestion({ key,questionId:body.questionId,answers:body.answers,
+        source:"web",actor,listener });
+      if ("ok" in result) return json(result);
+      const status = result.reason === "session_not_found" || result.reason === "disabled" ? 404 :
+        result.reason.startsWith("invalid_") ? 400 : 409;
+      return json(result,status);
     }
     const replyRoute = path.match(/^\/api\/sessions\/([^/]+)\/(reply|replies|replies\/cancel)$/);
     if (replyRoute && ((request.method === "POST" && replyRoute[2] !== "replies") ||

@@ -140,6 +140,30 @@ Set `DASH_REPLIES=1` separately to allow replies. Re-run the Claude installer wi
 
 To roll back Telegram or replies, clear the corresponding `DASH_TELEGRAM` or `DASH_REPLIES` string in the plist and reload. Unpair in the local dashboard if desired. Removing the Keychain item or revoking the bot is optional and separate from disabling the collector integration.
 
+### Optional Claude question answers on macOS
+
+This mode intercepts `AskUserQuestion` **before** Claude opens its native dialog. It does not answer an already-open terminal dialog, approve other tools, or change permission settings. It requires an interactive Claude CLI with the documented [PreToolUse answer contract](https://code.claude.com/docs/en/hooks#askuserquestion), Python 3 (default `/usr/bin/python3`), and `DASH_REPLIES=1` on the hub. The native hook contract and dashboard round trip were exercised with Claude Code 2.1.292.
+
+Opt in on each Mac. Preserve your existing `--url`, `--host`, `--reply-base` and custom settings/helper paths when updating a remote installation:
+
+```sh
+cd "$HOME/.local/share/dash"
+bun run scripts/install-claude-hooks.ts --settings "$HOME/.claude/settings.json" \
+  --remote-questions --question-timeout-ms 120000 --no-reply --dry-run
+bun run scripts/install-claude-hooks.ts --settings "$HOME/.claude/settings.json" \
+  --remote-questions --question-timeout-ms 120000 --no-reply
+```
+
+`--no-reply` omits the separate stopped-turn reply waiter; remove that flag if you also use stopped-turn replies. It does not disable question answers. The installer copies the helper to `~/.local/share/dash/scripts/claude-question.py`; override this with `--question-helper` and select an absolute Python executable with `--python3`. Start a fresh Claude session after changing question hooks.
+
+The dashboard preserves question order, option labels/descriptions and supplied recommendation markers. One single-select question submits when you tap an option; custom, multi-select and multi-question answers use **Send answer(s)**. In Telegram, select the numbers corresponding to the displayed ordered labels, use **Custom answer** and reply to its prompt for free text, then **Submit answers**. All questions must have valid answers; multi-select may contain no selections. Telegram display text is redacted; delivered selections retain the original option labels.
+
+The wait is bounded to 1–600 seconds (default 120). Missing connectivity, invalid or incomplete answers, cancellation and expiry emit no approval and return control to Claude's terminal question. Telegram's **Use terminal instead** also cancels the remote wait. Expiry, terminal completion, replacement and session shutdown invalidate remote controls. Every answer is bound to its host, session and exact tool invocation, consumed only once, and cannot answer a permission request or `ExitPlanMode`.
+
+For verification, use temporary settings/helper paths and an isolated hub with empty `HOME`/`DASH_DATA` (never backfill real transcripts into a smoke instance). Ask a signed-in interactive Claude to call `AskUserQuestion` with a recommended single-select option, a multi-select question and a third custom answer. Answer through the dashboard, then repeat through a dedicated test Telegram bot. Verify the exact labels and Unicode text in Claude's continuation and that old controls no longer work. Test terminal fallback with `--question-timeout-ms 1000`: leave the remote question unanswered, answer the resulting native dialog and verify the remote controls disappear. Do not run two pollers against the production bot.
+
+To disable only remote questions, rerun the installer with your same connection/settings paths **without** `--remote-questions`; it removes the managed question hook and helper while preserving other Dash integration. Use `--uninstall` to remove all Dash hooks instead. Backups are timestamped beside changed settings/helpers; restoring an old backup can overwrite intervening user changes, so prefer the managed uninstall.
+
 ### Project rules and Telegram topics
 
 Set `DASH_TG_TOPICS=1` and reload to show **Project rules**. Rules match a session's working directory in order; the first matching regular expression chooses its project label. Use the path preview before saving rule edits. Inspect the initial generic rules and replace them with patterns appropriate to your own paths; project rules and stored session paths are local data.

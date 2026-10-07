@@ -10,6 +10,7 @@ import { createDashServer } from "../src/server.ts";
 import { CONTINUE_LABEL, CONTINUE_TEXT } from "../src/actions.ts";
 import { validateDecisionSet } from "../src/decisions.ts";
 
+import type { AskQuestion } from "../src/normalize.ts";
 const token = `123456789:${"A".repeat(32)}`;
 const owner = 712345;
 const chat = 812345;
@@ -72,6 +73,7 @@ class FakeBot {
         return response ? Response.json(response.body, { status: response.status }) : Response.json(ok({ message_id: body.message_id }));
       }
       if (method === "editMessageReplyMarkup") return Response.json(ok(true));
+      if (method === "deleteMessage") return Response.json(ok(true));
       if (method === "answerCallbackQuery") {
         if (this.nextCallbackAnswer) {
           const response = this.nextCallbackAnswer;
@@ -165,6 +167,21 @@ async function pairedFixture(options: Parameters<typeof fixture>[0] = {}) {
 }
 async function topicFixture(options: Omit<Parameters<typeof fixture>[0], "topicsEnabled"> = {}) {
   return pairedFixture({ ...options, topicsEnabled: true, bindings: options.bindings ?? { groupChatId: String(group), topics: defaultTopics } });
+}
+function registerClaudeQuestion(f: Awaited<ReturnType<typeof pairedFixture>>, sessionId: string, questions: AskQuestion[]) {
+  const id = Buffer.alloc(32, sessionId.length).toString("base64url"), toolUseId = `tool-${sessionId}`;
+  const event: Parameters<NonNullable<typeof f.replies>["registerQuestion"]>[0]["event"] = {
+    host: "synthetic-host", harness: "claude", sessionId, kind: "question", ts: f.clock.now, interactive: true,
+    toolUseId, questionData: questions,
+  };
+  const result = f.replies!.registerQuestion({ event, id, toolUseId, timeoutMs: 60_000 });
+  if (!("ok" in result)) throw new Error(`question registration refused: ${result.reason}`);
+  const key = `synthetic-host|claude|${sessionId}`;
+  f.db.sqlite.query("UPDATE sessions SET alive=1 WHERE key=?").run(key);
+  const row = f.db.getSession(key);
+  if (!row) throw new Error("registered question session is missing");
+  f.telegram.observe(row, "question");
+  return { id, key, toolUseId };
 }
 const groupMessage = (text: string, threadId?: number, overrides: Record<string, any> = {}) => message(text, {
   chat: { id: group, type: "supergroup", title: "Ops <group>" },
@@ -1872,7 +1889,7 @@ describe("Telegram reply routing", () => {
       f.bot.enqueue(answer("reply", alertId, alertId + 100));
       const count = f.bot.sent.length + 1;
       await apiSettled(() => f.bot.sent.length === count);
-      expect(f.bot.sent.at(-1)!.text).toBe("Claude questions and permission prompts can't be answered from dash yet. Answer in the terminal or Remote Control.");
+      expect(f.bot.sent.at(-1)!.text).toBe("Claude dialogs can't be answered by a free-text reply. Use AskUserQuestion buttons when available; answer permission prompts in the terminal or Remote Control.");
     }
     const omp = seed(f.db, "omp", "omp", "permission");
     f.db.rememberAlert(String(chat), 99, omp.key, "alert", f.clock.now);
@@ -2956,6 +2973,118 @@ describe("Telegram decision cards", () => {
       for (const name of names) if (old[name] === undefined) delete process.env[name]; else process.env[name] = old[name];
       rmSync(scratch, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Telegram native question answers", () => {
+  const tapQuestion = (f: Awaited<ReturnType<typeof pairedFixture>>, callbackId: string, questionId: string,
+    questionIndex: number, action: string, messageId: number, chatId = chat, threadId?: number) =>
+    f.bot.enqueueUpdate({ callback_query: {
+      id: callbackId, from: { id: owner },
+      message: { message_id: messageId, chat: { id: chatId, type: chatId === chat ? "private" : "supergroup" },
+        ...(threadId === undefined ? {} : { message_thread_id: threadId }) },
+      data: `q:${questionId}:${questionIndex}:${action}`,
+    } });
+
+  test("preserves multiple Claude selections and custom text, then consumes one exact answer map", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const questions: AskQuestion[] = [
+      { id: "approach", question: "Choose an approach?", header: "Implementation",
+        options: [{ label: "Keep <existing> & tested", description: "No rewrite" }, { label: "Replace (Recommended)" }] },
+      { id: "colors", question: "Which colors?", options: [{ label: "Red & blue" }, { label: "Green" }], multi: true },
+    ];
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "telegram-claude-question", questions);
+    const wait = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).filter(item => !item.prompt).length === 2,
+      "two question cards");
+    const q0 = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt && item.questionIndex === 0)!;
+    const q1 = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt && item.questionIndex === 1)!;
+    expect(f.bot.sent.some(item => visibleText(item.text).includes("Keep <existing> & tested") &&
+      visibleText(item.text).includes("Replace (Recommended)"))).toBe(true);
+
+    tapQuestion(f, "select-single", id, 0, "1", q0.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 1, "single selection");
+    tapQuestion(f, "select-multi", id, 1, "0", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 2, "first multi selection");
+    tapQuestion(f, "select-multi-second", id, 1, "1", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 3, "second multi selection");
+    tapQuestion(f, "custom-button", id, 1, "c", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 4, "custom-answer prompt");
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => item.prompt), "ForceReply prompt");
+    const prompt = f.db.telegramQuestionMessagesForQuestion(id).find(item => item.prompt)!;
+    f.bot.enqueue(message("My own & free", { message_id: 99, reply_to_message: { message_id: prompt.messageId } }));
+    await apiSettled(() => f.bot.sent.some(item => item.text === "Custom answer captured."), "custom answer captured");
+
+    tapQuestion(f, "submit-answers", id, 1, "s", q1.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 5, "answer submission");
+    expect(await wait).toEqual({
+      status: 200,
+      answers: {
+        "Choose an approach?": "Replace (Recommended)",
+        "Which colors?": "Red & blue, Green, My own & free",
+      },
+    });
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("consumed");
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+
+    tapQuestion(f, "stale-question", id, 0, "0", q0.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 6, "stale button refusal");
+    expect(f.bot.calls.filter(call => call.method === "answerCallbackQuery").at(-1)?.body.text).toBe("Expired");
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("consumed");
+  });
+
+  test("cancel returns Claude to its native terminal question without approving anything", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, "telegram-terminal-fallback", [
+      { id: "continue", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }] },
+    ]);
+    const wait = f.replies!.waitQuestion(key, id, toolUseId, 30_000);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    tapQuestion(f, "cancel-question", id, 0, "x", card.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 1, "terminal fallback cancellation");
+    expect(await wait).toEqual({ status: 409 });
+    expect(f.db.getQuestionInvocation(id, key)?.state).toBe("cancelled");
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+  });
+
+  test.each(["cancel", "expire"] as const)("%s from the hook removes the Telegram keyboard while terminal input remains pending", async action => {
+    const f = await pairedFixture({ repliesEnabled: true, observeReplies: true, clock: { now: Date.now() } });
+    const { id, key, toolUseId } = registerClaudeQuestion(f, `hook-${action}`, [
+      { id: "route", question: "Which route?", options: [{ label: "Local" }, { label: "Remote" }] },
+    ]);
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => !item.prompt), "question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(id).find(item => !item.prompt)!;
+    if (action === "cancel") expect(f.replies!.cancelQuestion(id, key, toolUseId)).toBe(true);
+    else { f.clock.now += 60_000; f.replies!.sweep(); }
+    await apiSettled(() => f.bot.calls.some(call => call.method === "editMessageReplyMarkup" &&
+      call.body.message_id === card.messageId), "terminal fallback keyboard removal");
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    expect(f.db.getSession(key)).toMatchObject({ status: "needs_input", needsReason: "question" });
+    expect(f.bot.calls.filter(call => call.method === "editMessageReplyMarkup" && call.body.message_id === card.messageId)
+      .at(-1)?.body.reply_markup).toEqual({ inline_keyboard: [] });
+  });
+
+  test("keeps OMP's question reply envelope and exact option labels", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const questionId = "omp-question-identity";
+    const row = f.db.applyEvent({ host: "synthetic-host", harness: "omp", sessionId: "telegram-omp-question",
+      kind: "question", ts: f.clock.now, text: "Which color?", interactive: true, questionIdentity: questionId,
+      questionData: [{ id: "color-choice", question: "Which color?", options: [{ label: "Red & gold" }, { label: "Blue" }], multi: true }] });
+    f.telegram.observe(row, "question");
+    await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(questionId).some(item => !item.prompt), "OMP question card");
+    const card = f.db.telegramQuestionMessagesForQuestion(questionId).find(item => !item.prompt)!;
+    tapQuestion(f, "omp-select", questionId, 0, "1", card.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 1, "OMP selection");
+    tapQuestion(f, "omp-submit", questionId, 0, "s", card.messageId);
+    await eventually(() => f.bot.count("answerCallbackQuery") === 2, "OMP answer");
+
+    const reply = f.db.queuedReplies()[0]!;
+    expect(reply.answersQuestion).toBe(questionId);
+    expect(reply.text).toBe('"color-choice": {"selectedOptions":["Blue"]}');
+    expect(reply.source).toBe("telegram");
+    expect(reply.actor).toBe(`telegram:${owner}`);
+    expect(f.db.telegramQuestionMessagesForQuestion(questionId)).toHaveLength(0);
   });
 });
 

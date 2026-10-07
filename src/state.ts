@@ -28,15 +28,12 @@ export function reduceState(previous: SessionState, event: NormalizedEvent): Ses
     case "prompt": next.status = "working"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null; next.lastPrompt = describePrompt(event.text); next.backgroundPending = false; break;
     case "question":
       next.status = "needs_input"; next.needsReason = "question"; next.needsText = event.text ?? null;
-      next.pendingQuestionId = event.harness === "omp" ? event.questionIdentity ?? null : null;
+      next.pendingQuestionId = event.questionIdentity ?? null;
       break;
     case "permission": next.status = "needs_input"; next.needsReason = "permission"; next.needsText = event.text ?? null; next.pendingQuestionId = null; break;
     case "question_answered":
-      if (event.harness === "omp" && (
-        event.questionIdentity
-          ? previous.needsReason !== "question" || previous.pendingQuestionId !== event.questionIdentity
-          : previous.needsReason === "question" && Boolean(previous.pendingQuestionId)
-      )) break;
+      if (previous.pendingQuestionId && previous.pendingQuestionId !== event.questionIdentity ||
+          event.questionIdentity && previous.pendingQuestionId !== event.questionIdentity) break;
       next.status = "working"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null;
       break;
     case "notification": next.lastNotification = event.text ?? null; if (event.detail && Object.hasOwn(promptingNotifications, event.detail) && !(next.status === "needs_input" && next.needsReason === "question")) { next.status = "needs_input"; next.needsReason = event.detail; next.needsText = event.text ?? null; next.pendingQuestionId = null; } break;
