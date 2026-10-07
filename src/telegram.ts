@@ -1002,7 +1002,8 @@ export function createTelegram(opts: TelegramOptions) {
     const questionMessage = card.messages.get(index)?.sent;
     if (!questionMessage) return;
     const destination = { chatId: questionMessage.chatId, threadId: questionMessage.threadId, name: null };
-    const sentAt = await queueSend(destination, `Reply with your custom answer for question ${index + 1}.`,
+    const sentAt = await queueSend(destination,
+      `<a href="tg://user?id=${userId}">Reply with your custom answer</a> for question ${index + 1}.`,
       { force_reply: true, selective: true }, questionMessage.messageId);
     if (!sentAt || !questionCardLive(card)) return;
     const saved: TelegramQuestionMessage = {

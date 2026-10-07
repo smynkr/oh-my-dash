@@ -3180,6 +3180,12 @@ describe("Telegram native question answers", () => {
       await apiSettled(() => f.db.telegramQuestionMessagesForQuestion(id).some(item => item.prompt), "custom reply prompt");
       const prompt = f.db.telegramQuestionMessagesForQuestion(id).find(item => item.prompt)!;
       expect(prompt.chatId).toBe(String(recipient));
+      // Selective ForceReply targets mentions or the original message's sender.
+      // This prompt replies to our own bot card, so it must mention the owner.
+      const sentPrompt = f.bot.calls.filter(call => call.method === "sendMessage" && call.body.reply_markup?.force_reply).at(-1)!.body;
+      expect(sentPrompt.reply_markup.selective).toBe(true);
+      const replyTargets = [...String(sentPrompt.text).matchAll(/<a href="tg:\/\/user\?id=(\d+)">/g)].map(match => match[1]);
+      expect(replyTargets).toEqual([String(owner)]);
       f.bot.enqueue(message(answer, { message_id: 99, chat: { id: recipient, type: topics ? "supergroup" : "private" },
         reply_to_message: { message_id: prompt.messageId } }));
     }
