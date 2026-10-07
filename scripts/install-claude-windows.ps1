@@ -6,6 +6,8 @@ param(
     [string]$ClaudePath = '',
     [string]$TaskName = 'OhMyDash-Claude-Liveness',
     [switch]$NoReply,
+    [switch]$Questions,
+    [ValidateRange(1, 600)][int]$QuestionWaitSeconds = 120,
     [switch]$DryRun,
     [switch]$Uninstall
 )
@@ -203,14 +205,15 @@ function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups) {
     return $Document
 }
 
-function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [switch]$NoReply) {
+function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [string]$QuestionPath, [switch]$NoReply, [switch]$Questions, [int]$QuestionWaitSeconds) {
     $powerShellExe = Get-WindowsPowerShellExe
-    if ($HookPath.Contains('"') -or $WaiterPath.Contains('"') -or $powerShellExe.Contains('"')) {
+    if ($HookPath.Contains('"') -or $WaiterPath.Contains('"') -or $QuestionPath.Contains('"') -or $powerShellExe.Contains('"')) {
         throw 'Windows paths cannot contain a quotation mark.'
     }
     $quotedExe = '"' + $powerShellExe + '"'
     $ingestCommand = $quotedExe + ' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $HookPath + '" -DashHookMarker "# dash-hook"'
     $replyCommand = $quotedExe + ' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $WaiterPath + '" -DashHookMarker "# dash-hook"'
+    $questionCommand = $quotedExe + ' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $QuestionPath + '" -DashHookMarker "# dash-hook"'
     $events = @(
         @{ Event = 'SessionStart' },
         @{ Event = 'UserPromptSubmit' },
@@ -232,6 +235,10 @@ function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [switch]$NoR
             $reply = [ordered]@{ type = 'command'; async = $true; asyncRewake = $true; timeout = 21600; command = $replyCommand }
             $groups.Add([pscustomobject]@{ Event = 'Stop'; Group = [ordered]@{ hooks = @($reply) } })
         }
+    }
+    if ($Questions) {
+        $question = [ordered]@{ type = 'command'; timeout = ($QuestionWaitSeconds + 5); command = $questionCommand }
+        $groups.Add([pscustomobject]@{ Event = 'PreToolUse'; Group = [ordered]@{ matcher = 'AskUserQuestion'; hooks = @($question) } })
     }
     return $groups.ToArray()
 }
@@ -339,7 +346,7 @@ function Remove-InstalledHelpers([string]$Directory) {
         Write-Output 'Installed helper files were preserved because the client config is not owned by this installer.'
         return
     }
-    foreach ($name in @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1')) {
+    foreach ($name in @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1', 'claude-question.ps1')) {
         $path = Join-Path $Directory $name
         $expected = $config.HelperHashes.PSObject.Properties[$name]
         if ($null -eq $expected -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
@@ -385,7 +392,7 @@ try {
     $hubBase = Get-HubBase $HubUrl
     $HostLabel = $HostLabel.Split('.')[0]
     $ClaudePath = Get-ClaudeExecutable $ClaudePath
-    $helperNames = @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1')
+    $helperNames = @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1', 'claude-question.ps1')
     $helperBytes = @{}
     $helperHashes = [ordered]@{}
     foreach ($name in $helperNames) {
@@ -398,7 +405,8 @@ try {
     $hookPath = Join-Path $InstallPath 'claude-hook.ps1'
     $waiterPath = Join-Path $InstallPath 'reply-wait.ps1'
     $livenessPath = Join-Path $InstallPath 'claude-liveness.ps1'
-    $groups = New-DashHookGroups -HookPath $hookPath -WaiterPath $waiterPath -NoReply:$NoReply
+    $questionPath = Join-Path $InstallPath 'claude-question.ps1'
+    $groups = New-DashHookGroups -HookPath $hookPath -WaiterPath $waiterPath -QuestionPath $questionPath -NoReply:$NoReply -Questions:$Questions -QuestionWaitSeconds $QuestionWaitSeconds
     $settings = Get-SettingsOutput -Path $SettingsPath -Install:$true -Groups $groups
     $config = [ordered]@{
         ManagedBy = 'oh-my-dash-claude-windows'
@@ -407,6 +415,8 @@ try {
         HostLabel = $HostLabel
         ClaudePath = $ClaudePath
         ReplyWaitSeconds = 21600
+        QuestionsEnabled = [bool]$Questions
+        QuestionWaitSeconds = $QuestionWaitSeconds
         HelperHashes = $helperHashes
     }
     $configText = (ConvertTo-Json -InputObject $config -Depth 8) + [Environment]::NewLine
@@ -418,7 +428,7 @@ try {
         Write-Output "Would copy source-pinned PowerShell helpers and client config to $InstallPath"
         Write-Output "Would configure hub $hubBase for host $HostLabel using Claude CLI $ClaudePath"
         Write-Output "Would register per-user Scheduled Task '$TaskName' with one-minute liveness checks"
-        Write-Output "Would create ten Dash hook groups (or nine with -NoReply); settings change: $($settings.Changed)"
+        Write-Output "Would create $($groups.Count) Dash hook groups; remote questions enabled: $([bool]$Questions); settings change: $($settings.Changed)"
         return
     }
 
