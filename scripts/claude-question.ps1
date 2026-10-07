@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$registered = $false
+$registrationAttempted = $false
 $completed = $false
 $config = $null
 $payload = $null
@@ -59,9 +59,9 @@ try {
         timeoutMs = $timeoutMs
     })
     $headers = @{ 'X-Dash-Entrypoint' = 'cli' }
+    $registrationAttempted = $true
     $registration = Invoke-DashWindowsHttp -Uri ($config.HubBase + '/question/register') -HostLabel $config.HostLabel -Headers $headers -Method POST -TimeoutMilliseconds ([Math]::Min(5000, $timeoutMs)) -Body $register -HasBody
-    if ($registration.StatusCode -ne 201) { exit 0 }
-    $registered = $true
+    if ($registration.StatusCode -ne 201) { throw 'Question registration was rejected.' }
     $waitUri = $config.HubBase + '/question/wait?session=' + [Uri]::EscapeDataString($session) +
         '&toolUseId=' + [Uri]::EscapeDataString($toolUse) + '&question=' + [Uri]::EscapeDataString($invocation)
 
@@ -101,7 +101,7 @@ catch {
     # payload, remote error body, or an unvalidated answer on a failure path.
 }
 finally {
-    if (-not $completed -and $registered -and $null -ne $config) {
+    if (-not $completed -and $registrationAttempted -and $null -ne $config) {
         try {
             $cancelUri = $config.HubBase + '/question/cancel?session=' + [Uri]::EscapeDataString($session) +
                 '&toolUseId=' + [Uri]::EscapeDataString($toolUse) + '&question=' + [Uri]::EscapeDataString($invocation)

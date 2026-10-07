@@ -55,6 +55,7 @@ $cases = @(
     @{ Name = 'non-text answer falls back'; Status = 200; Body = '{"answers":{"Shade?":true,"shade?":"Logging","Notes?":"None"}}'; Allows = $false },
     @{ Name = 'malformed answer falls back'; Status = 200; Body = '{'; Allows = $false },
     @{ Name = 'wrong identity response falls back'; Status = 409; Body = '{}'; Allows = $false },
+    @{ Name = 'registration rejection cancels possible controls'; Status = 200; Body = '{}'; Allows = $false; RegisterStatus = 503; NoWait = $true },
     @{ Name = 'extra answer question falls back'; Status = 200; Body = '{"answers":{"Shade?":"Blue","shade?":"Logging","Notes?":"None","Unexpected?":"Other"}}'; Allows = $false },
     @{ Name = 'timeout cancels remote controls'; Status = 204; Body = ''; Allows = $false; Delay = 1200; WaitSeconds = 2 },
     @{ Name = 'permission tools never register'; Status = 200; Body = '{}'; Allows = $false; Tool = 'ExitPlanMode'; NoRequests = $true },
@@ -67,8 +68,9 @@ $cases = @(
 foreach ($case in $cases) {
     $fixture = New-WindowsClaudeFixture -RepositoryRoot $RepositoryRoot
     try {
+        $registerStatus = if ($case.RegisterStatus) { [int]$case.RegisterStatus } else { 201 }
         $fixture.Server = Start-WindowsClaudeHttpFixture -Directory $fixture.Root -Plans @{
-            '/question/register' = @(@{ StatusCode = 201; Body = '{"questionId":"synthetic-question-identity","expiresAt":9999999999999}'; ContentType = 'application/json' })
+            '/question/register' = @(@{ StatusCode = $registerStatus; Body = '{"questionId":"synthetic-question-identity","expiresAt":9999999999999}'; ContentType = 'application/json' })
             '/question/wait' = @(@{ StatusCode = $case.Status; Body = $case.Body; ContentType = 'application/json'; DelayMilliseconds = $case.Delay })
             '/question/cancel' = @(@{ StatusCode = 200; Body = '{"ok":true}'; ContentType = 'application/json' })
         }
@@ -96,14 +98,18 @@ foreach ($case in $cases) {
         $waitRequests = @($requests | Where-Object Path -eq '/question/wait')
         $cancelRequests = @($requests | Where-Object Path -eq '/question/cancel')
         if (-not $case.NoRequests) {
-            Assert-Question ($registrationRequests.Count -eq 1 -and $waitRequests.Count -eq 1) ($case.Name + ': expected one registration and one wait')
+            $expectedWaitCount = if ($case.NoWait) { 0 } else { 1 }
+            Assert-Question ($registrationRequests.Count -eq 1 -and $waitRequests.Count -eq $expectedWaitCount) ($case.Name + ': registration or wait count changed')
             $registration = $registrationRequests[0]
-            $waitRequest = $waitRequests[0]
-            Assert-Question ($registration.Method -ceq 'POST' -and $waitRequest.Method -ceq 'GET') 'Question registration/wait methods changed'
-            Assert-Question ((Get-QuestionHeader $registration 'X-Dash-Entrypoint') -ceq 'cli' -and
-                (Get-QuestionHeader $registration 'X-Dash-Host') -ceq $fixture.HostLabel -and
-                (Get-QuestionHeader $waitRequest 'X-Dash-Entrypoint') -ceq 'cli' -and
-                (Get-QuestionHeader $waitRequest 'X-Dash-Host') -ceq $fixture.HostLabel) 'Question requests lost the CLI/host identity headers'
+            $waitRequest = if ($case.NoWait) { $null } else { $waitRequests[0] }
+            Assert-Question ($registration.Method -ceq 'POST' -and
+                (Get-QuestionHeader $registration 'X-Dash-Entrypoint') -ceq 'cli' -and
+                (Get-QuestionHeader $registration 'X-Dash-Host') -ceq $fixture.HostLabel) 'Question registration method or identity headers changed'
+            if ($null -ne $waitRequest) {
+                Assert-Question ($waitRequest.Method -ceq 'GET' -and
+                    (Get-QuestionHeader $waitRequest 'X-Dash-Entrypoint') -ceq 'cli' -and
+                    (Get-QuestionHeader $waitRequest 'X-Dash-Host') -ceq $fixture.HostLabel) 'Question wait method or identity headers changed'
+            }
             $registerBody = $json.DeserializeObject($registration.Body)
             $invocation = $registerBody['invocationId']
             Assert-Question ($registerBody['sessionId'] -ceq $payload.session_id -and
@@ -120,15 +126,17 @@ foreach ($case in $cases) {
             Assert-Question ((@($sentQuestions[0]['options'] | ForEach-Object { $_['label'] }) -join '|') -ceq 'Blue (Recommended)|Green' -and
                 $sentQuestions[1]['multiSelect'] -eq $true -and
                 (@($sentQuestions[1]['options'] | ForEach-Object { $_['label'] }) -join '|') -ceq 'Logging|Metrics') 'Option labels, order or multi-select mode changed'
-            $waitUri = [Uri]::new('http://127.0.0.1' + $waitRequest.Target)
-            $waitQueryNames = @($waitUri.Query.TrimStart('?').Split('&') | ForEach-Object { [Uri]::UnescapeDataString(($_ -split '=', 2)[0]) })
-            Assert-Question (($waitQueryNames -join '|') -ceq 'session|toolUseId|question|wait' -and
-                (Get-WindowsClaudeQueryValue $waitUri.Query 'session') -ceq $payload.session_id -and
-                (Get-WindowsClaudeQueryValue $waitUri.Query 'toolUseId') -ceq $payload.tool_use_id -and
-                (Get-WindowsClaudeQueryValue $waitUri.Query 'question') -ceq $invocation) 'Wait used a different or incomplete invocation identity'
-            $waitSeconds = 0
-            Assert-Question ([int]::TryParse((Get-WindowsClaudeQueryValue $waitUri.Query 'wait'), [ref]$waitSeconds) -and
-                $waitSeconds -ge 1 -and $waitSeconds -le 55) 'Question wait interval was outside the hub contract'
+            if ($null -ne $waitRequest) {
+                $waitUri = [Uri]::new('http://127.0.0.1' + $waitRequest.Target)
+                $waitQueryNames = @($waitUri.Query.TrimStart('?').Split('&') | ForEach-Object { [Uri]::UnescapeDataString(($_ -split '=', 2)[0]) })
+                Assert-Question (($waitQueryNames -join '|') -ceq 'session|toolUseId|question|wait' -and
+                    (Get-WindowsClaudeQueryValue $waitUri.Query 'session') -ceq $payload.session_id -and
+                    (Get-WindowsClaudeQueryValue $waitUri.Query 'toolUseId') -ceq $payload.tool_use_id -and
+                    (Get-WindowsClaudeQueryValue $waitUri.Query 'question') -ceq $invocation) 'Wait used a different or incomplete invocation identity'
+                $waitSeconds = 0
+                Assert-Question ([int]::TryParse((Get-WindowsClaudeQueryValue $waitUri.Query 'wait'), [ref]$waitSeconds) -and
+                    $waitSeconds -ge 1 -and $waitSeconds -le 55) 'Question wait interval was outside the hub contract'
+            }
             if ($cancelRequests.Count -gt 0) {
                 Assert-Question ($cancelRequests.Count -eq 1) 'Question fallback sent duplicate cancellation requests'
                 $cancelRequest = $cancelRequests[0]
