@@ -193,7 +193,7 @@ export function normalizeClaudeQuestions(value: unknown): AskQuestion[] | undefi
       }
       options.push(normalized);
     }
-    const normalized: AskQuestion = { id: text, question: text, options };
+    const normalized: AskQuestion = { id: String(questions.length), question: text, options };
     if (question.header !== undefined) {
       const header = boundedQuestionString(question.header, 256);
       if (header === undefined) return undefined;
