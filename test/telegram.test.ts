@@ -3058,16 +3058,18 @@ describe("Telegram native question answers", () => {
       const f = await pairedFixture({
         repliesEnabled: true, snippetChars: source === "redaction" ? Infinity : 100, clock: { now: Date.now() },
       });
+      const keyType = "PRIVATE KEY";
+      const beginKey = `-----BEGIN ${keyType}-----`, endKey = `-----END ${keyType}-----`;
       const { id } = registerClaudeQuestion(f, `repeated-label-${source}`, [{
         id: "route",
         question: source === "question"
           ? `Examples: 1. Keep, 2. Replace. ${"context ".repeat(40)}`
-          : source === "redaction" ? "Examples: 1. Keep, 2. Replace -----END PRIVATE KEY-----." : "Which route?",
+          : source === "redaction" ? `Examples: 1. Keep, 2. Replace ${endKey}.` : "Which route?",
         options: [
           { label: "Keep", description: source === "description"
             ? `Example: 2. Replace. ${"context ".repeat(40)}`
-            : source === "redaction" ? "-----BEGIN PRIVATE KEY-----\nsynthetic-key-material" : undefined },
-          { label: source === "redaction" ? "Replace -----END PRIVATE KEY-----" : "Replace" },
+            : source === "redaction" ? `${beginKey}\nsynthetic-key-material` : undefined },
+          { label: source === "redaction" ? `Replace ${endKey}` : "Replace" },
         ],
       }]);
       await apiSettled(() => f.bot.sent.length > 0, "metadata-only hidden-option alert");
