@@ -676,6 +676,7 @@ test("a StopFailure event urgently pages once even when its DTO was already dedu
   const seeded = new DashDB(dataPath, { topicsEnabled: true });
   seeded.setSetting("telegram.chat_id", "812345");
   seeded.setSetting("telegram.user_id", "712345");
+  seeded.setSetting("telegram.topics", JSON.stringify({ groupChatId: "-100812345", topics: { general: null, urgent: 90 } }));
   seeded.applyEvent({ host: "synthetic-host", harness: "claude", sessionId, kind: "error", ts: stamp,
     cwd, text: "Synthetic crash", interactive: true });
   seeded.close();
@@ -698,8 +699,7 @@ test("a StopFailure event urgently pages once even when its DTO was already dedu
     for (let i = 0; i < 100 && !bot.calls.some(call => call.method === "sendMessage"); i++) await Bun.sleep(1);
     const sends = bot.calls.filter(call => call.method === "sendMessage");
     expect(sends).toHaveLength(1);
-    expect(sends[0].body).toMatchObject({ chat_id: "812345" });
-    expect(sends[0].body.message_thread_id).toBeUndefined();
+    expect(sends[0].body).toMatchObject({ chat_id: "-100812345", message_thread_id: 90 });
   } finally {
     app.close();
     bot.close();

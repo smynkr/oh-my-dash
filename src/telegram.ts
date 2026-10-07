@@ -256,7 +256,7 @@ export function createTelegram(opts: TelegramOptions) {
   const destinationForProject = (project: string, bindings = readBindings()): Destination | null => {
     if (!topicsEnabled) return dmDestination();
     const topic = topicFor(project, bindings);
-    return topic ? { chatId: topic.chatId, threadId: topic.threadId, name: topic.name } : dmDestination();
+    return topic ? { chatId: topic.chatId, threadId: topic.threadId, name: topic.name } : null;
   };
   const generalDestination = (bindings = readBindings()): Destination | null => {
     if (!bindings || !Object.hasOwn(bindings.topics, "general")) return null;
@@ -328,6 +328,8 @@ export function createTelegram(opts: TelegramOptions) {
   const validRecipient = (destination: Destination, epoch: number) => running && paired() && epoch === pairEpoch && !!destination.chatId;
   const sendAtDestination = async (destination: Destination, epoch: number, text: string, keyboard?: Record<string, unknown>, replyTo?: number,
     editId?: number, disableNotification = false, canSend?: () => boolean): Promise<SentMessage | undefined> => {
+    // Do not update historical DM content after switching to group-only topic mode.
+    if (editId && topicsEnabled && destination.chatId === chatId) return;
     for (let attempt = 0; attempt <= 3 && validRecipient(destination, epoch) && (!canSend || canSend()); attempt++) {
       const delay = Math.max(0, 1000 - (now() - lastSendAt));
       if (delay) await wait(delay);
@@ -365,14 +367,10 @@ export function createTelegram(opts: TelegramOptions) {
     if (sentAt) return sentAt;
     if (!running || epoch !== pairEpoch) return;
     if (!topicsEnabled || !token || destination.chatId === chatId) { dropped++; return; }
-    const bindings = readBindings(), general = generalDestination(bindings), dm = dmDestination();
-    const candidates = [general, dm].filter((candidate): candidate is Destination => !!candidate);
-    for (const candidate of candidates) {
-      if (sameDestination(candidate, destination)) continue;
-      const changed = !sameDestination(candidate, destination);
-      const delivered = await sendAtDestination(candidate, epoch, text, keyboard, changed ? undefined : replyTo, undefined, disableNotification, canSend);
+    const general = generalDestination();
+    if (general && !sameDestination(general, destination)) {
+      const delivered = await sendAtDestination(general, epoch, text, keyboard, undefined, undefined, disableNotification, canSend);
       if (delivered) return delivered;
-      if (!token || !running || epoch !== pairEpoch) break;
     }
     dropped++;
   };
@@ -385,8 +383,6 @@ export function createTelegram(opts: TelegramOptions) {
     sendChain = next.catch(error => report("telegram send", error));
     return next;
   };
-  const retrySend = (text: string, keyboard?: Record<string, unknown>, replyTo?: number): Promise<SentMessage | undefined> =>
-    queueSend(dmDestination(), text, keyboard, replyTo);
   const retrySendAt = (destination: Destination, text: string, keyboard?: Record<string, unknown>, replyTo?: number): Promise<SentMessage | undefined> =>
     queueSend(destination, text, keyboard, replyTo);
   const editText = (destination: Destination, messageId: number, html: string) => {
@@ -857,7 +853,7 @@ export function createTelegram(opts: TelegramOptions) {
       messages.set(saved.questionIndex, { sent: { chatId: saved.chatId, threadId: saved.threadId, messageId: saved.messageId },
         questionIndex: saved.questionIndex });
     }
-    const destination = row ? questionDestination(row) : destinationForProject(dto.project) ?? dmDestination();
+    const destination = row ? questionDestination(row) : destinationForProject(dto.project);
     if (!destination) return undefined;
     const card: QuestionCard = {
       id, key, questions: dto.pendingQuestion.questions, destination,
@@ -956,7 +952,9 @@ export function createTelegram(opts: TelegramOptions) {
   };
   const restoreQuestionCards = () => {
     for (const message of db.telegramQuestionMessages()) {
-      if (message.prompt) { clearTelegramQuestionMessage(message); continue; }
+      if (message.prompt || topicsEnabled && message.chatId === chatId) {
+        clearTelegramQuestionMessage(message); continue;
+      }
       const dto = db.getSession(message.sessionKey), card = dto && questionCardFor(message.questionId, message.sessionKey, message);
       if (!card) { clearTelegramQuestionMessage(message); continue; }
       updateQuestionKeyboard(card, message.questionIndex);
@@ -1120,7 +1118,7 @@ export function createTelegram(opts: TelegramOptions) {
     const bindings = readBindings();
     const urgentThread = bindings && Object.hasOwn(bindings.topics, "urgent")
       ? { chatId: bindings.groupChatId, threadId: bindings.topics.urgent, name: "urgent" } satisfies Destination
-      : dmDestination();
+      : generalDestination(bindings);
     if (!urgentThread) return false;
     const mutedUntil = Number(db.getSetting("telegram.mute_until") ?? 0) > now();
     const silent = mutedUntil || destinationMode(urgentThread, bindings) === "off";
@@ -1283,7 +1281,7 @@ export function createTelegram(opts: TelegramOptions) {
     for (const [boundName, boundThread] of Object.entries(topics)) if (boundThread === threadId && boundName !== name) delete topics[boundName];
     topics[name] = threadId;
     db.setSetting("telegram.topics", JSON.stringify({ groupChatId: groupId, topics }));
-    await retrySend(bindingConfirmation(chat.title, groupId, name, threadId === null));
+    await retrySendAt({ chatId: groupId, threadId, name }, bindingConfirmation(chat.title, groupId, name, threadId === null));
   };
   const unbindTopic = async (name: string, destination: Destination, bindings: TopicBindings | null) => {
     if (!bindings || !Object.hasOwn(bindings.topics, name)) {
@@ -1305,7 +1303,9 @@ export function createTelegram(opts: TelegramOptions) {
       const match = (topicsEnabled ? /^\/pair(?:@[A-Za-z0-9_]+)?\s+([0-9A-Za-z]+)\s*$/i : /^\/pair\s+([0-9A-Za-z]+)\s*$/i).exec(text);
       if (chat.type === "private" && match && now() < pairingExpires && match[1].toUpperCase() === pairing) {
         setPaired(String(chat.id), String(from.id), from.username ?? "");
-        await retrySend("Paired. You'll get alerts here.");
+        await queueSend(dmDestination(), topicsEnabled
+          ? "Paired. Bind your group topics with /bind and bind General with /bind general. Alerts and replies stay in the group."
+          : "Paired. You'll get alerts here.");
       }
       return;
     }
@@ -1313,7 +1313,7 @@ export function createTelegram(opts: TelegramOptions) {
     const bindings = readBindings(), incomingChatId = String(chat.id);
     const bootstrapBind = topicsEnabled && parsedCommand?.command === "/bind" && !!parsedCommand.arg && chat.type === "supergroup" && !bindings;
     const bootstrapBasicGroup = topicsEnabled && parsedCommand?.command === "/bind" && !!parsedCommand.arg && chat.type === "group";
-    const privateDm = incomingChatId === chatId && (!topicsEnabled || chat.type === "private");
+    const privateDm = !topicsEnabled && incomingChatId === chatId;
     const boundGroup = !!bindings && incomingChatId === bindings.groupChatId && chat.type === "supergroup";
     if (!privateDm && !boundGroup && !bootstrapBind && !bootstrapBasicGroup) return;
     const destination = incomingDestination(message);
@@ -1467,7 +1467,7 @@ export function createTelegram(opts: TelegramOptions) {
     const callbackChat = callback.message?.chat, fromId = callback.from?.id;
     if (!paired() || String(fromId) !== userId || !callbackChat) return;
     const bindings = readBindings(), callbackChatId = String(callbackChat.id);
-    const privateDm = callbackChatId === chatId && (!topicsEnabled || callbackChat.type === "private");
+    const privateDm = !topicsEnabled && callbackChatId === chatId;
     const boundGroup = callbackChat.type === "supergroup" && !!bindings && callbackChatId === bindings.groupChatId;
     if (!privateDm && !boundGroup) return;
     if (callback.data?.startsWith("q:")) { await handleQuestionCallback(callback, callbackChatId, callback.data); return; }
