@@ -577,6 +577,25 @@ test("native question answers are complete, exact, single-use and audited", asyn
     .toEqual([{ source: "web", actor: "web:loopback", listener: "loopback" }]);
 });
 
+test.each(["雪".repeat(100), "q".repeat(8192)])("long native question text remains answerable after storage", async text => {
+  setup(true);
+  const registration = await fetch(base + "/question/register", {
+    method: "POST", headers: questionHeaders, body: JSON.stringify({
+      ...questionPayload, questions: [{ question: text, options: [{ label: "Keep" }, { label: "Replace" }] }],
+    }),
+  });
+  expect(registration.status).toBe(201);
+  const key = `${localHost()}|claude|${sid}`;
+  expect(app!.db.getQuestionInvocation(questionId, key)?.questions).toMatchObject([{ question: text }]);
+  const submitted = await apiJson(base + `/api/sessions/${encodeURIComponent(key)}/question`, {
+    questionId, answers: { [text]: { selectedOptions: [0] } },
+  });
+  expect(submitted.status).toBe(200);
+  await expectExactJson(await fetch(base + "/question/wait?" + questionQuery + "&wait=1", {
+    headers: questionHeaders,
+  }), 200, { answers: { [text]: "Keep" } });
+});
+
 test("native question registration, wait and cancel enforce peer and invocation identity", async () => {
   setup(true, { tailnet: true, peers: "peer-a=192.0.2.10,peer-b=192.0.2.11" });
   const first = { ...questionHeaders, ...remoteHeaders, "X-Dash-Host": "peer-a" };

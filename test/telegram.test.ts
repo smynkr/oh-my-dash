@@ -168,7 +168,7 @@ async function pairedFixture(options: Parameters<typeof fixture>[0] = {}) {
 async function topicFixture(options: Omit<Parameters<typeof fixture>[0], "topicsEnabled"> = {}) {
   return pairedFixture({ ...options, topicsEnabled: true, bindings: options.bindings ?? { groupChatId: String(group), topics: defaultTopics } });
 }
-function registerClaudeQuestion(f: Awaited<ReturnType<typeof pairedFixture>>, sessionId: string, questions: AskQuestion[]) {
+function registerClaudeQuestion(f: Awaited<ReturnType<typeof pairedFixture>>, sessionId: string, questions: AskQuestion[], observe = true) {
   const id = Buffer.alloc(32, sessionId.length).toString("base64url"), toolUseId = `tool-${sessionId}`;
   const event: Parameters<NonNullable<typeof f.replies>["registerQuestion"]>[0]["event"] = {
     host: "synthetic-host", harness: "claude", sessionId, kind: "question", ts: f.clock.now, interactive: true,
@@ -180,7 +180,7 @@ function registerClaudeQuestion(f: Awaited<ReturnType<typeof pairedFixture>>, se
   f.db.sqlite.query("UPDATE sessions SET alive=1 WHERE key=?").run(key);
   const row = f.db.getSession(key);
   if (!row) throw new Error("registered question session is missing");
-  f.telegram.observe(row, "question");
+  if (observe) f.telegram.observe(row, "question");
   return { id, key, toolUseId };
 }
 const groupMessage = (text: string, threadId?: number, overrides: Record<string, any> = {}) => message(text, {
@@ -2985,12 +2985,157 @@ describe("Telegram native question answers", () => {
         ...(threadId === undefined ? {} : { message_thread_id: threadId }) },
       data: `q:${questionId}:${questionIndex}:${action}`,
     } });
+  const questionMessages = (bot: FakeBot) =>
+    bot.sent.filter(send => typeof send.text === "string" && send.text.includes("Claude / OMP question"));
+
+  test("redacts every displayed question field before pagination", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const headerSecret = `sk-${"H".repeat(24)}`, questionSecret = `sk-${"Q".repeat(24)}`;
+    const labelSecret = `sk-${"L".repeat(24)}`, descriptionSecret = `sk-${"D".repeat(24)}`;
+    const previewSecret = `sk-${"P".repeat(24)}`;
+    const { id } = registerClaudeQuestion(f, "redacted-question", [{
+      id: "choice", header: `Header ${headerSecret}`, question: `${"q".repeat(535)}${questionSecret}`,
+      options: [{ label: `Label ${labelSecret}`, description: `Description ${descriptionSecret}`, preview: `Preview ${previewSecret}` },
+        { label: "Other choice" }],
+    }]);
+    await apiSettled(() => questionMessages(f.bot).length === 2, "redacted question pages");
+    const rendered = questionMessages(f.bot).map(send => visibleText(send.text)).join("\n");
+    for (const secret of [headerSecret, questionSecret, labelSecret, descriptionSecret, previewSecret]) {
+      expect(rendered).not.toContain(secret);
+    }
+    expect(rendered.match(/\[redacted\]/g)).toHaveLength(5);
+    expect(rendered).not.toContain(questionSecret.slice(0, 8));
+    expect(rendered).not.toContain(questionSecret.slice(8));
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(1);
+  });
+
+  test("zero content budget keeps native question details and answer controls off Telegram", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, snippetChars: 0, clock: { now: Date.now() } });
+    const secret = `sk-${"Z".repeat(24)}`;
+    const { id } = registerClaudeQuestion(f, "zero-question-content", [{
+      id: "private-route", header: `Private header ${secret}`, question: `Should this be shown? ${secret}`,
+      options: [{ label: `Use secure route (Recommended) ${secret}`, description: `Private detail ${secret}` },
+        { label: "Fallback route", preview: `Private preview ${secret}` }],
+    }]);
+    await apiSettled(() => f.bot.sent.length > 0, "metadata-only needs-input alert");
+    const rendered = visibleText(f.bot.sent.map(send => send.text).join("\n"));
+    for (const hidden of ["Private header", "Should this be shown?", "Use secure route", "Private detail", "Private preview"]) {
+      expect(rendered).not.toContain(hidden);
+    }
+    expect(questionMessages(f.bot)).toHaveLength(0);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    const buttons = f.bot.sent.flatMap(send => send.reply_markup?.inline_keyboard?.flat() ?? []);
+    expect(buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))).toBe(false);
+  });
+
+  test("positive budget clips one complete question before pagination and hides choices it cannot fit", async () => {
+    const f = await pairedFixture({ repliesEnabled: true, snippetChars: 160, clock: { now: Date.now() } });
+    registerClaudeQuestion(f, "bounded-question", [{
+      id: "route", header: "Route selection", question: "Which path should be used?",
+      options: [{ label: "Keep local", description: "No rewrite" },
+        { label: "Use remote", preview: `Overflow sample ${"excerpt ".repeat(100)}UNSENT-OVERFLOW-TAIL` }],
+    }]);
+    await apiSettled(() => questionMessages(f.bot).length === 1, "bounded question card");
+    const content = visibleText(questionMessages(f.bot)[0]!.text).split("\n").slice(1).join("\n");
+    expect([...content].length).toBeLessThanOrEqual(160);
+    expect(content).toContain("1. Keep local");
+    expect(content).toContain("2. Use remote");
+    expect(content).not.toContain("UNSENT-OVERFLOW-TAIL");
+
+    const hidden = await pairedFixture({ repliesEnabled: true, snippetChars: 16, clock: { now: Date.now() } });
+    const { id } = registerClaudeQuestion(hidden, "hidden-choice-question", [{
+      id: "route", question: "Which path?", options: [{ label: "Keep local" }, { label: "Use remote" }],
+    }]);
+    await apiSettled(() => hidden.bot.sent.length > 0, "bounded metadata-only alert");
+    expect(questionMessages(hidden.bot)).toHaveLength(0);
+    expect(hidden.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+    const buttons = hidden.bot.sent.flatMap(send => send.reply_markup?.inline_keyboard?.flat() ?? []);
+    expect(buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))).toBe(false);
+  });
+
+  test.each(["global", "session"] as const)("does not create native question cards during a %s mute", async mute => {
+    const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const sessionId = `native-${mute}-mute`;
+    if (mute === "global") f.db.setSetting("telegram.mute_until", String(f.clock.now + 60_000));
+    else {
+      const row = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId, kind: "question",
+        ts: f.clock.now, text: "Synthetic waiting question", interactive: true });
+      f.telegram.observe(row);
+      await apiSettled(() => f.bot.sent.length === 1, "session alert with mute action");
+      const data = f.bot.sent[0]!.reply_markup.inline_keyboard[0][0].callback_data;
+      f.bot.enqueueUpdate({ callback_query: {
+        id: "mute-native-question", from: { id: owner },
+        message: { chat: { id: chat, type: "private" } }, data,
+      } });
+      await eventually(() => f.bot.count("answerCallbackQuery") === 1, "session mute callback");
+    }
+    const { id } = registerClaudeQuestion(f, sessionId, [{
+      id: "choice", question: "Should this stay muted?", options: [{ label: "Yes" }, { label: "No" }],
+    }]);
+    await apiSettled(() => questionMessages(f.bot).length === 0);
+    expect(questionMessages(f.bot)).toHaveLength(0);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+  });
+
+  test("a queued question send rechecks mute after pacing and replay does not resend it", async () => {
+    const clock = { now: Date.now() };
+    let holdNextSleep = false, releaseSleep: (() => void) | undefined, markSleepStarted: (() => void) | undefined;
+    const sleepStarted = new Promise<void>(resolve => { markSleepStarted = resolve; });
+    const sleep = async (ms: number) => {
+      if (holdNextSleep) {
+        holdNextSleep = false;
+        await new Promise<void>(resolve => {
+          releaseSleep = () => { clock.now += ms; resolve(); };
+          markSleepStarted?.();
+        });
+      } else clock.now += ms;
+    };
+    const f = await topicFixture({ repliesEnabled: true, clock, sleep });
+    const rateLimitRow = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "rate-limit",
+      cwd: "/projects/invest/synthetic", kind: "question", ts: clock.now, text: "Synthetic waiting text", interactive: true });
+    f.telegram.observe(rateLimitRow);
+    await apiSettled(() => f.bot.sent.length === 1, "prior paced send");
+
+    const { id, key } = registerClaudeQuestion(f, "queued-question", [{
+      id: "choice", question: "Queued synthetic question?", options: [{ label: "First" }, { label: "Second" }],
+    }], false);
+    const row = f.db.getSession(key)!;
+    f.db.setSetting("telegram.mute_until", String(clock.now + 60_000));
+    f.telegram.observe(row, "question");
+    f.db.setSetting("telegram.mute_until", "0");
+    holdNextSleep = true;
+    f.telegram.observe(row, "question");
+    await sleepStarted;
+    f.db.setSetting("telegram.mute_until", String(clock.now + 60_000));
+    const marker = f.telegram.sendUrgent("invest", "Synthetic queue synchronization marker");
+    releaseSleep!();
+    expect(await marker).toBe(true);
+    expect(questionMessages(f.bot)).toHaveLength(0);
+    expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+
+    f.db.setSetting("telegram.mute_until", "0");
+    f.telegram.observe(row, "question");
+    await apiSettled(() => questionMessages(f.bot).length === 1, "unmuted question card");
+    const beforeReplay = questionMessages(f.bot).length;
+    f.db.setSetting("telegram.mute_until", String(clock.now + 60_000));
+    f.telegram.close();
+    const again = createTelegram({ db: f.db, apiBase: f.bot.base, fetch: trackedFetch, now: () => clock.now, replies: f.replies,
+      readToken: async () => token, sleep: async ms => { clock.now += ms; } });
+    resources.push(() => again.close());
+    again.start();
+    await eventually(() => again.health().state === "ok", "muted question replay startup");
+    await apiSettled(() => questionMessages(f.bot).length === beforeReplay, "muted question replay");
+    expect(questionMessages(f.bot)).toHaveLength(beforeReplay);
+  });
+
 
   test("preserves multiple Claude selections and custom text, then consumes one exact answer map", async () => {
     const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
+    const originalQuestion = `Choose an approach? sk-${"Q".repeat(24)}`;
+    const originalLabel = `Replace (Recommended) sk-${"O".repeat(24)}`;
     const questions: AskQuestion[] = [
-      { id: "approach", question: "Choose an approach?", header: "Implementation",
-        options: [{ label: "Keep <existing> & tested", description: "No rewrite" }, { label: "Replace (Recommended)" }] },
+      { id: "approach", question: originalQuestion, header: "Implementation",
+        options: [{ label: "Keep <existing> & tested", description: "No rewrite" }, { label: originalLabel }] },
       { id: "colors", question: "Which colors?", options: [{ label: "Red & blue" }, { label: "Green" }], multi: true },
     ];
     const { id, key, toolUseId } = registerClaudeQuestion(f, "telegram-claude-question", questions);
@@ -3020,7 +3165,7 @@ describe("Telegram native question answers", () => {
     expect(await wait).toEqual({
       status: 200,
       answers: {
-        "Choose an approach?": "Replace (Recommended)",
+        [originalQuestion]: originalLabel,
         "Which colors?": "Red & blue, Green, My own & free",
       },
     });

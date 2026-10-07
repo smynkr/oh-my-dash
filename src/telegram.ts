@@ -327,11 +327,11 @@ export function createTelegram(opts: TelegramOptions) {
       ...(disableNotification ? { disable_notification: true } : {}) });
   const validRecipient = (destination: Destination, epoch: number) => running && paired() && epoch === pairEpoch && !!destination.chatId;
   const sendAtDestination = async (destination: Destination, epoch: number, text: string, keyboard?: Record<string, unknown>, replyTo?: number,
-    editId?: number, disableNotification = false): Promise<SentMessage | undefined> => {
-    for (let attempt = 0; attempt <= 3 && validRecipient(destination, epoch); attempt++) {
+    editId?: number, disableNotification = false, canSend?: () => boolean): Promise<SentMessage | undefined> => {
+    for (let attempt = 0; attempt <= 3 && validRecipient(destination, epoch) && (!canSend || canSend()); attempt++) {
       const delay = Math.max(0, 1000 - (now() - lastSendAt));
       if (delay) await wait(delay);
-      if (!validRecipient(destination, epoch)) return;
+      if (!validRecipient(destination, epoch) || canSend && !canSend()) return;
       lastSendAt = now();
       try {
         const message = editId
@@ -359,9 +359,9 @@ export function createTelegram(opts: TelegramOptions) {
     }
   };
   const sendWithFallback = async (destination: Destination | null, epoch: number, text: string, keyboard?: Record<string, unknown>, replyTo?: number,
-    disableNotification = false): Promise<SentMessage | undefined> => {
-    if (!destination || !validRecipient(destination, epoch)) return;
-    const sentAt = await sendAtDestination(destination, epoch, text, keyboard, replyTo, undefined, disableNotification);
+    disableNotification = false, canSend?: () => boolean): Promise<SentMessage | undefined> => {
+    if (!destination || !validRecipient(destination, epoch) || canSend && !canSend()) return;
+    const sentAt = await sendAtDestination(destination, epoch, text, keyboard, replyTo, undefined, disableNotification, canSend);
     if (sentAt) return sentAt;
     if (!running || epoch !== pairEpoch) return;
     if (!topicsEnabled || !token || destination.chatId === chatId) { dropped++; return; }
@@ -370,7 +370,7 @@ export function createTelegram(opts: TelegramOptions) {
     for (const candidate of candidates) {
       if (sameDestination(candidate, destination)) continue;
       const changed = !sameDestination(candidate, destination);
-      const delivered = await sendAtDestination(candidate, epoch, text, keyboard, changed ? undefined : replyTo, undefined, disableNotification);
+      const delivered = await sendAtDestination(candidate, epoch, text, keyboard, changed ? undefined : replyTo, undefined, disableNotification, canSend);
       if (delivered) return delivered;
       if (!token || !running || epoch !== pairEpoch) break;
     }
@@ -378,9 +378,10 @@ export function createTelegram(opts: TelegramOptions) {
   };
   let sendChain: Promise<unknown> = Promise.resolve();
   const queueSend = (destination: Destination | null, text: string, keyboard?: Record<string, unknown>, replyTo?: number,
-    disableNotification = false): Promise<SentMessage | undefined> => {
+    disableNotification = false, canSend?: () => boolean): Promise<SentMessage | undefined> => {
     const epoch = pairEpoch;
-    const next = sendChain.then(() => sendWithFallback(destination, epoch, text, keyboard, replyTo, disableNotification));
+    const next = sendChain.then(() => !canSend || canSend()
+      ? sendWithFallback(destination, epoch, text, keyboard, replyTo, disableNotification, canSend) : undefined);
     sendChain = next.catch(error => report("telegram send", error));
     return next;
   };
@@ -800,6 +801,9 @@ export function createTelegram(opts: TelegramOptions) {
         `${option.preview ? `\n   Preview: ${option.preview}` : ""}`;
     }),
   ].join("\n\n");
+  const questionLabelsVisible = (question: AskQuestion, text: string) => {
+    return question.options.every((option, index) => text.includes(`${index + 1}. ${redact(option.label)}`));
+  };
   const questionKeyboard = (card: QuestionCard, index: number) => {
     const question = card.questions[index]!, pick = card.picks[index]!;
     const rows: { text: string; callback_data: string }[][] = [];
@@ -888,16 +892,21 @@ export function createTelegram(opts: TelegramOptions) {
     if (sendingQuestionCards.has(card.id)) return;
     sendingQuestionCards.add(card.id);
     try {
-      if (!questionCardLive(card)) { invalidateQuestionCard(card); return; }
-      for (let index = 0; index < card.questions.length && questionCardLive(card); index++) {
+      const canSend = () => questionCardCanSend(card);
+      if (!canSend()) { invalidateQuestionCard(card); return; }
+      const texts = card.questions.map(question => clipped(redact(questionText(question)), snippetChars));
+      if (texts.some((text, index) => !questionLabelsVisible(card.questions[index]!, text))) {
+        invalidateQuestionCard(card); return;
+      }
+      for (let index = 0; index < card.questions.length && canSend(); index++) {
         if (card.messages.has(index)) continue;
-        const points = [...questionText(card.questions[index]!)], chunks: string[] = [];
+        const points = [...texts[index]!], chunks: string[] = [];
         for (let offset = 0; offset < points.length; offset += 600) chunks.push(points.slice(offset, offset + 600).join(""));
         let finalMessage: SentMessage | undefined;
-        for (let part = 0; part < chunks.length && questionCardLive(card); part++) {
+        for (let part = 0; part < chunks.length && canSend(); part++) {
           const lastPage = part === chunks.length - 1;
           finalMessage = await queueSend(card.destination, buildQuestionPage(card, index, part, chunks.length, chunks[part]!),
-            lastPage ? questionKeyboard(card, index) : undefined);
+            lastPage ? questionKeyboard(card, index) : undefined, undefined, false, canSend);
           if (!finalMessage) { invalidateQuestionCard(card); return; }
         }
         if (!finalMessage) { invalidateQuestionCard(card); return; }
@@ -905,7 +914,7 @@ export function createTelegram(opts: TelegramOptions) {
           questionId: card.id, sessionKey: card.key, chatId: finalMessage.chatId, threadId: finalMessage.threadId,
           messageId: finalMessage.messageId, questionIndex: index, createdAt: now(), prompt: false,
         };
-        if (!questionCardLive(card)) { clearTelegramQuestionMessage(saved); invalidateQuestionCard(card); return; }
+        if (!canSend()) { clearTelegramQuestionMessage(saved); invalidateQuestionCard(card); return; }
         db.rememberTelegramQuestionMessage(saved);
         card.messages.set(index, { sent: finalMessage, questionIndex: index });
       }
@@ -913,7 +922,7 @@ export function createTelegram(opts: TelegramOptions) {
   };
   const createQuestionCard = (dto: SessionDTO) => {
     if (!replies || !isHarness(dto) || dto.status !== "needs_input" || dto.needsReason !== "question" ||
-        !dto.pendingQuestion?.questions?.length) return;
+        !dto.pendingQuestion?.questions?.length || snippetChars === 0 || isMuted(dto.key)) return;
     const id = dto.pendingQuestion.id;
     if (!/^[A-Za-z0-9_-]{8,43}$/.test(id)) return;
     const destination = destinationForProject(dto.project);
@@ -1130,7 +1139,7 @@ export function createTelegram(opts: TelegramOptions) {
   };
   // Claude AskUserQuestion options carry their own "(Recommended)" marker; without one the line is omitted.
   const questionRecommendation = (dto: SessionDTO): Rec | undefined => {
-    if (!replies || dto.harness !== "claude" || dto.needsReason !== "question") return;
+    if (!replies || !snippetChars || dto.harness !== "claude" || dto.needsReason !== "question") return;
     try {
       const questions: unknown = JSON.parse(db.latestQuestionDetail(dto.key) ?? "[]");
       const labels = (Array.isArray(questions) ? questions : []).flatMap(options => Array.isArray(options) ? options : [])
@@ -1140,6 +1149,7 @@ export function createTelegram(opts: TelegramOptions) {
     } catch { return undefined; }
   };
   const isMuted = (key: string) => Number(db.getSetting("telegram.mute_until") ?? 0) > now() || (muted.get(key) ?? 0) > now();
+  const questionCardCanSend = (card: QuestionCard) => questionCardLive(card) && !isMuted(card.key);
   const cardAlert = (dto: SessionDTO, response: ResponseDTO, destination: Destination): Alert => {
     const { key, displayName, host, harness, sessionKind } = dto, rec = recommendation(response);
     return { dto: { key, displayName, host, harness, sessionKind }, reason: "waiting", turn: true, promptId: db.latestPromptEventId(key),

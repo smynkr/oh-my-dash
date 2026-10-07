@@ -278,7 +278,10 @@
     const session = state.sessions.find(item => responseKey(item) === key);
     if (session) patchSessionCard(session, session);
   }
-  function replyApiPath(key, suffix = '') { return `/api/sessions/${encodeURIComponent(key)}/replies${suffix}`; }
+  function replyApiPath(key, suffix = '') {
+    const endpoint = suffix === '/reply' ? suffix : `/replies${suffix}`;
+    return `/api/sessions/${encodeURIComponent(key)}${endpoint}`;
+  }
   async function refreshReplyAvailability() {
     const response = await fetch('/healthz');
     if (!response.ok) throw new Error('Reply status unavailable');
@@ -385,6 +388,7 @@
       await loadSessions().catch(() => {});
       return;
     }
+    state.replyNotices.delete(key);
     state.replyPending.add(key);
     patchSessionCard(session, session);
     try {
@@ -395,7 +399,7 @@
       });
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        if (response.status === 404 && payload.error === 'not found') {
+        if (response.status === 404 && payload?.error === 'not found') {
           state.repliesEnabled = false; stopAllReplyRefreshes(); renderSessions(); return;
         }
         if (response.status === 409 && ['stale_turn', 'stale_question'].includes(payload?.reason)) {
@@ -425,6 +429,7 @@
       replyNotice(key, 'Out of date: the question has been answered or replaced');
       return;
     }
+    state.replyNotices.delete(key);
     state.replyPending.add(key);
     patchSessionCard(session, session);
     try {
@@ -460,7 +465,7 @@
     const pendingId = harness === 'omp' && status === 'needs_input' && !dialogCopy
       ? s.pendingQuestion?.id ?? s.pendingQuestionId
       : harness === 'claude' && status === 'needs_input' && reason === 'question' &&
-        s.pendingQuestion?.id === s.pendingQuestionId ? s.pendingQuestion.id : undefined;
+        s.pendingQuestion && s.pendingQuestion.id === s.pendingQuestionId ? s.pendingQuestion.id : undefined;
     const pending = pendingId ? s.pendingQuestion : undefined, claudeQuestion = harness === 'claude' && Boolean(pending);
     const draftKey = pendingId ? `${key}#${pendingId}` : key;
     if (pending) controls.append(renderPendingQuestion(key, pending, busy, harness));
