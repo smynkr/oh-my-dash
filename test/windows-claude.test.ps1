@@ -226,6 +226,22 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $fixture.InstallPath)) 'dry-run creates no helper directory'
     Assert-True (-not (Get-ScheduledTask -TaskName $fixture.TaskName -ErrorAction SilentlyContinue)) 'dry-run creates no scheduled task'
     Assert-Equal $beforeDryRun ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($fixture.SettingsPath))) 'dry-run leaves settings bytes untouched'
+    $dottedLabelArguments = @(
+        '-HubUrl', $fixture.Server.HubBase,
+        '-HostLabel', 'synthetic.windows.host',
+        '-SettingsPath', $fixture.SettingsPath,
+        '-InstallPath', $fixture.InstallPath,
+        '-ClaudePath', $fixture.ClaudePath,
+        '-TaskName', $fixture.TaskName,
+        '-DryRun'
+    )
+    $dottedLabelFailure = Invoke-WindowsClaudeScript -ScriptPath $installer `
+        -Arguments $dottedLabelArguments -TimeoutSeconds 30
+    Assert-Equal 1 $dottedLabelFailure.ExitCode 'installer rejects a dotted host label rather than silently truncating it'
+    Assert-True (-not (Test-Path -LiteralPath $fixture.InstallPath)) 'rejected dotted host label creates no helper directory'
+    Assert-True (-not (Get-ScheduledTask -TaskName $fixture.TaskName -ErrorAction SilentlyContinue)) 'rejected dotted host label creates no scheduled task'
+    Assert-Equal $beforeDryRun ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($fixture.SettingsPath))) `
+        'rejected dotted host label leaves settings bytes untouched'
 
     $install = Invoke-WindowsClaudeScript -ScriptPath $installer `
         -Arguments (Get-InstallerArguments $fixture) -TimeoutSeconds 60
@@ -233,6 +249,49 @@ try {
     $installed = $true
     $task = Get-ScheduledTask -TaskName $fixture.TaskName -ErrorAction Stop
     $taskCreated = $true
+
+    $unregisterFailureWrapper = Join-Path $fixture.Root 'simulate-unregister-failure.ps1'
+    $unregisterFailureScript = @'
+param(
+    [Parameter(Mandatory = $true)][string]$InstallerPath,
+    [Parameter(Mandatory = $true)][string]$ArgumentsJson
+)
+function Unregister-ScheduledTask {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([string]$TaskName, [string]$TaskPath)
+    $errorRecord = [System.Management.Automation.ErrorRecord]::new(
+        [System.UnauthorizedAccessException]::new('Synthetic access denied removing the task.'),
+        'SyntheticUnregisterDenied',
+        [System.Management.Automation.ErrorCategory]::PermissionDenied,
+        $TaskName
+    )
+    $PSCmdlet.WriteError($errorRecord)
+}
+$installerArguments = @($ArgumentsJson | ConvertFrom-Json)
+& $InstallerPath @installerArguments
+'@
+    [System.IO.File]::WriteAllText($unregisterFailureWrapper, $unregisterFailureScript, [System.Text.UTF8Encoding]::new($false))
+    $settingsBeforeUnregisterFailure = [System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($fixture.SettingsPath))
+    $clientConfigPath = Join-Path $fixture.InstallPath 'client-config.json'
+    $livenessHelperPath = Join-Path $fixture.InstallPath 'claude-liveness.ps1'
+    try {
+        $uninstallArgumentsJson = ConvertTo-Json -InputObject (Get-InstallerArguments $fixture @('-Uninstall')) -Compress
+        $failedUnregister = Invoke-WindowsClaudeScript -ScriptPath $unregisterFailureWrapper `
+            -Arguments @($installer, $uninstallArgumentsJson) -TimeoutSeconds 30
+        Assert-Equal 1 $failedUnregister.ExitCode 'uninstall fails when owned liveness task removal fails'
+        $remainingTask = Get-ScheduledTask -TaskName $fixture.TaskName -TaskPath '\' -ErrorAction Stop
+        Assert-Equal $fixture.TaskName $remainingTask.TaskName 'failed task removal leaves the liveness task registered'
+        Assert-Equal $settingsBeforeUnregisterFailure `
+            ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($fixture.SettingsPath))) `
+            'failed task removal leaves Claude settings unchanged'
+        Assert-True (Test-Path -LiteralPath $clientConfigPath -PathType Leaf) 'failed task removal preserves client config'
+        Assert-True (Test-Path -LiteralPath $livenessHelperPath -PathType Leaf) 'failed task removal preserves the liveness helper'
+    }
+    finally {
+        Remove-Item -LiteralPath $unregisterFailureWrapper -Force -ErrorAction SilentlyContinue
+    }
+
+    $task = Get-ScheduledTask -TaskName $fixture.TaskName -ErrorAction Stop
     Assert-Equal ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) (Get-WindowsClaudeAccountSid $task.Principal.UserId) 'liveness task runs as the installing user'
     $repeatingTriggers = @($task.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT1M' })
     Assert-Equal 1 $repeatingTriggers.Count 'liveness uses a supported one-minute repeating trigger'

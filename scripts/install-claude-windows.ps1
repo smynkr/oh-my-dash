@@ -421,8 +421,14 @@ function Get-DashTaskArguments([string]$Path) {
 }
 
 function Assert-DashTaskOwnership([string]$Path, [string]$TaskName) {
-    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
-    if ($null -eq $task) { return }
+    $taskLookupErrors = @()
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue -ErrorVariable taskLookupErrors
+    foreach ($taskLookupError in $taskLookupErrors) {
+        if ($taskLookupError.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+            throw $taskLookupError
+        }
+    }
+    if ($null -eq $task) { return $null }
 
     $expectedPowerShell = Get-WindowsPowerShellExe
     $expectedPath = ConvertTo-FullPath $Path
@@ -451,12 +457,13 @@ function Assert-DashTaskOwnership([string]$Path, [string]$TaskName) {
     if (-not $owned) {
         throw "Scheduled Task '$TaskName' exists but does not match the managed Windows Claude task; refusing to overwrite or remove it."
     }
+    return $task
 }
 
 function Register-DashLivenessTask([string]$Path, [string]$TaskName, $TaskSnapshot) {
     $powershellExe = Get-WindowsPowerShellExe
     $livenessPath = ConvertTo-FullPath $Path
-    Assert-DashTaskOwnership -Path $livenessPath -TaskName $TaskName
+    $null = Assert-DashTaskOwnership -Path $livenessPath -TaskName $TaskName
     $action = New-ScheduledTaskAction -Execute $powershellExe -Argument (Get-DashTaskArguments $livenessPath) `
         -WorkingDirectory (Split-Path -Parent $livenessPath)
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -474,8 +481,9 @@ function Register-DashLivenessTask([string]$Path, [string]$TaskName, $TaskSnapsh
 }
 
 function Remove-DashLivenessTask([string]$Path, [string]$TaskName) {
-    Assert-DashTaskOwnership -Path $Path -TaskName $TaskName
-    Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false -ErrorAction SilentlyContinue
+    $task = Assert-DashTaskOwnership -Path $Path -TaskName $TaskName
+    if ($null -eq $task) { return }
+    Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false -ErrorAction Stop
 }
 
 
@@ -514,12 +522,11 @@ try {
     $SettingsPath = ConvertTo-FullPath $SettingsPath
     $InstallPath = ConvertTo-FullPath $InstallPath
     if ($TaskName -notmatch '^[A-Za-z0-9 ._-]{1,128}$') { throw '-TaskName may contain only letters, digits, spaces, dots, underscores, or hyphens.' }
-    if ($HostLabel -match '\.') { $HostLabel = $HostLabel.Split('.')[0] }
     if (-not $Uninstall -and $HostLabel -notmatch '^[A-Za-z0-9_-]{1,64}$') {
         throw '-HostLabel must be a label of 1 to 64 letters, digits, underscores, or hyphens.'
     }
     $livenessPath = Join-Path $InstallPath 'claude-liveness.ps1'
-    Assert-DashTaskOwnership -Path $livenessPath -TaskName $TaskName
+    $null = Assert-DashTaskOwnership -Path $livenessPath -TaskName $TaskName
 
     if ($Uninstall) {
         if ($DryRun) {
@@ -541,7 +548,6 @@ try {
     }
 
     $hubBase = Get-HubBase $HubUrl
-    $HostLabel = $HostLabel.Split('.')[0]
     $ClaudePath = Get-ClaudeExecutable $ClaudePath
     $helperNames = @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1')
     $helperBytes = @{}
