@@ -15,7 +15,7 @@ This public source snapshot is software documentation, not an operational histor
 
 ## Requirements and local quick start
 
-macOS is the supported hub platform: its optional LaunchAgent template, Keychain-backed Telegram token, and Claude liveness polling via `claude agents --json` are macOS-specific. Install [Bun 1.3.14 or newer](https://bun.sh/), then clone and start the project:
+macOS is the supported hub platform: its optional LaunchAgent template and Keychain-backed Telegram token are macOS-specific. Native Windows clients can connect to an existing hub. Install [Bun 1.3.14 or newer](https://bun.sh/), then clone and start the project:
 
 ```sh
 git clone https://github.com/smynkr/oh-my-dash.git
@@ -60,7 +60,16 @@ Uninstalling integrations does not erase the collector database or the original 
 
 ### Windows
 
-Windows support is currently limited to the OMP extension connecting to an already-running hub. The documented hub service, macOS Keychain token storage, LaunchAgent setup, Claude Code hooks, and Claude CLI liveness polling are macOS-specific; Claude Code integration on Windows is not supported here. Set `DASH_URL` to the hub's allowed OMP ingest URL and `DASH_HOST` to the exact peer label configured on that hub before starting OMP.
+Windows clients support both the OMP extension and native Claude Code hooks connecting to an already-running hub. The collector service, Keychain token storage, and LaunchAgent setup remain macOS-specific.
+
+For Claude Code, use Windows PowerShell 5.1 and a working, signed-in Claude CLI. From the repository root, preview the installation, then repeat without `-DryRun`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://your-hub.tailnet.ts.net:4777" -HostLabel "windows-peer" -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://your-hub.tailnet.ts.net:4777" -HostLabel "windows-peer"
+```
+
+Use the exact peer label authorized on your hub; remote URLs require HTTPS. The installer preserves unrelated Claude settings, backs up changed files, installs native event/reply helpers, and registers a per-user liveness task. Normal stopped turns can receive dashboard/Telegram replies when the hub enables `DASH_REPLIES=1`; question and permission dialogs remain terminal-only in this client mode. This installer does not require Bun or install a Windows hub. See the [Windows client runbook](docs/runbook.md#windows-claude-code-client) for prerequisites, custom paths, verification, and uninstall.
 
 From PowerShell in the repository root, install the extension and set the hub's Tailscale Serve URL and this device's exact allowlisted label:
 
@@ -71,7 +80,7 @@ setx DASH_URL "https://your-hub.tailnet.ts.net:4777/ingest/omp"
 setx DASH_HOST "windows-peer"
 ```
 
-Replace the example host/label with the values configured on your hub, open a new terminal so the environment is refreshed, and restart OMP. This does not install the hub or add Claude Code support on Windows.
+Replace the example host/label with the values configured on your hub, open a new terminal so the environment is refreshed, and restart OMP. The OMP extension and Claude installer are separate client integrations; neither installs the hub on Windows.
 
 ## Optional Telegram and replies
 

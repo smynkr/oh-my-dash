@@ -199,7 +199,37 @@ DASH_HUB="hub.example.ts.net:4777" bash scripts/deploy-remote.sh user@remote.exa
 DASH_HUB="hub.example.ts.net:4777" bash scripts/deploy-remote.sh user@remote.example laptop-label --apply
 ```
 
-The label must match that device's `label=IP` entry in the hub plist. Remote installs require SSH and the remote Mac's Bun and agent tools. To remove only those remote integrations, use the same SSH target and label with `--uninstall`; first run without `--apply` to preview, then apply. Windows currently supports the OMP extension only, not this macOS remote deployment script or Claude hooks.
+The label must match that device's `label=IP` entry in the hub plist. Remote installs require SSH and the remote Mac's Bun and agent tools. To remove only those remote integrations, use the same SSH target and label with `--uninstall`; first run without `--apply` to preview, then apply. Windows uses the native client installer below, not this macOS remote deployment script.
+
+### Windows Claude Code client
+
+The hub still runs on macOS. The Windows client requires Windows PowerShell 5.1, the `ScheduledTasks` module, a working Claude CLI, and permission to register a task for the current user. Sign in through Claude's `/login` if needed. Run the installer as the same Windows user who runs Claude; its liveness task uses that user's interactive logon context, not a service account.
+
+From a checkout in Windows PowerShell:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://hub.example.ts.net:4777" -HostLabel "windows-peer" -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://hub.example.ts.net:4777" -HostLabel "windows-peer"
+```
+
+The URL must be an HTTPS origin without a path, query, or credentials. Loopback HTTP is accepted only for local QA. The host label must match the hub's existing peer allowlist; the installer does not authorize a device or change hub flags.
+
+Defaults are `%USERPROFILE%\.claude\settings.json`, helper copies and private `client-config.json` under `%USERPROFILE%\.claude\oh-my-dash`, and task `OhMyDash-Claude-Liveness`. Override them with `-SettingsPath`, `-InstallPath`, and `-TaskName`. Use `-ClaudePath` for an explicit CLI executable or command shim if `claude` is not discoverable. Preserve these arguments when upgrading or uninstalling.
+
+Changed settings and helpers receive timestamped `.bak-dash-*` backups. Reinstalling an unchanged configuration is idempotent. An unrelated task with the same name is refused before settings or helper changes; select a different `-TaskName` rather than removing someone else's task.
+
+The client sends lifecycle/response events and runs `claude agents --json` at logon and once per minute while the user is signed in. CLI, parse, and transport failures are unknown liveness, never evidence that all sessions ended. A separate bounded Stop hook uses Claude's `asyncRewake` contract: a delivered reply is written to stderr with exit code `2`. Add `-NoReply` to omit that waiter; the hub must independently enable `DASH_REPLIES=1` to accept replies. This mode does not answer question or permission dialogs.
+
+For native verification, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\windows-claude.test.ps1`. It uses temporary settings/helpers, loopback HTTP fixtures, and uniquely named per-user tasks. For a live smoke, start a fresh signed-in Claude session, check its feed entry and response, send a dashboard/Telegram reply to its stopped turn, and confirm that only that turn resumes. Close the session and check liveness. Installation alone is not evidence of successful model-driven reply delivery.
+
+To remove the managed hooks, task, and unmodified helper copies:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -Uninstall -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -Uninstall
+```
+
+Uninstall preserves unrelated settings, hooks, backups, and modified helpers. It does not remove Claude, sign out, erase transcripts, or change the hub database. To restore an earlier client version, use its checkout and the same custom installation arguments; restore a settings backup only after checking for intervening user changes.
 
 ## Optional Caddy hostname
 
