@@ -3053,6 +3053,31 @@ describe("Telegram native question answers", () => {
     expect(buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))).toBe(false);
   });
 
+  test.each(["question", "description", "redaction"] as const)(
+    "repeated option text in %s cannot stand in for the actual option labels", async source => {
+      const f = await pairedFixture({
+        repliesEnabled: true, snippetChars: source === "redaction" ? Infinity : 100, clock: { now: Date.now() },
+      });
+      const { id } = registerClaudeQuestion(f, `repeated-label-${source}`, [{
+        id: "route",
+        question: source === "question"
+          ? `Examples: 1. Keep, 2. Replace. ${"context ".repeat(40)}`
+          : source === "redaction" ? "Examples: 1. Keep, 2. Replace -----END PRIVATE KEY-----." : "Which route?",
+        options: [
+          { label: "Keep", description: source === "description"
+            ? `Example: 2. Replace. ${"context ".repeat(40)}`
+            : source === "redaction" ? "-----BEGIN PRIVATE KEY-----\nsynthetic-key-material" : undefined },
+          { label: source === "redaction" ? "Replace -----END PRIVATE KEY-----" : "Replace" },
+        ],
+      }]);
+      await apiSettled(() => f.bot.sent.length > 0, "metadata-only hidden-option alert");
+      expect(questionMessages(f.bot)).toHaveLength(0);
+      expect(f.db.telegramQuestionMessagesForQuestion(id)).toHaveLength(0);
+      const buttons = f.bot.sent.flatMap(send => send.reply_markup?.inline_keyboard?.flat() ?? []);
+      expect(buttons.some((button: { callback_data?: string }) => button.callback_data?.startsWith("q:"))).toBe(false);
+    },
+  );
+
   test.each(["global", "session"] as const)("does not create native question cards during a %s mute", async mute => {
     const f = await pairedFixture({ repliesEnabled: true, clock: { now: Date.now() } });
     const sessionId = `native-${mute}-mute`;

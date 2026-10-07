@@ -790,19 +790,35 @@ export function createTelegram(opts: TelegramOptions) {
   };
   const questionSelectionReady = (question: AskQuestion, pick: QuestionPick) =>
     question.multi === true || pick.selected.size === 1 || !!pick.useCustom && !!pick.customInput?.trim();
-  const questionText = (question: AskQuestion) => [
-    ...(question.header ? [`Header: ${question.header}`] : []),
-    `Question: ${question.question}`,
-    `Select ${question.multi ? "all that apply" : "one option"}:`,
-    ...question.options.map((option, index) => {
+  const questionDisplayText = (question: AskQuestion): string | undefined => {
+    const parts = [
+      ...(question.header ? [`Header: ${question.header}`] : []),
+      `Question: ${question.question}`,
+      `Select ${question.multi ? "all that apply" : "one option"}:`,
+    ];
+    const cleanParts = parts.map(redact);
+    let length = cleanParts.reduce((sum, part) => sum + part.length, 0) + 2 * (cleanParts.length - 1);
+    let lastLabelEnd = 0;
+    for (let index = 0; index < question.options.length; index++) {
+      const option = question.options[index]!;
       const recommended = question.recommended === index && !option.label.endsWith(" (Recommended)");
-      return `${index + 1}. ${option.label}${recommended ? " (Recommended)" : ""}` +
+      const heading = `${index + 1}. ${option.label}${recommended ? " (Recommended)" : ""}`;
+      const part = heading +
         `${option.description ? `\n   ${option.description}` : ""}` +
         `${option.preview ? `\n   Preview: ${option.preview}` : ""}`;
-    }),
-  ].join("\n\n");
-  const questionLabelsVisible = (question: AskQuestion, text: string) => {
-    return question.options.every((option, index) => text.includes(`${index + 1}. ${redact(option.label)}`));
+      const clean = redact(part), cleanHeading = redact(heading);
+      if (!clean.startsWith(cleanHeading)) return;
+      lastLabelEnd = length + 2 + cleanHeading.length;
+      length += 2 + clean.length;
+      parts.push(part);
+      cleanParts.push(clean);
+    }
+    const clean = redact(parts.join("\n\n"));
+    // Cross-field redaction can consume an option row; only intact layout pieces have known label positions.
+    if (clean !== cleanParts.join("\n\n")) return;
+    const text = clipped(clean, snippetChars);
+    const visibleEnd = text === clean ? text.length : text.length - 1;
+    return lastLabelEnd <= visibleEnd ? text : undefined;
   };
   const questionKeyboard = (card: QuestionCard, index: number) => {
     const question = card.questions[index]!, pick = card.picks[index]!;
@@ -894,8 +910,8 @@ export function createTelegram(opts: TelegramOptions) {
     try {
       const canSend = () => questionCardCanSend(card);
       if (!canSend()) { invalidateQuestionCard(card); return; }
-      const texts = card.questions.map(question => clipped(redact(questionText(question)), snippetChars));
-      if (texts.some((text, index) => !questionLabelsVisible(card.questions[index]!, text))) {
+      const texts = card.questions.map(questionDisplayText);
+      if (texts.some(text => text === undefined)) {
         invalidateQuestionCard(card); return;
       }
       for (let index = 0; index < card.questions.length && canSend(); index++) {
