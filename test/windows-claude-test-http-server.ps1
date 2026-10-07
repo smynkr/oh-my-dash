@@ -61,7 +61,7 @@ function Read-HttpRequest([System.Net.Sockets.NetworkStream]$Stream) {
     }
 }
 
-function Write-HttpResponse([System.Net.Sockets.NetworkStream]$Stream, [int]$StatusCode, [string]$Body, [string]$ContentType, [string]$ExtraHeaders = '') {
+function Write-HttpResponse([System.Net.Sockets.NetworkStream]$Stream, [int]$StatusCode, [string]$Body, [string]$ContentType, [string]$ExtraHeaders = '', [int]$BodyByteDelayMilliseconds = 0) {
     $reason = switch ($StatusCode) {
         200 { 'OK' }
         201 { 'Created' }
@@ -77,7 +77,14 @@ function Write-HttpResponse([System.Net.Sockets.NetworkStream]$Stream, [int]$Sta
     $headerText = "HTTP/1.1 $StatusCode $reason`r`nContent-Type: $ContentType`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n" + $ExtraHeaders + "`r`n"
     $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($headerText)
     $Stream.Write($headerBytes, 0, $headerBytes.Length)
-    if ($bodyBytes.Length -gt 0) { $Stream.Write($bodyBytes, 0, $bodyBytes.Length) }
+    if ($BodyByteDelayMilliseconds -gt 0) {
+        foreach ($value in $bodyBytes) {
+            $Stream.WriteByte($value)
+            $Stream.Flush()
+            Start-Sleep -Milliseconds $BodyByteDelayMilliseconds
+        }
+    }
+    elseif ($bodyBytes.Length -gt 0) { $Stream.Write($bodyBytes, 0, $bodyBytes.Length) }
     $Stream.Flush()
 }
 
@@ -123,7 +130,7 @@ try {
                     $extraHeaders += $header.Name + ': ' + [string]$header.Value + "`r`n"
                 }
             }
-            Write-HttpResponse $stream ([int]$selected.StatusCode) ([string]$selected.Body) ([string]$selected.ContentType) $extraHeaders
+            Write-HttpResponse $stream ([int]$selected.StatusCode) ([string]$selected.Body) ([string]$selected.ContentType) $extraHeaders ([int]$selected.BodyByteDelayMilliseconds)
         }
         catch {
             # A client closing after its bounded request timeout is expected in timeout tests.

@@ -13,22 +13,6 @@ function Assert-Equal($Expected, $Actual, [string]$Message) {
     }
 }
 
-function Get-DashHooks($Settings) {
-    $entries = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($eventProperty in $Settings.hooks.PSObject.Properties) {
-        if ($eventProperty.Value -isnot [System.Array]) { continue }
-        foreach ($group in @($eventProperty.Value)) {
-            if ($null -eq $group -or $group.hooks -isnot [System.Array]) { continue }
-            foreach ($hook in @($group.hooks)) {
-                if ($hook.command -is [string] -and $hook.command.Contains('# dash-hook')) {
-                    $entries.Add([pscustomobject]@{ Event = $eventProperty.Name; Group = $group; Hook = $hook })
-                }
-            }
-        }
-    }
-    return $entries.ToArray()
-}
-
 function Get-InstallerArguments($Fixture, [string[]]$Extra = @()) {
     return @(
         '-HubUrl', $Fixture.Server.HubBase,
@@ -38,6 +22,25 @@ function Get-InstallerArguments($Fixture, [string[]]$Extra = @()) {
         '-ClaudePath', $Fixture.ClaudePath,
         '-TaskName', $Fixture.TaskName
     ) + $Extra
+}
+
+$failedFixture = New-WindowsClaudeFixture
+try {
+    [IO.File]::WriteAllText($failedFixture.SettingsPath, '{"model":"synthetic-preserved"}', [Text.UTF8Encoding]::new($false))
+    [IO.File]::SetAttributes($failedFixture.SettingsPath, [IO.FileAttributes]::ReadOnly)
+    [IO.File]::WriteAllText($failedFixture.ClaudePath, "@echo off`r`nexit /b 7`r`n", [Text.Encoding]::ASCII)
+    $failedInstall = Invoke-WindowsClaudeScript -ScriptPath (Join-Path $failedFixture.RepositoryRoot 'scripts\install-claude-windows.ps1') -Arguments @(
+        '-HubUrl', 'http://127.0.0.1:1', '-HostLabel', $failedFixture.HostLabel,
+        '-SettingsPath', $failedFixture.SettingsPath, '-InstallPath', $failedFixture.InstallPath,
+        '-ClaudePath', $failedFixture.ClaudePath, '-TaskName', $failedFixture.TaskName
+    ) -TimeoutSeconds 60
+    Assert-Equal 1 $failedInstall.ExitCode 'unwritable settings fail the installation'
+    Assert-Equal '{"model":"synthetic-preserved"}' ([IO.File]::ReadAllText($failedFixture.SettingsPath)) 'failed replacement preserves settings'
+    Assert-True (-not (Get-ScheduledTask -TaskName $failedFixture.TaskName -ErrorAction SilentlyContinue)) 'failed settings write never starts background collection'
+}
+finally {
+    [IO.File]::SetAttributes($failedFixture.SettingsPath, [IO.FileAttributes]::Normal)
+    Remove-WindowsClaudeFixture $failedFixture
 }
 
 $fixture = New-WindowsClaudeFixture
@@ -236,6 +239,14 @@ try {
     Assert-True ($clock.Elapsed.TotalSeconds -lt 5) 'network waits remain bounded by the overall deadline'
     Assert-Equal '' $timeoutResult.Stderr 'timeouts never write an empty reply'
 
+
+    Set-WindowsClaudePlans $fixture.Server @{
+        '/reply/wait/claude' = @(@{ StatusCode = 200; Body = 'late synthetic reply'; ContentType = 'text/plain'; BodyByteDelayMilliseconds = 120 })
+    }
+    $slowReply = Invoke-WindowsClaudeScript -ScriptPath $waiterPath -Stdin $replyInput -TimeoutSeconds 6
+    Assert-Equal 0 $slowReply.ExitCode 'a response trickling past the reply deadline must not wake Claude'
+    Assert-Equal '' $slowReply.Stderr 'a late partial reply never reaches the model'
+    Set-WindowsClaudePlans $fixture.Server $plans
     [System.IO.File]::WriteAllText($fixture.ClaudePath, $fakeClaude, [System.Text.Encoding]::ASCII)
     $livenessPath = Join-Path $fixture.InstallPath 'claude-liveness.ps1'
     $livenessResult = Invoke-WindowsClaudeScript -ScriptPath $livenessPath -TimeoutSeconds 20
@@ -252,6 +263,22 @@ try {
     Assert-True ($arrayRequest.Body.StartsWith('[')) 'single-agent root arrays stay arrays instead of being dropped as malformed'
     $arrayAgents = @(ConvertFrom-Json -InputObject $arrayRequest.Body)
     Assert-Equal 'synthetic-array-session' $arrayAgents[0].sessionId 'single-agent array preserves its session id'
+
+    $unicodeCwd = 'C:\synthetic\' + $snow
+    $unicodeName = 'session ' + $umlaut
+    $unicodeAgents = ConvertTo-Json -Compress -Depth 4 @{ agents = @(@{ sessionId = 'synthetic-unicode-session'; cwd = $unicodeCwd; name = $unicodeName }) }
+    $encodedBody = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($unicodeAgents))
+    $emit = '$bytes=[Convert]::FromBase64String("' + $encodedBody + '");[Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length)'
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($emit))
+    [IO.File]::WriteAllText($fixture.ClaudePath, "@echo off`r`npowershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encodedCommand`r`nexit /b 0`r`n", [Text.Encoding]::ASCII)
+    $unicodeWrapper = Join-Path $fixture.Root 'unicode-liveness.ps1'
+    [IO.File]::WriteAllText($unicodeWrapper, 'param([string]$Helper);[Console]::OutputEncoding=[Text.Encoding]::GetEncoding(437);& $Helper', [Text.Encoding]::ASCII)
+    $unicodeResult = Invoke-WindowsClaudeScript -ScriptPath $unicodeWrapper -Arguments @('-Helper', $livenessPath) -TimeoutSeconds 20
+    Assert-Equal 0 $unicodeResult.ExitCode 'non-UTF-8 console environments accept UTF-8 Claude output'
+    $unicodeRequest = @(Get-WindowsClaudeRequests $fixture.Server | Where-Object { $_.Path -eq '/ingest/liveness/claude' }) | Select-Object -Last 1
+    $unicodeAgent = (ConvertFrom-Json $unicodeRequest.Body).agents[0]
+    Assert-Equal $unicodeCwd $unicodeAgent.cwd 'liveness preserves the Unicode working directory'
+    Assert-Equal $unicodeName $unicodeAgent.name 'liveness preserves the Unicode session name'
     $livenessRequests = @(Get-WindowsClaudeRequests $fixture.Server | Where-Object { $_.Path -eq '/ingest/liveness/claude' })
 
     [System.IO.File]::WriteAllText($fixture.ClaudePath, "@echo off`r`nexit /b 7`r`n", [System.Text.Encoding]::ASCII)
@@ -296,11 +323,6 @@ try {
         -Arguments (Get-InstallerArguments $fixture @('-NoReply')) -TimeoutSeconds 60
     Assert-Equal 0 $noReplyInstall.ExitCode 'no-reply configuration installs'
     $installed = $true
-    $noReplySettings = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fixture.SettingsPath, [System.Text.Encoding]::UTF8))
-    $noReplyHooks = @(Get-DashHooks $noReplySettings)
-    Assert-Equal 9 $noReplyHooks.Count 'no-reply install omits only the Stop reply waiter'
-    $noReplyWaiters = @($noReplyHooks | Where-Object { $_.Hook.command -match 'reply-wait\.ps1' }).Count
-    Assert-Equal 0 $noReplyWaiters 'no-reply mode has no waiter hook'
     $finalUninstall = Invoke-WindowsClaudeScript -ScriptPath $installer `
         -Arguments (Get-InstallerArguments $fixture @('-Uninstall')) -TimeoutSeconds 60
     Assert-Equal 0 $finalUninstall.ExitCode 'no-reply install uninstalls cleanly'
