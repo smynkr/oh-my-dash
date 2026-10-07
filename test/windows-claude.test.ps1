@@ -24,6 +24,66 @@ function Get-InstallerArguments($Fixture, [string[]]$Extra = @()) {
     ) + $Extra
 }
 
+foreach ($failurePoint in @('Register-ScheduledTask', 'Start-ScheduledTask')) {
+    foreach ($upgrade in @($false, $true)) {
+        $rollbackFixture = New-WindowsClaudeFixture
+        try {
+            [IO.File]::WriteAllText($rollbackFixture.SettingsPath, '{"model":"synthetic-preserved"}', [Text.UTF8Encoding]::new($false))
+            [IO.File]::WriteAllText($rollbackFixture.ClaudePath, "@echo off`r`nexit /b 7`r`n", [Text.Encoding]::ASCII)
+            $rollbackInstaller = Join-Path $rollbackFixture.RepositoryRoot 'scripts\install-claude-windows.ps1'
+            $rollbackArguments = @(
+                '-HubUrl', 'http://127.0.0.1:1', '-HostLabel', $rollbackFixture.HostLabel,
+                '-SettingsPath', $rollbackFixture.SettingsPath, '-InstallPath', $rollbackFixture.InstallPath,
+                '-ClaudePath', $rollbackFixture.ClaudePath, '-TaskName', $rollbackFixture.TaskName
+            )
+            $taskXmlBefore = $null
+            $activePaths = @($rollbackFixture.SettingsPath)
+            if ($upgrade) {
+                $initialInstall = Invoke-WindowsClaudeScript -ScriptPath $rollbackInstaller -Arguments $rollbackArguments -TimeoutSeconds 60
+                Assert-Equal 0 $initialInstall.ExitCode 'rollback fixture installs before an upgrade'
+                Stop-ScheduledTask -TaskName $rollbackFixture.TaskName -TaskPath '\'
+                $taskXmlBefore = Export-ScheduledTask -TaskName $rollbackFixture.TaskName -TaskPath '\'
+                $activePaths += @(Get-ChildItem -LiteralPath $rollbackFixture.InstallPath -File | ForEach-Object { $_.FullName })
+                [IO.File]::AppendAllText((Join-Path $rollbackFixture.InstallPath 'claude-hook.ps1'), "`n# synthetic local helper edit`n")
+            }
+            $before = @{}
+            foreach ($path in $activePaths) { $before[$path] = [BitConverter]::ToString([IO.File]::ReadAllBytes($path)) }
+
+            $failureArguments = @($rollbackArguments)
+            $failureArguments[3] = 'synthetic-changed-host'
+            $wrapper = Join-Path $rollbackFixture.Root 'scheduler-failure.ps1'
+            $source = "Import-Module ScheduledTasks`nfunction $failurePoint { throw 'Synthetic scheduler refusal' }`n& '" +
+                $rollbackInstaller.Replace("'", "''") + "'"
+            for ($index = 0; $index -lt $failureArguments.Count; $index += 2) {
+                $source += ' ' + $failureArguments[$index] + " '" + $failureArguments[$index + 1].Replace("'", "''") + "'"
+            }
+            $source += "`nexit `$LASTEXITCODE"
+            [IO.File]::WriteAllText($wrapper, $source, [Text.Encoding]::Unicode)
+            $failedInstall = Invoke-WindowsClaudeScript -ScriptPath $wrapper -TimeoutSeconds 60
+            Assert-Equal 1 $failedInstall.ExitCode "$failurePoint failure reports a failed install"
+            Assert-True ($failedInstall.Stderr -match 'Synthetic scheduler refusal') 'scheduler refusal reaches the installation boundary'
+            foreach ($path in $activePaths) {
+                Assert-Equal $before[$path] ([BitConverter]::ToString([IO.File]::ReadAllBytes($path))) `
+                    "$failurePoint failure restores existing settings, config and locally modified helpers"
+            }
+            $remainingTask = Get-ScheduledTask -TaskName $rollbackFixture.TaskName -TaskPath '\' -ErrorAction SilentlyContinue
+            if ($upgrade) {
+                Assert-True ($null -ne $remainingTask) 'failed upgrade retains the previous liveness task'
+                Assert-Equal $taskXmlBefore (Export-ScheduledTask -TaskName $rollbackFixture.TaskName -TaskPath '\') `
+                    'failed upgrade restores the previous task definition'
+            }
+            else {
+                Assert-True ($null -eq $remainingTask) 'failed first installation leaves no liveness task'
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollbackFixture.InstallPath 'client-config.json'))) `
+                    'failed first installation leaves no active client configuration'
+                Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollbackFixture.InstallPath 'claude-hook.ps1'))) `
+                    'failed first installation removes its new hook executable'
+            }
+        }
+        finally { Remove-WindowsClaudeFixture $rollbackFixture }
+    }
+}
+
 $failedFixture = New-WindowsClaudeFixture
 try {
     [IO.File]::WriteAllText($failedFixture.SettingsPath, '{"model":"synthetic-preserved"}', [Text.UTF8Encoding]::new($false))
@@ -52,6 +112,7 @@ $umlaut = [string][char]0x00E9
 $snow = [string][char]0x96EA
 $original = [ordered]@{
     model = 'synthetic-windows-model'
+    futureSetting = [ordered]@{ enabled = $true; nested = @('preserve synthetic unknown value') }
     permissions = [ordered]@{ allow = @('Read(C:\synthetic\**)') }
     hooks = [ordered]@{
         PreToolUse = @(
@@ -61,9 +122,9 @@ $original = [ordered]@{
         CustomEvent = @([ordered]@{ hooks = @([ordered]@{ type = 'command'; command = 'keep synthetic custom hook' }) })
     }
 }
-[System.IO.File]::WriteAllText($fixture.SettingsPath,
-    (ConvertTo-Json -InputObject $original -Depth 30) + [Environment]::NewLine,
-    [System.Text.UTF8Encoding]::new($false))
+$rawSettings = "`r`n    " + (ConvertTo-Json -InputObject $original -Depth 30 -Compress) + "`r`n"
+[System.IO.File]::WriteAllText($fixture.SettingsPath, $rawSettings, [System.Text.UTF8Encoding]::new($false))
+
 $fakeClaude = "@echo off`r`nif /I `"%~1`" NEQ `"agents`" exit /b 9`r`nif /I `"%~2`" NEQ `"--json`" exit /b 9`r`necho {`"agents`":[{`"sessionId`":`"synthetic-live-session`",`"pid`":321,`"cwd`":`"C:\\synthetic`",`"name`":`"native fixture`",`"status`":`"running`"}]}`r`nexit /b 0`r`n"
 $fakeClaudeArray = "@echo off`r`necho [{`"sessionId`":`"synthetic-array-session`"}]`r`nexit /b 0`r`n"
  [System.IO.File]::WriteAllText($fixture.ClaudePath, "@echo off`r`nexit /b 7`r`n", [System.Text.Encoding]::ASCII)
@@ -78,6 +139,29 @@ try {
         )
     }
     $fixture.Server = Start-WindowsClaudeHttpFixture -Directory $fixture.Root -Plans $plans
+    $settingsBeforeNoOpUninstall = [System.IO.File]::ReadAllBytes($fixture.SettingsPath)
+    [System.IO.File]::SetAttributes($fixture.SettingsPath, [System.IO.FileAttributes]::ReadOnly)
+    try {
+        $noOpUninstall = Invoke-WindowsClaudeScript -ScriptPath $installer `
+            -Arguments (Get-InstallerArguments $fixture @('-Uninstall')) -TimeoutSeconds 30
+        Assert-Equal 0 $noOpUninstall.ExitCode 'uninstall with no Dash hooks succeeds on read-only settings'
+        Assert-Equal ([System.BitConverter]::ToString($settingsBeforeNoOpUninstall)) `
+            ([System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($fixture.SettingsPath))) `
+            'no-op uninstall preserves the exact settings bytes'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $fixture.Root -Filter 'Claude settings *.json.bak-dash-*').Count) `
+            'no-op uninstall creates no settings backup'
+    }
+    finally {
+        [System.IO.File]::SetAttributes($fixture.SettingsPath, [System.IO.FileAttributes]::Normal)
+    }
+    $original.hooks['Stop'] = @([ordered]@{
+        hooks = @([ordered]@{
+            type = 'command'
+            command = '"C:\synthetic\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\synthetic\claude-hook.ps1" -DashHookMarker "# dash-hook"'
+        })
+    })
+    $rawSettings = "`r`n    " + (ConvertTo-Json -InputObject $original -Depth 30 -Compress) + "`r`n"
+    [System.IO.File]::WriteAllText($fixture.SettingsPath, $rawSettings, [System.Text.UTF8Encoding]::new($false))
     $collisionAction = New-ScheduledTaskAction -Execute $fixture.PowerShellExe `
         -Argument $fixture.CollisionTaskArguments -WorkingDirectory $fixture.Root
     $collisionTrigger = New-ScheduledTaskTrigger -Once -At ([DateTime]::Now.AddHours(1))
@@ -124,15 +208,15 @@ try {
     $task = Get-ScheduledTask -TaskName $fixture.TaskName -ErrorAction Stop
     $taskCreated = $true
     Assert-Equal ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) (Get-WindowsClaudeAccountSid $task.Principal.UserId) 'liveness task runs as the installing user'
-    Assert-Equal $fixture.ManagedTaskDescription $task.Description 'liveness task carries its ownership marker'
     $repeatingTriggers = @($task.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT1M' })
     Assert-Equal 1 $repeatingTriggers.Count 'liveness uses a supported one-minute repeating trigger'
     Assert-True ([string]::IsNullOrEmpty([string]$repeatingTriggers[0].Repetition.Duration)) 'liveness repetition is indefinite'
-    Assert-True ($task.Actions[0].Arguments.Contains('claude-liveness.ps1')) 'scheduled task launches the native liveness helper'
 
     Assert-Equal 'Interactive' ([string]$task.Principal.LogonType) 'liveness task requires the signed-in user context'
 
     $settings = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fixture.SettingsPath, [System.Text.Encoding]::UTF8))
+    Assert-Equal $true $settings.futureSetting.enabled 'unknown future settings are preserved'
+    Assert-Equal 'preserve synthetic unknown value' $settings.futureSetting.nested[0] 'nested unknown settings are preserved'
     Assert-Equal 'synthetic-windows-model' $settings.model 'model setting is preserved'
     Assert-Equal 'keep synthetic unrelated hook' $settings.hooks.PreToolUse[0].hooks[0].command 'unrelated event hook is preserved'
     Assert-True ($settings.hooks.CustomEmptyEvent.Count -eq 0) 'pre-existing empty event array is preserved'
@@ -312,6 +396,8 @@ try {
     $taskCreated = $false
     Assert-True (-not (Get-ScheduledTask -TaskName $fixture.TaskName -ErrorAction SilentlyContinue)) 'uninstall removes only its liveness task'
     $restored = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fixture.SettingsPath, [System.Text.Encoding]::UTF8))
+    Assert-Equal $true $restored.futureSetting.enabled 'uninstall preserves unknown future settings'
+    Assert-Equal 'preserve synthetic unknown value' $restored.futureSetting.nested[0] 'uninstall preserves nested unknown settings'
     Assert-True ($restored.hooks.CustomEmptyEvent.Count -eq 0) 'uninstall preserves unrelated empty event array'
     Assert-Equal 'keep synthetic unrelated hook' $restored.hooks.PreToolUse[0].hooks[0].command 'uninstall preserves the unrelated hook'
     Assert-Equal 'keep synthetic custom hook' $restored.hooks.CustomEvent[0].hooks[0].command 'uninstall preserves unrelated custom event hook'

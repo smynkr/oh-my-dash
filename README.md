@@ -62,7 +62,7 @@ Uninstalling integrations does not erase the collector database or the original 
 
 Windows clients support both the OMP extension and native Claude Code hooks connecting to an already-running hub. The collector service, Keychain token storage, and LaunchAgent setup remain macOS-specific.
 
-For Claude Code, use Windows PowerShell 5.1 and a working, signed-in Claude CLI. From the repository root, preview the installation, then repeat without `-DryRun`:
+For Claude Code, use its supported native Windows platform (Windows 10 1809+ or Windows Server 2019+), Windows PowerShell 5.1, and a working, signed-in Claude CLI. From the repository root, preview the installation, then repeat without `-DryRun`:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://your-hub.tailnet.ts.net:4777" -HostLabel "windows-peer" -DryRun
