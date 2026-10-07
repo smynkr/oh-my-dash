@@ -161,11 +161,13 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
   };
   const consumeQuestion = (id: string, key: string, toolUseId: string): QuestionWaitResult | undefined => {
     const consumedAt = now();
-    const invocation = db.getQuestionInvocation(id,key,toolUseId);
+    const invocation = db.questionInvocationsForSession(key)
+      .find(item => item.id === id && item.toolUseId === toolUseId);
     if (invocation?.state === "answered" && invocation.expiresAt > consumedAt) {
       const dto = db.getSession(key);
       if (dto && dto.status !== "ended" &&
-          (dto.status !== "working" || !duplicateQuestionEventsAfterAnswer(key,id))) {
+          (dto.status !== "working" || !questionAnswerHasNotMoved(
+            key,id,invocation.answeredAt,invocation.lastHookEventAt))) {
         cancelQuestion(id,key,toolUseId,"session_moved");
         return { status:409 };
       }
@@ -297,10 +299,13 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
   };
   // last_hook_event_ts advances for duplicate delivery too; only question events for this
   // exact invocation are harmless after its answer. Any other event means the session moved.
-  const duplicateQuestionEventsAfterAnswer = (key: string, id: string) => {
+  // Event rows are pruned by their supplied timestamp; if the answer row is gone, the
+  // session timestamp is the remaining signal that no later hook event moved it.
+  const duplicateQuestionEventsAfterAnswer = (key: string, id: string): boolean | undefined => {
     const rows: unknown[] = db.sqlite.query(`SELECT kind,detail FROM events WHERE session_key=? AND id >= (
       SELECT id FROM events WHERE session_key=? AND kind='question_answered' AND detail=? ORDER BY id LIMIT 1
     ) ORDER BY id`).all(key,key,JSON.stringify({ questionIdentity:id }));
+    if (!rows.length) return undefined;
     let sawAnswer = false;
     for (const row of rows) {
       if (!row || typeof row !== "object" || !("kind" in row) || !("detail" in row)) return false;
@@ -310,6 +315,12 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       } else if (row.kind !== "question" || !eventHasQuestionIdentity(row.detail,id)) return false;
     }
     return sawAnswer;
+  };
+  const questionAnswerHasNotMoved = (key: string, id: string, answeredAt: number | undefined,
+    lastHookEventAt: number | undefined) => {
+    if (answeredAt === undefined || lastHookEventAt === undefined) return false;
+    const history = duplicateQuestionEventsAfterAnswer(key,id);
+    return history ?? lastHookEventAt <= answeredAt;
   };
   const observeQuestions = (dto: SessionDTO) => {
     if (dto.status === "ended") {
@@ -322,8 +333,8 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       const pending = invocation.state === "pending" && dto.status === "needs_input" &&
         dto.needsReason === "question" && dto.pendingQuestionId === invocation.id;
       const answered = invocation.state === "answered" && dto.status === "working" &&
-        invocation.answeredAt !== undefined && invocation.expiresAt > observedAt &&
-        duplicateQuestionEventsAfterAnswer(dto.key,invocation.id);
+        invocation.expiresAt > observedAt &&
+        questionAnswerHasNotMoved(dto.key,invocation.id,invocation.answeredAt,invocation.lastHookEventAt);
       if (pending || answered) continue;
       db.cancelQuestion(invocation.id,dto.key,invocation.toolUseId,observedAt,
         invocation.expiresAt <= observedAt ? "expired" : "session_moved");
