@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$questionId = $null
+$registered = $false
 $completed = $false
 $config = $null
 $payload = $null
@@ -58,26 +58,18 @@ try {
         questions = $questions
         timeoutMs = $timeoutMs
     })
-    $headers = @{
-        'X-Dash-Entrypoint' = [string]$env:CLAUDE_CODE_ENTRYPOINT
-        'X-Dash-Attended' = [string]$env:CLAUDE_CODE_SESSION_ATTENDED
-        'X-Dash-Kind' = [string]$env:CLAUDE_CODE_SESSION_KIND
-    }
+    $headers = @{ 'X-Dash-Entrypoint' = 'cli' }
     $registration = Invoke-DashWindowsHttp -Uri ($config.HubBase + '/question/register') -HostLabel $config.HostLabel -Headers $headers -Method POST -TimeoutMilliseconds ([Math]::Min(5000, $timeoutMs)) -Body $register -HasBody
     if ($registration.StatusCode -ne 201) { exit 0 }
-    $registered = $json.DeserializeObject($registration.Body)
-    if ($registered -isnot [System.Collections.IDictionary] -or
-        $registered['questionId'] -isnot [string] -or
-        [string]::IsNullOrWhiteSpace($registered['questionId'])) { exit 0 }
-    $questionId = $registered['questionId']
+    $registered = $true
     $waitUri = $config.HubBase + '/question/wait?session=' + [Uri]::EscapeDataString($session) +
-        '&toolUse=' + [Uri]::EscapeDataString($toolUse) + '&question=' + [Uri]::EscapeDataString($questionId)
+        '&toolUseId=' + [Uri]::EscapeDataString($toolUse) + '&question=' + [Uri]::EscapeDataString($invocation)
 
     while ($clock.ElapsedMilliseconds -lt $timeoutMs) {
         $remainingMs = $timeoutMs - [int]$clock.ElapsedMilliseconds
         $pollSeconds = [Math]::Min(50, [Math]::Floor($remainingMs / 1000))
         if ($pollSeconds -lt 1) { break }
-        $reply = Invoke-DashWindowsHttp -Uri ($waitUri + '&wait=' + $pollSeconds) -HostLabel $config.HostLabel -Method GET -TimeoutMilliseconds $remainingMs
+        $reply = Invoke-DashWindowsHttp -Uri ($waitUri + '&wait=' + $pollSeconds) -HostLabel $config.HostLabel -Headers $headers -Method GET -TimeoutMilliseconds $remainingMs
         if ($reply.StatusCode -eq 204) { continue }
         if ($reply.StatusCode -ne 200 -or $clock.ElapsedMilliseconds -ge $timeoutMs) { break }
         $result = $json.DeserializeObject($reply.Body)
@@ -109,10 +101,11 @@ catch {
     # payload, remote error body, or an unvalidated answer on a failure path.
 }
 finally {
-    if (-not $completed -and $null -ne $questionId -and $null -ne $config) {
+    if (-not $completed -and $registered -and $null -ne $config) {
         try {
-            $cancel = $json.Serialize(@{ sessionId = $session; toolUseId = $toolUse; questionId = $questionId })
-            $null = Invoke-DashWindowsHttp -Uri ($config.HubBase + '/question/cancel') -HostLabel $config.HostLabel -Method POST -TimeoutMilliseconds 2000 -Body $cancel -HasBody
+            $cancelUri = $config.HubBase + '/question/cancel?session=' + [Uri]::EscapeDataString($session) +
+                '&toolUseId=' + [Uri]::EscapeDataString($toolUse) + '&question=' + [Uri]::EscapeDataString($invocation)
+            $null = Invoke-DashWindowsHttp -Uri $cancelUri -HostLabel $config.HostLabel -Headers $headers -Method DELETE -TimeoutMilliseconds 2000
         }
         catch { }
     }

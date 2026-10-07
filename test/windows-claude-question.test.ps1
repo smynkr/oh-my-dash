@@ -14,6 +14,12 @@ $passed = 0
 function Assert-Question([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
+function Get-QuestionHeader($Request, [string]$Name) {
+    $property = $Request.Headers.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return [string]$property.Value
+}
+
 
 $custom = 'custom ' + [char]0x65E5 + "`nsecond line"
 $payload = @{
@@ -36,6 +42,7 @@ $payload = @{
                 @{ label = 'Later'; description = 'Add later' }
             ) }
         )
+        metadata = @{ marker = 'keep original input' }
     }
 }
 # Hashtable keys are case-insensitive in PowerShell; use JSON's real dictionary
@@ -47,9 +54,11 @@ $cases = @(
     @{ Name = 'incomplete answer falls back'; Status = 200; Body = '{"answers":{"Shade?":"Blue"}}'; Allows = $false },
     @{ Name = 'non-text answer falls back'; Status = 200; Body = '{"answers":{"Shade?":true,"shade?":"Logging","Notes?":"None"}}'; Allows = $false },
     @{ Name = 'malformed answer falls back'; Status = 200; Body = '{'; Allows = $false },
-    @{ Name = 'stale invocation falls back'; Status = 409; Body = '{}'; Allows = $false },
+    @{ Name = 'wrong identity response falls back'; Status = 409; Body = '{}'; Allows = $false },
+    @{ Name = 'extra answer question falls back'; Status = 200; Body = '{"answers":{"Shade?":"Blue","shade?":"Logging","Notes?":"None","Unexpected?":"Other"}}'; Allows = $false },
     @{ Name = 'timeout cancels remote controls'; Status = 204; Body = ''; Allows = $false; Delay = 1200; WaitSeconds = 2 },
     @{ Name = 'permission tools never register'; Status = 200; Body = '{}'; Allows = $false; Tool = 'ExitPlanMode'; NoRequests = $true },
+    @{ Name = 'unrelated tool never registers'; Status = 200; Body = '{}'; Allows = $false; Tool = 'Bash'; NoRequests = $true },
     @{ Name = 'permission request events never register'; Status = 200; Body = '{}'; Allows = $false; Event = 'PermissionRequest'; NoRequests = $true },
     @{ Name = 'headless permission hosts never wait for hidden controls'; Status = 200; Body = '{}'; Allows = $false; Entrypoint = 'sdk-cli'; NoRequests = $true },
     @{ Name = 'disabled question mode never registers'; Status = 200; Body = '{}'; Allows = $false; Disabled = $true; NoRequests = $true }
@@ -83,12 +92,74 @@ foreach ($case in $cases) {
         Assert-Question ($result.ExitCode -eq 0) ($case.Name + ': hook failed instead of returning to terminal: ' + $result.Stderr)
         Assert-Question ([string]::IsNullOrWhiteSpace($result.Stderr)) ($case.Name + ': failure disclosed hook data')
         $requests = @(Get-WindowsClaudeRequests -Fixture $fixture.Server)
+        $registrationRequests = @($requests | Where-Object Path -eq '/question/register')
+        $waitRequests = @($requests | Where-Object Path -eq '/question/wait')
+        $cancelRequests = @($requests | Where-Object Path -eq '/question/cancel')
+        if (-not $case.NoRequests) {
+            Assert-Question ($registrationRequests.Count -eq 1 -and $waitRequests.Count -eq 1) ($case.Name + ': expected one registration and one wait')
+            $registration = $registrationRequests[0]
+            $waitRequest = $waitRequests[0]
+            Assert-Question ($registration.Method -ceq 'POST' -and $waitRequest.Method -ceq 'GET') 'Question registration/wait methods changed'
+            Assert-Question ((Get-QuestionHeader $registration 'X-Dash-Entrypoint') -ceq 'cli' -and
+                (Get-QuestionHeader $registration 'X-Dash-Host') -ceq $fixture.HostLabel -and
+                (Get-QuestionHeader $waitRequest 'X-Dash-Entrypoint') -ceq 'cli' -and
+                (Get-QuestionHeader $waitRequest 'X-Dash-Host') -ceq $fixture.HostLabel) 'Question requests lost the CLI/host identity headers'
+            $registerBody = $json.DeserializeObject($registration.Body)
+            $invocation = $registerBody['invocationId']
+            Assert-Question ($registerBody['sessionId'] -ceq $payload.session_id -and
+                $registerBody['toolUseId'] -ceq $payload.tool_use_id -and
+                $invocation -is [string] -and $invocation -cmatch '^[A-Za-z0-9_-]{43}$') 'Question registration identity changed'
+            $invocationBytes = [Convert]::FromBase64String($invocation.Replace('-', '+').Replace('_', '/') + '=')
+            Assert-Question ($invocationBytes.Length -eq 32) 'Question invocation identity was not 32 random bytes'
+            Assert-Question ($registerBody['timeoutMs'] -eq ($duration * 1000)) 'Question registration timeout changed'
+            $sentQuestions = @($registerBody['questions'])
+            Assert-Question ($sentQuestions.Count -eq 3 -and
+                $sentQuestions[0]['question'] -ceq 'Shade?' -and
+                $sentQuestions[1]['question'] -ceq 'shade?' -and
+                $sentQuestions[2]['question'] -ceq 'Notes?') 'Question text or ordering changed'
+            Assert-Question ((@($sentQuestions[0]['options'] | ForEach-Object { $_['label'] }) -join '|') -ceq 'Blue (Recommended)|Green' -and
+                $sentQuestions[1]['multiSelect'] -eq $true -and
+                (@($sentQuestions[1]['options'] | ForEach-Object { $_['label'] }) -join '|') -ceq 'Logging|Metrics') 'Option labels, order or multi-select mode changed'
+            $waitUri = [Uri]::new('http://127.0.0.1' + $waitRequest.Target)
+            $waitQueryNames = @($waitUri.Query.TrimStart('?').Split('&') | ForEach-Object { [Uri]::UnescapeDataString(($_ -split '=', 2)[0]) })
+            Assert-Question (($waitQueryNames -join '|') -ceq 'session|toolUseId|question|wait' -and
+                (Get-WindowsClaudeQueryValue $waitUri.Query 'session') -ceq $payload.session_id -and
+                (Get-WindowsClaudeQueryValue $waitUri.Query 'toolUseId') -ceq $payload.tool_use_id -and
+                (Get-WindowsClaudeQueryValue $waitUri.Query 'question') -ceq $invocation) 'Wait used a different or incomplete invocation identity'
+            $waitSeconds = 0
+            Assert-Question ([int]::TryParse((Get-WindowsClaudeQueryValue $waitUri.Query 'wait'), [ref]$waitSeconds) -and
+                $waitSeconds -ge 1 -and $waitSeconds -le 55) 'Question wait interval was outside the hub contract'
+            if ($cancelRequests.Count -gt 0) {
+                Assert-Question ($cancelRequests.Count -eq 1) 'Question fallback sent duplicate cancellation requests'
+                $cancelRequest = $cancelRequests[0]
+                $cancelUri = [Uri]::new('http://127.0.0.1' + $cancelRequest.Target)
+                $cancelQueryNames = @($cancelUri.Query.TrimStart('?').Split('&') | ForEach-Object { [Uri]::UnescapeDataString(($_ -split '=', 2)[0]) })
+                Assert-Question ($cancelRequest.Method -ceq 'DELETE' -and
+                    [string]::IsNullOrEmpty($cancelRequest.Body) -and
+                    ($cancelQueryNames -join '|') -ceq 'session|toolUseId|question' -and
+                    (Get-WindowsClaudeQueryValue $cancelUri.Query 'session') -ceq $payload.session_id -and
+                    (Get-WindowsClaudeQueryValue $cancelUri.Query 'toolUseId') -ceq $payload.tool_use_id -and
+                    (Get-WindowsClaudeQueryValue $cancelUri.Query 'question') -ceq $invocation -and
+                    (Get-QuestionHeader $cancelRequest 'X-Dash-Entrypoint') -ceq 'cli' -and
+                    (Get-QuestionHeader $cancelRequest 'X-Dash-Host') -ceq $fixture.HostLabel) 'Question fallback cancelled a different invocation or used the wrong API contract'
+            }
+        }
         if ($case.Allows) {
             $output = $json.DeserializeObject($result.Stdout)
             $decision = $output['hookSpecificOutput']
             Assert-Question ($decision['permissionDecision'] -ceq 'allow' -and $decision['hookEventName'] -ceq 'PreToolUse') 'Answered question did not use the native hook contract'
-            $answers = $decision['updatedInput']['answers']
-            Assert-Question ($answers['Shade?'] -ceq 'Blue (Recommended)' -and $answers['shade?'] -ceq 'Logging, Metrics' -and $answers['Notes?'] -ceq $custom) 'Question identity, multi-select or Unicode custom text changed'
+            $updatedInput = $decision['updatedInput']
+            $answers = $updatedInput['answers']
+            Assert-Question ($answers.Count -eq 3 -and
+                $answers['Shade?'] -ceq 'Blue (Recommended)' -and
+                $answers['shade?'] -ceq 'Logging, Metrics' -and
+                $answers['Notes?'] -ceq $custom) 'Question identity, multi-select or Unicode custom text changed'
+            $updatedQuestions = @($updatedInput['questions'])
+            Assert-Question ($updatedInput['metadata']['marker'] -ceq 'keep original input' -and
+                $updatedQuestions.Count -eq 3 -and
+                $updatedQuestions[0]['question'] -ceq 'Shade?' -and
+                (@($updatedQuestions[0]['options'] | ForEach-Object { $_['label'] }) -join '|') -ceq 'Blue (Recommended)|Green' -and
+                $updatedQuestions[1]['multiSelect'] -eq $true) 'Hook did not preserve the original tool input'
             Assert-Question (@($requests | Where-Object Path -eq '/question/cancel').Count -eq 0) 'Delivered answer was cancelled'
         }
         else {
@@ -97,10 +168,8 @@ foreach ($case in $cases) {
                 Assert-Question ($requests.Count -eq 0) ($case.Name + ': non-question path reached the broker')
             }
             else {
-                $cancel = @($requests | Where-Object Path -eq '/question/cancel')
+                $cancel = $cancelRequests
                 Assert-Question ($cancel.Count -eq 1) ($case.Name + ': fallback did not invalidate remote controls')
-                $cancelBody = $json.DeserializeObject($cancel[0].Body)
-                Assert-Question ($cancelBody['questionId'] -ceq 'synthetic-question-identity' -and $cancelBody['toolUseId'] -ceq $payload.tool_use_id) 'Fallback cancelled the wrong invocation'
             }
         }
         if ($case.WaitSeconds) { Assert-Question ($clock.Elapsed.TotalSeconds -lt 7) 'Remote question wait exceeded its bounded fallback window' }

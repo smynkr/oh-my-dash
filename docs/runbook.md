@@ -224,6 +224,14 @@ For a hub with Claude question support, opt in separately with `-Questions` on t
 
 Keep `-Questions` in subsequent install commands to retain the opt-in; reinstall without it to return entirely to terminal questions. `-NoReply` controls the ordinary Stop waiter independently. For native question boundary checks, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\windows-claude-question.test.ps1`. Then use a fresh signed-in interactive Claude session for a live multi-question answer and verify continuation; synthetic helper checks alone do not prove model-driven delivery.
 
+For a first opt-in install or upgrade, rerun the normal installer command with `-Questions`; for example:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-claude-windows.ps1 -HubUrl "https://hub.example.ts.net:4777" -HostLabel "windows-peer" -Questions -QuestionWaitSeconds 120
+```
+
+Keep the same settings, helper, task, and Claude executable paths used by the existing install. Exit active Claude Code sessions and start a fresh session to load the updated hook configuration. To roll back only remote questions while retaining the native feed, liveness, and any configured stopped-turn replies, rerun the same installer command with the same arguments except `-Questions` and `-QuestionWaitSeconds`. Use the uninstall command below only to remove the whole managed integration.
+
 For native verification, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test\windows-claude.test.ps1`. It uses temporary settings/helpers, loopback HTTP fixtures, and uniquely named per-user tasks. For a live smoke, start a fresh signed-in Claude session, check its feed entry and response, send a dashboard/Telegram reply to its stopped turn, and confirm that only that turn resumes. Close the session and check liveness. Installation alone is not evidence of successful model-driven reply delivery.
 
 To remove the managed hooks, task, and unmodified helper copies:

@@ -63,7 +63,7 @@ function Invoke-DashWindowsHttp {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
         [Parameter(Mandatory = $true)][string]$HostLabel,
-        [Parameter(Mandatory = $true)][ValidateSet('GET', 'POST')][string]$Method,
+        [Parameter(Mandatory = $true)][ValidateSet('GET', 'POST', 'DELETE')][string]$Method,
         [Parameter(Mandatory = $true)][int]$TimeoutMilliseconds,
         [System.Collections.IDictionary]$Headers = @{},
         [AllowEmptyString()][string]$Body,
