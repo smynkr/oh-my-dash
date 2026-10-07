@@ -80,12 +80,14 @@ function Get-BackupPath([string]$Path) {
     return $candidate
 }
 
-function Write-ManagedBytes([string]$Path, [byte[]]$Bytes) {
+function Write-ManagedBytes([string]$Path, [byte[]]$Bytes, $Journal = $null) {
     $directory = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+    $old = $null
+    $existed = Test-Path -LiteralPath $Path -PathType Leaf
+    if ($existed) {
         $old = [System.IO.File]::ReadAllBytes($Path)
         $same = $old.Length -eq $Bytes.Length
         if ($same) {
@@ -99,6 +101,14 @@ function Write-ManagedBytes([string]$Path, [byte[]]$Bytes) {
     }
     else { $backup = $null }
 
+    if ($null -ne $Journal) {
+        $Journal.Add([pscustomobject]@{
+            Path = $Path
+            Existed = $existed
+            Original = $old
+            WrittenHash = Get-FileSha256 $Bytes
+        })
+    }
     $temporary = Join-Path $directory ('.' + [System.IO.Path]::GetFileName($Path) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
         [System.IO.File]::WriteAllBytes($temporary, $Bytes)
@@ -115,6 +125,53 @@ function Write-ManagedBytes([string]$Path, [byte[]]$Bytes) {
     return $backup
 }
 
+function Restore-FailedInstall($Journal, $TaskSnapshot, [string]$TaskName) {
+    $restoreTask = $false
+    try {
+        $currentTask = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
+        $currentXml = if ($null -ne $currentTask) { Export-ScheduledTask -TaskName $TaskName -TaskPath '\' } else { $null }
+        if ($currentXml -cne $TaskSnapshot.OriginalXml) {
+            if ($null -eq $TaskSnapshot.WrittenXml -or $currentXml -cne $TaskSnapshot.WrittenXml) {
+                throw 'Scheduled Task changed outside this installation; preserved it instead of rolling it back.'
+            }
+            Stop-ScheduledTask -TaskName $TaskName -TaskPath '\'
+            $restoreTask = $true
+        }
+    }
+    catch { [Console]::Error.WriteLine("Task rollback incomplete: $($_.Exception.Message)") }
+
+    for ($index = $Journal.Count - 1; $index -ge 0; $index--) {
+        $entry = $Journal[$index]
+        try {
+            if (-not (Test-Path -LiteralPath $entry.Path -PathType Leaf)) {
+                if ($entry.Existed) { throw "File disappeared during installation: $($entry.Path)" }
+                continue
+            }
+            $currentHash = Get-FileSha256 ([System.IO.File]::ReadAllBytes($entry.Path))
+            if ($entry.Existed -and $currentHash -ceq (Get-FileSha256 $entry.Original)) { continue }
+            if ($currentHash -cne $entry.WrittenHash) {
+                throw "File changed outside this installation; preserved it: $($entry.Path)"
+            }
+            if ($entry.Existed) { Write-ManagedBytes -Path $entry.Path -Bytes $entry.Original | Out-Null }
+            else { Remove-Item -LiteralPath $entry.Path }
+        }
+        catch { [Console]::Error.WriteLine("File rollback incomplete: $($_.Exception.Message)") }
+    }
+
+    if ($restoreTask) {
+        try {
+            if ($null -eq $TaskSnapshot.OriginalXml) {
+                Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false
+            }
+            else {
+                Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Xml $TaskSnapshot.OriginalXml -Force | Out-Null
+                if ($TaskSnapshot.WasRunning) { Start-ScheduledTask -TaskName $TaskName -TaskPath '\' }
+            }
+        }
+        catch { [Console]::Error.WriteLine("Task rollback incomplete: $($_.Exception.Message)") }
+    }
+}
+
 function Set-JsonProperty($Object, [string]$Name, $Value) {
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) {
@@ -123,7 +180,28 @@ function Set-JsonProperty($Object, [string]$Name, $Value) {
     else { $property.Value = $Value }
 }
 
-function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups) {
+function Test-DashHookMarker($Hook) {
+    if ($null -eq $Hook -or $Hook -is [System.Array]) { return $false }
+    $commandProperty = $Hook.PSObject.Properties['command']
+    if ($null -ne $commandProperty -and $commandProperty.Value -is [string] -and
+        $commandProperty.Value.Contains('# dash-hook')) { return $true }
+
+    $argumentsProperty = $Hook.PSObject.Properties['args']
+    if ($null -eq $argumentsProperty -or $argumentsProperty.Value -isnot [System.Array]) {
+        return $false
+    }
+    $arguments = @($argumentsProperty.Value)
+    for ($index = 0; $index -lt $arguments.Count - 1; $index++) {
+        if ($arguments[$index] -is [string] -and $arguments[$index] -eq '-DashHookMarker' -and
+            $arguments[$index + 1] -is [string] -and $arguments[$index + 1] -ceq '# dash-hook') {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups, [ref]$Changed) {
+    $Changed.Value = $false
     $hooksProperty = $Document.PSObject.Properties['hooks']
     if ($null -eq $hooksProperty) {
         if (-not $Install) { return $Document }
@@ -160,13 +238,17 @@ function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups) {
             }
             $remainingHooks = New-Object 'System.Collections.Generic.List[object]'
             foreach ($hook in @($groupHooksProperty.Value)) {
-                $commandProperty = if ($null -ne $hook -and $hook -isnot [System.Array]) { $hook.PSObject.Properties['command'] } else { $null }
-                if ($null -ne $commandProperty -and $commandProperty.Value -is [string] -and
-                    $commandProperty.Value.Contains('# dash-hook')) { continue }
+                if (Test-DashHookMarker $hook) {
+                    $Changed.Value = $true
+                    continue
+                }
                 $remainingHooks.Add($hook)
             }
             if ($remainingHooks.Count -gt 0) {
                 $groupHooksProperty.Value = [object[]]$remainingHooks.ToArray()
+                $remainingGroups.Add($group)
+            }
+            elseif ($groupHooksProperty.Value.Count -eq 0) {
                 $remainingGroups.Add($group)
             }
         }
@@ -195,9 +277,10 @@ function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups) {
             else {
                 throw "Claude settings hooks.$eventName must be an array; no settings were changed."
             }
+            $Changed.Value = $true
         }
     }
-    elseif ($hooks.PSObject.Properties.Count -eq 0) {
+    elseif ($Changed.Value -and $hooks.PSObject.Properties.Count -eq 0) {
         $Document.PSObject.Properties.Remove('hooks')
     }
     return $Document
@@ -205,12 +288,10 @@ function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups) {
 
 function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [switch]$NoReply) {
     $powerShellExe = Get-WindowsPowerShellExe
-    if ($HookPath.Contains('"') -or $WaiterPath.Contains('"') -or $powerShellExe.Contains('"')) {
-        throw 'Windows paths cannot contain a quotation mark.'
-    }
-    $quotedExe = '"' + $powerShellExe + '"'
-    $ingestCommand = $quotedExe + ' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $HookPath + '" -DashHookMarker "# dash-hook"'
-    $replyCommand = $quotedExe + ' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $WaiterPath + '" -DashHookMarker "# dash-hook"'
+    $ingestArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $HookPath, '-DashHookMarker', '# dash-hook')
+    $replyArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $WaiterPath, '-DashHookMarker', '# dash-hook')
     $events = @(
         @{ Event = 'SessionStart' },
         @{ Event = 'UserPromptSubmit' },
@@ -224,12 +305,26 @@ function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [switch]$NoR
     )
     $groups = New-Object 'System.Collections.Generic.List[object]'
     foreach ($event in $events) {
-        $hook = [ordered]@{ type = 'command'; async = $true; timeout = 5; command = $ingestCommand }
+        $isFinalIngestEvent = $event.Event -in @('Stop', 'StopFailure', 'SessionEnd')
+        $hook = [ordered]@{
+            type = 'command'
+            async = -not $isFinalIngestEvent
+            timeout = 5
+            command = $powerShellExe
+            args = $ingestArgs
+        }
         $group = [ordered]@{ hooks = @($hook) }
         if ($event.ContainsKey('Matcher')) { $group.matcher = $event.Matcher }
         $groups.Add([pscustomobject]@{ Event = $event.Event; Group = $group })
         if ($event.Event -eq 'Stop' -and -not $NoReply) {
-            $reply = [ordered]@{ type = 'command'; async = $true; asyncRewake = $true; timeout = 21600; command = $replyCommand }
+            $reply = [ordered]@{
+                type = 'command'
+                async = $true
+                asyncRewake = $true
+                timeout = 21600
+                command = $powerShellExe
+                args = $replyArgs
+            }
             $groups.Add([pscustomobject]@{ Event = 'Stop'; Group = [ordered]@{ hooks = @($reply) } })
         }
     }
@@ -251,9 +346,14 @@ function Get-SettingsOutput([string]$Path, [switch]$Install, [object[]]$Groups) 
     if ($null -eq $document -or $document -is [System.Array] -or $document -is [string] -or $document -is [ValueType]) {
         throw 'Claude settings JSON must contain an object at the root; no settings were changed.'
     }
-    $merged = Remove-DashHookGroups -Document $document -Install:$Install -Groups $Groups
+    $hookChanges = $false
+    $merged = Remove-DashHookGroups -Document $document -Install:$Install -Groups $Groups -Changed ([ref]$hookChanges)
+    if (-not $Install -and -not $hookChanges) {
+        return [pscustomobject]@{ Changed = $false; Bytes = $null }
+    }
     $text = (ConvertTo-Json -InputObject $merged -Depth 100) + [Environment]::NewLine
-    $changed = $null -eq $originalText -or $text -cne $originalText
+    $changed = $Install -and ($null -eq $originalText -or $text -cne $originalText)
+    if (-not $Install) { $changed = $true }
     return [pscustomobject]@{ Changed = $changed; Bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($text) }
 }
 
@@ -299,7 +399,7 @@ function Assert-DashTaskOwnership([string]$Path, [string]$TaskName) {
     }
 }
 
-function Register-DashLivenessTask([string]$Path, [string]$TaskName) {
+function Register-DashLivenessTask([string]$Path, [string]$TaskName, $TaskSnapshot) {
     $powershellExe = Get-WindowsPowerShellExe
     $livenessPath = ConvertTo-FullPath $Path
     Assert-DashTaskOwnership -Path $livenessPath -TaskName $TaskName
@@ -315,6 +415,7 @@ function Register-DashLivenessTask([string]$Path, [string]$TaskName) {
     Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $action -Trigger @($atLogon, $repeating) `
         -Principal $principal -Settings $settings `
         -Description 'Oh My Dash managed Claude liveness task (oh-my-dash-claude-windows)' -Force | Out-Null
+    $TaskSnapshot.WrittenXml = Export-ScheduledTask -TaskName $TaskName -TaskPath '\'
     Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
 }
 
@@ -353,6 +454,8 @@ function Remove-InstalledHelpers([string]$Directory) {
     if (@(Get-ChildItem -LiteralPath $Directory -Force).Count -eq 0) { Remove-Item -LiteralPath $Directory -Force }
 }
 
+$installJournal = $null
+$taskSnapshot = $null
 try {
     $SettingsPath = ConvertTo-FullPath $SettingsPath
     $InstallPath = ConvertTo-FullPath $InstallPath
@@ -422,20 +525,30 @@ try {
         return
     }
 
+    $existingTask = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
+    $taskSnapshot = [pscustomobject]@{
+        OriginalXml = if ($null -ne $existingTask) { Export-ScheduledTask -TaskName $TaskName -TaskPath '\' } else { $null }
+        WrittenXml = $null
+        WasRunning = $null -ne $existingTask -and $existingTask.State -eq 'Running'
+    }
+    $installJournal = New-Object 'System.Collections.Generic.List[object]'
     foreach ($name in $helperNames) {
-        $backup = Write-ManagedBytes -Path (Join-Path $InstallPath $name) -Bytes $helperBytes[$name]
+        $backup = Write-ManagedBytes -Path (Join-Path $InstallPath $name) -Bytes $helperBytes[$name] -Journal $installJournal
         if ($backup) { Write-Output "Helper backup: $backup" }
     }
-    $configBackup = Write-ManagedBytes -Path $configPath -Bytes $configBytes
+    $configBackup = Write-ManagedBytes -Path $configPath -Bytes $configBytes -Journal $installJournal
     if ($configBackup) { Write-Output "Client config backup: $configBackup" }
     if ($settings.Changed) {
-        $settingsBackup = Write-ManagedBytes -Path $SettingsPath -Bytes $settings.Bytes
+        $settingsBackup = Write-ManagedBytes -Path $SettingsPath -Bytes $settings.Bytes -Journal $installJournal
         if ($settingsBackup) { Write-Output "Settings backup: $settingsBackup" }
     }
-    Register-DashLivenessTask -Path $livenessPath -TaskName $TaskName
+    Register-DashLivenessTask -Path $livenessPath -TaskName $TaskName -TaskSnapshot $taskSnapshot
     Write-Output "Installed Windows Claude hooks and per-user liveness task '$TaskName'."
 }
 catch {
     [Console]::Error.WriteLine($_.Exception.Message)
+    if ($null -ne $installJournal) {
+        Restore-FailedInstall -Journal $installJournal -TaskSnapshot $taskSnapshot -TaskName $TaskName
+    }
     exit 1
 }
