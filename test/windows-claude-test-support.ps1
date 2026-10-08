@@ -204,17 +204,23 @@ function Remove-WindowsClaudeFixture($Fixture) {
         if ($actions.Count -eq 1) {
             try {
                 $actualExecutable = [System.IO.Path]::GetFullPath([string]$actions[0].Execute)
-                $actualWorkingDirectory = [System.IO.Path]::GetFullPath([string]$actions[0].WorkingDirectory)
+                $workingDirectory = [string]$actions[0].WorkingDirectory
+                $actualWorkingDirectory = if ($workingDirectory) { [System.IO.Path]::GetFullPath($workingDirectory) } else { '' }
                 $collisionOwned = $task.Description -ceq $Fixture.CollisionTaskDescription -and
                     $actualExecutable -ieq [System.IO.Path]::GetFullPath($Fixture.PowerShellExe) -and
                     [string]$actions[0].Arguments -ieq $Fixture.CollisionTaskArguments -and
                     $actualWorkingDirectory -ieq [System.IO.Path]::GetFullPath($Fixture.Root)
                 $livenessPath = [System.IO.Path]::GetFullPath((Join-Path $Fixture.InstallPath 'claude-liveness.ps1'))
                 $managedArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $livenessPath + '"'
-                $managedOwned = $task.Description -ceq $Fixture.ManagedTaskDescription -and
-                    $actualExecutable -ieq [System.IO.Path]::GetFullPath($Fixture.PowerShellExe) -and
+                $legacyAction = $actualExecutable -ieq [System.IO.Path]::GetFullPath($Fixture.PowerShellExe) -and
                     [string]$actions[0].Arguments -ieq $managedArguments -and
                     $actualWorkingDirectory -ieq [System.IO.Path]::GetFullPath($Fixture.InstallPath)
+                $headlessArguments = '--headless "' + $Fixture.PowerShellExe + '" ' + $managedArguments
+                $localArguments = '--headless ' + $Fixture.PowerShellExe + ' ' + $managedArguments
+                $headlessAction = $actualExecutable -ieq (Join-Path $env:SystemRoot 'System32\conhost.exe') -and
+                    ([string]$actions[0].Arguments -ieq $headlessArguments -or [string]$actions[0].Arguments -ieq $localArguments) -and
+                    (-not $workingDirectory -or $actualWorkingDirectory -ieq [System.IO.Path]::GetFullPath($Fixture.InstallPath))
+                $managedOwned = $task.Description -ceq $Fixture.ManagedTaskDescription -and ($legacyAction -or $headlessAction)
                 if ($collisionOwned -or $managedOwned) {
                     Stop-ScheduledTask -TaskName $Fixture.TaskName -TaskPath '\' -ErrorAction SilentlyContinue
                     Unregister-ScheduledTask -TaskName $Fixture.TaskName -TaskPath '\' -Confirm:$false -ErrorAction SilentlyContinue
