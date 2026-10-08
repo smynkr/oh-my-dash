@@ -25,7 +25,8 @@ function Get-InstallerArguments($Fixture, [string[]]$Extra = @()) {
 }
 
 foreach ($failurePoint in @('Register-ScheduledTask', 'Start-ScheduledTask')) {
-    foreach ($upgrade in @($false, $true)) {
+    foreach ($previousLauncher in @('none', 'powershell', 'local-headless', 'headless')) {
+        $upgrade = $previousLauncher -ne 'none'
         $rollbackFixture = New-WindowsClaudeFixture
         try {
             [IO.File]::WriteAllText($rollbackFixture.SettingsPath, '{"model":"synthetic-preserved"}', [Text.UTF8Encoding]::new($false))
@@ -42,6 +43,18 @@ foreach ($failurePoint in @('Register-ScheduledTask', 'Start-ScheduledTask')) {
                 $initialInstall = Invoke-WindowsClaudeScript -ScriptPath $rollbackInstaller -Arguments $rollbackArguments -TimeoutSeconds 60
                 Assert-Equal 0 $initialInstall.ExitCode 'rollback fixture installs before an upgrade'
                 Stop-ScheduledTask -TaskName $rollbackFixture.TaskName -TaskPath '\'
+                $legacyArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+                    (Join-Path $rollbackFixture.InstallPath 'claude-liveness.ps1') + '"'
+                if ($previousLauncher -eq 'powershell') {
+                    $priorAction = New-ScheduledTaskAction -Execute $rollbackFixture.PowerShellExe `
+                        -Argument $legacyArguments -WorkingDirectory $rollbackFixture.InstallPath
+                    Set-ScheduledTask -TaskName $rollbackFixture.TaskName -Action $priorAction | Out-Null
+                }
+                elseif ($previousLauncher -eq 'local-headless') {
+                    $priorAction = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\conhost.exe') `
+                        -Argument ('--headless ' + $rollbackFixture.PowerShellExe + ' ' + $legacyArguments)
+                    Set-ScheduledTask -TaskName $rollbackFixture.TaskName -Action $priorAction | Out-Null
+                }
                 $taskXmlBefore = Export-ScheduledTask -TaskName $rollbackFixture.TaskName -TaskPath '\'
                 $activePaths += @(Get-ChildItem -LiteralPath $rollbackFixture.InstallPath -File | ForEach-Object { $_.FullName })
                 [IO.File]::AppendAllText((Join-Path $rollbackFixture.InstallPath 'claude-hook.ps1'), "`n# synthetic local helper edit`n")

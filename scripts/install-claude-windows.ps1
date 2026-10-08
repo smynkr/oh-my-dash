@@ -428,6 +428,10 @@ function Get-DashTaskArguments([string]$Path) {
     return '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (Quote-TaskArgument $Path)
 }
 
+function Get-DashHeadlessTaskArguments([string]$Path) {
+    return '--headless ' + (Quote-TaskArgument (Get-WindowsPowerShellExe)) + ' ' + (Get-DashTaskArguments $Path)
+}
+
 function Assert-DashTaskOwnership([string]$Path, [string]$TaskName) {
     $taskLookupErrors = @()
     $task = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue -ErrorVariable taskLookupErrors
@@ -457,10 +461,19 @@ function Assert-DashTaskOwnership([string]$Path, [string]$TaskName) {
         $actions.Count -eq 1
     if ($owned) {
         $actualExecutable = ConvertTo-FullPath ([string]$actions[0].Execute)
-        $actualWorkingDirectory = ConvertTo-FullPath ([string]$actions[0].WorkingDirectory)
-        $owned = $actualExecutable -ieq $expectedPowerShell -and
+        $workingDirectory = [string]$actions[0].WorkingDirectory
+        $actualWorkingDirectory = if ($workingDirectory) { ConvertTo-FullPath $workingDirectory } else { '' }
+        $legacyAction = $actualExecutable -ieq $expectedPowerShell -and
             [string]$actions[0].Arguments -ieq $expectedArguments -and
             $actualWorkingDirectory -ieq $expectedWorkingDirectory
+        # Recognize the owner-applied headless form too, but never arbitrary wrappers or arguments.
+        $headlessArguments = Get-DashHeadlessTaskArguments $expectedPath
+        $unquotedArguments = '--headless ' + $expectedPowerShell + ' ' + $expectedArguments
+        $headlessAction = $actualExecutable -ieq (Join-Path $env:SystemRoot 'System32\conhost.exe') -and
+            ([string]$actions[0].Arguments -ieq $headlessArguments -or
+                ($expectedPowerShell -notmatch '\s' -and [string]$actions[0].Arguments -ieq $unquotedArguments)) -and
+            (-not $workingDirectory -or $actualWorkingDirectory -ieq $expectedWorkingDirectory)
+        $owned = $legacyAction -or $headlessAction
     }
     if (-not $owned) {
         throw "Scheduled Task '$TaskName' exists but does not match the managed Windows Claude task; refusing to overwrite or remove it."
@@ -469,21 +482,26 @@ function Assert-DashTaskOwnership([string]$Path, [string]$TaskName) {
 }
 
 function Register-DashLivenessTask([string]$Path, [string]$TaskName, $TaskSnapshot) {
-    $powershellExe = Get-WindowsPowerShellExe
     $livenessPath = ConvertTo-FullPath $Path
-    $null = Assert-DashTaskOwnership -Path $livenessPath -TaskName $TaskName
-    $action = New-ScheduledTaskAction -Execute $powershellExe -Argument (Get-DashTaskArguments $livenessPath) `
-        -WorkingDirectory (Split-Path -Parent $livenessPath)
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $atLogon = New-ScheduledTaskTrigger -AtLogOn -User $identity
-    $repeating = New-ScheduledTaskTrigger -Once -At ([DateTime]::Now.AddMinutes(1)) `
-        -RepetitionInterval (New-TimeSpan -Minutes 1)
-    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $action -Trigger @($atLogon, $repeating) `
-        -Principal $principal -Settings $settings `
-        -Description 'Oh My Dash managed Claude liveness task (oh-my-dash-claude-windows)' -Force | Out-Null
+    $existingTask = Assert-DashTaskOwnership -Path $livenessPath -TaskName $TaskName
+    $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\conhost.exe') `
+        -Argument (Get-DashHeadlessTaskArguments $livenessPath) -WorkingDirectory (Split-Path -Parent $livenessPath)
+    if ($null -ne $existingTask) {
+        $existingTask.Actions = @($action)
+        Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -InputObject $existingTask -Force | Out-Null
+    }
+    else {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $atLogon = New-ScheduledTaskTrigger -AtLogOn -User $identity
+        $repeating = New-ScheduledTaskTrigger -Once -At ([DateTime]::Now.AddMinutes(1)) `
+            -RepetitionInterval (New-TimeSpan -Minutes 1)
+        $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $action -Trigger @($atLogon, $repeating) `
+            -Principal $principal -Settings $settings `
+            -Description 'Oh My Dash managed Claude liveness task (oh-my-dash-claude-windows)' -Force | Out-Null
+    }
     $TaskSnapshot.WrittenXml = Export-ScheduledTask -TaskName $TaskName -TaskPath '\'
     Start-ScheduledTask -TaskName $TaskName -TaskPath '\'
 }
@@ -557,6 +575,9 @@ try {
 
     $hubBase = Get-HubBase $HubUrl
     $ClaudePath = Get-ClaudeExecutable $ClaudePath
+    if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\conhost.exe') -PathType Leaf)) {
+        throw 'Windows console host was not found; headless liveness polling requires conhost.exe.'
+    }
     $helperNames = @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1', 'claude-question.ps1')
     $helperBytes = @{}
     $helperHashes = [ordered]@{}
@@ -604,7 +625,7 @@ try {
         Write-Output "Would install native Claude hooks in $SettingsPath"
         Write-Output "Would copy source-pinned PowerShell helpers and client config to $InstallPath"
         Write-Output "Would configure hub $hubBase for host $HostLabel using Claude CLI $ClaudePath"
-        Write-Output "Would register per-user Scheduled Task '$TaskName' with one-minute liveness checks"
+        Write-Output "Would register headless per-user Scheduled Task '$TaskName' (one-minute checks on first install; existing schedule preserved)"
         Write-Output "Would create $($groups.Count) Dash hook groups; remote questions enabled: $([bool]$Questions); settings change: $($settings.Changed)"
         return
     }
