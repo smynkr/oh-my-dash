@@ -148,27 +148,73 @@ test("R3 a hook duplicate rebinds the exact matched row (A,B,A) to the new turn 
     db.applyEvent(event("aba","response",1000,CHOICE));
     db.applyEvent(event("aba","response",1001,"synthetic B"));
     const before = db.responseForTurn(key,1)!;
+    db.markSeen(key);
+    expect(db.responseForTurn(key,1)?.seen).toBe(true);
     const dto = db.applyEvent(event("aba","response",1002,CHOICE));
     expect(dto.turnSeq).toBe(3);
     expect(db.countResponses()).toBe(2);
     expect(db.responseForTurn(key,1)).toBeUndefined();
     const rebound = db.responseForTurn(key,3)!;
     expect(rebound.id).toBe(before.id);
+    expect(rebound.seen).toBe(false);
+    expect(db.readPosition(key)).toMatchObject({
+      firstUnread: { id:before.id, text:CHOICE, seen:false }, unreadCount:1, retainedCount:2,
+    });
     expect(rebound.ts).toBeGreaterThan(db.responseForTurn(key,2)!.ts);
     expect(rebound.decisions).toEqual(before.decisions);
     expect(dto.lastResponses.map(r => [r.text, r.turnSeq])).toEqual([[CHOICE,3],["synthetic B",2]]);
   } finally { db.close(); }
 });
 
-test("with decisions off a hook duplicate keeps today's ordering and only records its turn", () => {
+test("with decisions off, a hook duplicate is unread again at its fresh timestamp", () => {
   const db = new DashDB(":memory:"), key = "synthetic-host|claude|aba-off";
   try {
     db.applyEvent(event("aba-off","response",1000,"synthetic A"));
     db.applyEvent(event("aba-off","response",1001,"synthetic B"));
+    const before = db.responseForTurn(key,1)!;
+    db.markSeen(key);
     const dto = db.applyEvent(event("aba-off","response",1002,"synthetic A"));
-    expect(dto.lastResponses.map(r => [r.text, r.ts])).toEqual([["synthetic B",1001],["synthetic A",1000]]);
+    expect(dto.lastResponses.map(r => [r.text, r.ts, r.seen])).toEqual([
+      ["synthetic A",1002,false], ["synthetic B",1001,true],
+    ]);
     expect(db.responseForTurn(key,3)).toMatchObject({ text:"synthetic A", decisionState:"skipped", decisions:null });
+    expect(db.markResponseSeen(key,before.id,before.ts)).toEqual({ kind:"stale" });
   } finally { db.close(); }
+});
+test("backfill preserves live read state and imports new rows as read", () => {
+  const db = new DashDB(":memory:"), key = "synthetic-host|claude|backfill-read";
+  try {
+    const live = db.applyEvent(event("backfill-read","response",1000,"synthetic live response")).lastResponses[0];
+    db.addBackfill(backfill("backfill-read",
+      { ts:1001, text:"synthetic live response" },
+      { ts:1002, text:"synthetic imported response" }));
+    expect(db.sessionResponse(key,live.id)?.seen).toBe(false);
+    const imported = db.sqlite.query("SELECT id FROM responses WHERE session_key=? AND text=?")
+      .get(key,"synthetic imported response") as { id:number } | null;
+    expect(imported).not.toBeNull();
+    expect(db.sessionResponse(key,imported!.id)?.seen).toBe(true);
+  } finally { db.close(); }
+});
+
+test("exact response acknowledgement and first-unread position survive database reopen", () => {
+  const dir = mkdtempSync(join(tmpdir(),"dash-read-position-")), path = join(dir,"db.sqlite");
+  let db = new DashDB(path), key = "synthetic-host|claude|read-restart";
+  try {
+    const first = db.applyEvent(event("read-restart","response",1000,"synthetic first response")).lastResponses[0];
+    const second = db.applyEvent(event("read-restart","response",1001,"synthetic second response")).lastResponses[0];
+    expect(db.readPosition(key)).toMatchObject({
+      firstUnread: { id:first.id, ts:first.ts }, unreadCount:2, retainedCount:2,
+    });
+    expect(db.markResponseSeen(key,first.id,first.ts)).toMatchObject({ kind:"ok", readPosition:{
+      firstUnread:{id:second.id}, unreadCount:1, retainedCount:2,
+    }});
+    db.close();
+
+    db = new DashDB(path);
+    expect(db.readPosition(key)).toMatchObject({
+      firstUnread: { id:second.id, ts:second.ts, seen:false }, unreadCount:1, retainedCount:2,
+    });
+  } finally { db.close(); rmSync(dir,{recursive:true,force:true}); }
 });
 
 test("a hook duplicate of a backfill row or a skipped row is bound to the turn and evaluated now", () => {
@@ -263,4 +309,15 @@ test("R3 legacy responses gain inert decision columns and malformed stored decis
     db.sqlite.query("UPDATE responses SET decisions_json=?").run(JSON.stringify({ decisions:[{ title:"Invented", options:[{key:"A",label:"nowhere"},{key:"B",label:"else"}], recIndex:0, recQuote:"my pick A" }], source:"luna" }));
     expect(db.timeline()[0].decisions).toEqual({ decisions:[], source:"luna" });
   } finally { db.close(); rmSync(dir,{recursive:true,force:true}); }
+});
+
+test("responseForTurn and getResponse carry the session's display-name override and account alias", () => {
+  const db = new DashDB(":memory:");
+  try {
+    db.applyEvent(event("hook","response",1000,"synthetic response"));
+    db.sqlite.query("UPDATE sessions SET display_name_override=?,account_alias_override=? WHERE key=?").run("renamed-session","work","synthetic-host|claude|hook");
+    const byTurn = db.responseForTurn("synthetic-host|claude|hook",1)!;
+    expect([byTurn.displayName, byTurn.accountAlias]).toEqual(["renamed-session","work"]);
+    expect([db.getResponse(byTurn.id)!.displayName, db.getResponse(byTurn.id)!.accountAlias]).toEqual(["renamed-session","work"]);
+  } finally { db.close(); }
 });

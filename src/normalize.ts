@@ -10,6 +10,7 @@ export interface NormalizedEvent {
   ts: number;
   cwd?: string;
   title?: string;
+  accountAlias?: string;
   text?: string;
   detail?: string;
   questionIdentity?: string;
@@ -65,6 +66,13 @@ export const localHost = () => hostname().split(".")[0];
 export const sessionKey = (event: Pick<NormalizedEvent, "host" | "harness" | "sessionId">) => `${event.host}|${event.harness}|${event.sessionId}`;
 export const claudeInteractive = (headers: Headers) => headers.get("X-Dash-Entrypoint") === "cli";
 
+// Explicit display metadata only: never infer an account from credentials or app login.
+export function normalizeAccountAlias(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const alias = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(alias) ? alias : undefined;
+}
+
 export function describePrompt(text: string | undefined | null): string | null {
   if (text == null) return null;
   const trimmed = text.trimStart();
@@ -98,6 +106,7 @@ export function normalizeClaude(payload: unknown, headers: Headers, ts = Date.no
     host, harness: "claude", sessionId: data.session_id, ts,
     cwd: clip(data.cwd, 4096), transcriptPath: clip(data.transcript_path, 4096),
     interactive: claudeInteractive(headers), sessionKind: clip(headers.get("X-Dash-Kind"), 255),
+    accountAlias: normalizeAccountAlias(headers.get("X-Dash-Account-Alias")),
     ...(typeof data.tool_use_id === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(data.tool_use_id)
       ? { toolUseId: data.tool_use_id } : {}),
   };
@@ -275,6 +284,7 @@ export function normalizeOmp(payload: unknown, ts = Date.now()): NormalizedEvent
     kind, ts, cwd: clip(data.cwd, 4096), title: clip(data.title, 4096),
     text: clip(data.text), detail: clip(data.detail, detailLimit), interactive: data.interactive,
     transcriptPath: clip(data.transcriptPath, 4096),
+    accountAlias: normalizeAccountAlias(data.accountAlias),
     ...questionFields,
     ...(answerIdentity ? { questionIdentity: answerIdentity } : {}),
   };

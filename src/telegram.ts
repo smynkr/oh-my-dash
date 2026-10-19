@@ -3,7 +3,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Card, DashDB, Reply, ResponseDTO, SessionDTO, TelegramQuestionMessage } from "./db.ts";
 import type { AskQuestion } from "./normalize.ts";
-import type { createReplies } from "./replies.ts";
+import { cleanMessageText, MAX_MESSAGE_CHARS, messageTtlFromEnv, type createReplies } from "./replies.ts";
+import { messageRefusalReason } from "./capabilities.ts";
 import { CONTINUE_LABEL, CONTINUE_TEXT } from "./actions.ts";
 import { extractRecommendation, LABEL_CP, looksLikeAsk, TITLE_CP, verifiedRecommendation, type Decision, type DecisionSet } from "./decisions.ts";
 import { topicFor, type TopicBindings } from "./projects.ts";
@@ -78,6 +79,9 @@ const validThreadId = (value: unknown): value is number | null => value === null
   (typeof value === "number" && Number.isSafeInteger(value) && value > 0);
 const isHarness = (dto: SessionDTO) => dto.interactive && ["claude", "omp"].includes(dto.harness);
 const cardCode = /^d:([0-9a-z]{1,8}):(0|[1-9]\d?):(0|[1-9]\d?)$/;
+const pickerCode = /^c:([0-9a-z]{1,8}):([0-9a-z]{1,6}):([0-7]|i|x)$/, ideaCode = /^i:([0-9a-z]{1,8}):([sa])$/;
+const PICKER_ROWS = 8;
+const cpClip = (text: string, cap: number) => { const cps = [...text]; return cps.length <= cap ? text : `${cps.slice(0, cap - 1).join("")}…`; };
 const questionCode = /^q:([A-Za-z0-9_-]{8,43}):(0|[1-9]\d?):(c|s|x|0|[1-9]\d?)$/;
 const outcomeLine: Record<Outcome, string> = { delivered: "✅ Delivered", expired: "⌛ Expired", cancelled: "✖️ Cancelled" };
 const flat = (text: string) => text.replace(/\r\n|[\r\n\u2028\u2029]/g, " ");
@@ -740,7 +744,8 @@ export function createTelegram(opts: TelegramOptions) {
     const total = needs.length + ready.length;
     const more = total > listed.length ? `\n\nShowing ${listed.length} of ${total} waiting sessions. Open dash for the full list.` : "";
     return `<b>Session status</b>\n${needs.length} sessions need input · ${ready.length} your turn · ${working} working` +
-      (lines.length ? `\n\n${lines.join("\n\n")}${more}\n\n<b>Reply:</b> /r N your text` : "\n\nNo sessions are waiting for you.");
+      (lines.length ? `\n\n${lines.join("\n\n")}${more}\n\n<b>Reply:</b> /r N your text${replies ? " · /to name text" : ""}` :
+        `\n\nNo sessions are waiting for you.${replies ? "\n\n<b>Send:</b> /to name text" : ""}`);
   };
 
   const replyOutcome = (item: Reply, outcome: Outcome, dto?: SessionDTO, ttlMin = 15) => {
@@ -753,9 +758,10 @@ export function createTelegram(opts: TelegramOptions) {
     const name = escapeHtml(clipped(dto?.displayName ?? "session", 256));
     const host = escapeHtml(clipped(dto?.host ?? "", 256));
     const html = outcome === "delivered" ? `✅ Delivered to <b>${name}</b> · ${host}` :
-      outcome === "expired" ? `⌛ Not delivered to <b>${name}</b>: it wasn't ready within ${ttlMin} min.` :
+      outcome === "expired" ? `⌛ Not delivered to <b>${name}</b>: it wasn't ready within ${item.kind === "message" ? Math.round(messageTtlFromEnv(process.env.DASH_MESSAGE_TTL_MS) / 60_000) : ttlMin} min.` :
       dto?.status === "ended" ? `✖️ Not delivered: <b>${name}</b> ended.` : "✖️ Cancelled.";
-    void editText({ chatId: recordedChat, threadId: null, name: null }, msgId, html);
+    const saved = item.savedIdeaId ? ` · saved to Ideas (#${item.savedIdeaId})` : "";
+    void editText({ chatId: recordedChat, threadId: null, name: null }, msgId, html + saved);
   };
   const replyRefusal = (reason: string) => {
     switch (reason) {
@@ -767,12 +773,14 @@ export function createTelegram(opts: TelegramOptions) {
       case "omp_approval": return "omp tool approvals can't be answered from dash yet.";
       case "stale_turn": return "Out of date: the session has moved on";
       case "not_deliverable": return "That session is not ready for this action.";
+      case "too_long": return `That message is over ${MAX_MESSAGE_CHARS} characters. Shorten it and send again.`;
+      case "idea_not_open": return "That idea is no longer open.";
       default: return "Could not queue that reply.";
     }
   };
-  const routeReply = async (key: string, text: string, destination: Destination, toMessageId?: number) => {
+  const routeReply = async (key: string, text: string, destination: Destination, toMessageId?: number, kind?: "message") => {
     if (!replies) { await retrySendAt(destination, "Replies are off on the hub."); return; }
-    const submitted = replies.submit({ key, text, source: "telegram", actor: `telegram:${userId}`, listener: "telegram" });
+    const submitted = replies.submit({ key, text, source: "telegram", actor: `telegram:${userId}`, listener: "telegram", ...(kind ? { kind } : {}) });
     if ("refused" in submitted) { await retrySendAt(destination, replyRefusal(submitted.reason)); return; }
     const dto = db.getSession(key);
     const sentAt = await retrySendAt(destination, `📨 Queued for <b>${escapeHtml(clipped(dto?.displayName ?? "session", 256))}</b> · ${escapeHtml(clipped(dto?.host ?? "", 256))}`, undefined, toMessageId);
@@ -1116,6 +1124,105 @@ export function createTelegram(opts: TelegramOptions) {
   };
   const dtoHarness = (card: QuestionCard) => db.getSession(card.key)?.harness;
 
+  // C3 compose-first: a draft row is stored before its picker is sent. Buttons carry the draft id and an index into
+  // the stored targets snapshot, never a session key or any message text.
+  const statusRank: Record<string, number> = { needs_input: 0, your_turn: 1, working: 2 };
+  const deliverable = () => db.listSessions().filter(dto => isHarness(dto) && dto.status !== "ended" &&
+    messageRefusalReason(dto, true) === undefined && Object.hasOwn(statusRank, dto.status))
+    .sort((a, b) => statusRank[a.status]! - statusRank[b.status]! || b.lastActivity - a.lastActivity);
+  const statusIcon = (dto: SessionDTO) => dto.status === "needs_input" ? "🟡" : dto.status === "your_turn" ? "🟢" : "⚙️";
+  // Buttons carry the draft's rev, so a tap on a keyboard rendered before a re-map never lands on the new target at that index.
+  const pickerView = (draftId: number, rev: number, header: string, keys: string[], overflow: number) => {
+    const id = `${draftId.toString(36)}:${rev.toString(36)}`;
+    const sessions = keys.map(key => db.getSession(key));
+    const rows = sessions.map((dto, n) => [{ text: cpClip(`${dto ? statusIcon(dto) : "⚙️"} ${dto?.displayName ?? "session"} · ${dto?.host ?? ""}`, 48),
+      callback_data: `c:${id}:${n}` }]);
+    const lines = [escapeHtml(header)];
+    if (!keys.length) lines.push("No session can take a message right now.");
+    if (overflow > 0) lines.push(`${overflow} more: use /to &lt;name&gt; &lt;text&gt;`);
+    return { html: lines.join("\n"), keyboard: { inline_keyboard: [...rows,
+      [{ text: "💡 Save to Ideas", callback_data: `c:${id}:i` }], [{ text: "✖️ Cancel", callback_data: `c:${id}:x` }]] } };
+  };
+  const editWith = (destination: Destination, messageId: number, html: string, keyboard?: Record<string, unknown>) => {
+    const epoch = pairEpoch;
+    const next = sendChain.then(() => sendAtDestination(destination, epoch, html, keyboard, undefined, messageId));
+    sendChain = next.catch(error => report("telegram send", error));
+    return next.catch(() => undefined);
+  };
+  const tooLong = (text: string) => [...cleanMessageText(text)].length > MAX_MESSAGE_CHARS;
+  const openPicker = async (destination: Destination, text: string, replyTo?: number, header = "Send to which session?",
+    candidates?: SessionDTO[], ideaId?: number) => {
+    if (tooLong(text)) { await retrySendAt(destination, replyRefusal("too_long"), undefined, replyTo); return; }
+    if (!cleanMessageText(text)) { await retrySendAt(destination, "Only text can be sent to a session.", undefined, replyTo); return; }
+    const all = candidates ?? deliverable(), keys = all.slice(0, PICKER_ROWS).map(dto => dto.key);
+    const draft = db.createDraft({ chatId: destination.chatId, threadId: destination.threadId, sourceMessageId: replyTo ?? null, text, targets: keys,
+      ideaId: ideaId ?? null }, now());
+    const view = pickerView(draft.id, draft.rev, header, keys, all.length - keys.length);
+    const sentAt = await retrySendAt(destination, view.html, view.keyboard, replyTo);
+    if (sentAt) db.setDraftPicker(draft.id, sentAt.messageId);
+  };
+  const norm = (text: string) => text.toLowerCase().replace(/[\s_-]+/g, "-");
+  const matchSessions = (name: string, sessions: SessionDTO[]): SessionDTO[] => {
+    const wanted = norm(name);
+    for (const test of [(n: string) => n === wanted, (n: string) => n.startsWith(wanted), (n: string) => n.includes(wanted)]) {
+      const found = sessions.filter(dto => test(norm(dto.displayName)));
+      if (found.length) return found;
+    }
+    return [];
+  };
+  const routeTo = async (rest: string, destination: Destination, toMessageId?: number) => {
+    const match = /^(\S+)\s+([\s\S]*\S[\s\S]*)$/.exec(rest);
+    if (!match) { await retrySendAt(destination, "Use /to &lt;session-name&gt; your text"); return; }
+    const [, name, text] = match;
+    if (tooLong(text!)) { await retrySendAt(destination, replyRefusal("too_long"), undefined, toMessageId); return; }
+    // The most specific tier that names any session wins, so a name that exactly names an unavailable session is
+    // refused instead of reaching a different, deliverable session through a looser prefix or substring match.
+    const named = matchSessions(name!, db.listSessions(false, true).filter(isHarness)), tier = new Set(named.map(dto => dto.key));
+    const found = deliverable().filter(dto => tier.has(dto.key));
+    if (found.length === 1) { await routeReply(found[0]!.key, text!, destination, toMessageId, "message"); return; }
+    if (found.length > 1) {
+      await openPicker(destination, text!, toMessageId, `"${name}" matches ${found.length} sessions:`, found); return;
+    }
+    if (named.length) {
+      const dto = named[0]!, reason = dto.status === "ended" ? "session_ended" : messageRefusalReason(dto, true) ?? "not_deliverable";
+      await retrySendAt(destination, reason === "session_ended" ? `<b>${escapeHtml(clipped(dto.displayName, 256))}</b> has ended.` : replyRefusal(reason),
+        undefined, toMessageId);
+      return;
+    }
+    await openPicker(destination, text!, toMessageId, `No session matches "${name}".`);
+  };
+  const ideaFields = (text: string, origin: "owner" | "draft_expired") =>
+    ({ text: cleanMessageText(text), source: "telegram" as const, actor: `telegram:${userId}`, origin });
+  const saveIdea = (text: string, origin: "owner" | "draft_expired") => db.createIdea(ideaFields(text, origin), now());
+  const ageText = (ms: number) => {
+    const minutes = Math.max(0, Math.floor(ms / 60_000));
+    return minutes < 60 ? `${minutes}m` : minutes < 2880 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / 1440)}d`;
+  };
+  const ideasView = () => {
+    const open = db.listIdeas("open", 10), total = db.openIdeaCount();
+    if (!open.length) return { html: "No open ideas.", keyboard: undefined };
+    const lines = ["<b>Ideas</b>", ...open.map(idea => `#${idea.id} · ${ageText(now() - idea.createdAt)} · ${escapeHtml(cpClip(flat(redact(idea.text)), 80))}`)];
+    if (total > open.length) lines.push(`${total - open.length} more in dash`);
+    return { html: lines.join("\n"), keyboard: { inline_keyboard: open.map(idea => [
+      { text: `Send #${idea.id}…`, callback_data: `i:${idea.id.toString(36)}:s` }, { text: `Archive #${idea.id}`, callback_data: `i:${idea.id.toString(36)}:a` }]) } };
+  };
+  const sweepDrafts = () => {
+    if (!replies) return;
+    for (const draft of db.dueDrafts(now())) {
+      const destination: Destination = { chatId: draft.chatId, threadId: draft.threadId, name: null };
+      // A draft started from an idea leaves that idea open; any other text, including a send claim stranded before
+      // submit recorded a reply, is saved to Ideas in the same transaction that finishes the draft.
+      if (draft.ideaId !== null) {
+        if (!db.transitionDraft(draft.id, draft.state, "expired")) continue;
+        if (draft.pickerMessageId) void editWith(destination, draft.pickerMessageId, "⌛ Expired.");
+        continue;
+      }
+      const idea = db.draftToIdea(draft.id, draft.state, ideaFields(draft.text, "draft_expired"), now());
+      if (!idea) continue;
+      if (draft.pickerMessageId) void editWith(destination, draft.pickerMessageId, `⌛ No session picked in 30 min: saved to Ideas (#${idea.id}).`);
+    }
+  };
+
   const sendUrgent = async (project: string, body: string): Promise<boolean> => {
     if (!topicsEnabled || !running || !paired() || ["disabled", "webhook_conflict", "poll_conflict"].includes(state)) return false;
     const bindings = readBindings();
@@ -1325,6 +1432,8 @@ export function createTelegram(opts: TelegramOptions) {
     const topicRoot = !!message.reply_to_message?.forum_topic_created;
     if (topicRoot && (!topicsEnabled || !parsedCommand)) return;
     const replyTo = topicRoot ? undefined : message.reply_to_message;
+    // C3: a non-text DM (photo, sticker, voice) cannot become a draft.
+    if (replies && privateDm && !message.reply_to_message && !text) { await retrySendAt(destination, "Only text can be sent to a session."); return; }
     if (replyTo?.message_id !== undefined) {
       const prompt = db.telegramQuestionMessage(incomingChatId, replyTo.message_id);
       if (prompt?.prompt) {
@@ -1347,11 +1456,15 @@ export function createTelegram(opts: TelegramOptions) {
       await routeReply(alert.sessionKey, text, destination, message.message_id);
       return;
     }
+    const isCommand = topicsEnabled ? !!parsedCommand : text.startsWith("/");
+    if (replies && privateDm && !replyTo && !isCommand) { await openPicker(destination, text, message.message_id); return; }
     if (!parsedCommand) {
       await retrySendAt(destination, "Reply to an alert to answer it, or use /status then /r N your text.");
       return;
     }
     const command = parsedCommand.command, arg = parsedCommand.arg;
+    // Non-topic parsing keeps only the first word of the argument; /to and /idea need the whole rest.
+    const rest = topicsEnabled ? arg ?? "" : text.slice(command.length).trim();
     if (command === "/pair") {
       if (topicsEnabled && !privateDm) return;
       await retrySendAt(destination, "Reply to an alert to answer it, or use /status then /r N your text.");
@@ -1371,6 +1484,14 @@ export function createTelegram(opts: TelegramOptions) {
       const key = match ? statusKeyAt(destination.chatId, destination.threadId, Number(match[1])) : undefined;
       if (!key) await retrySendAt(destination, "Run /status first.");
       else await routeReply(key, match![2], destination, message.message_id);
+    } else if (replies && command === "/to") await routeTo(rest, destination, message.message_id);
+    else if (replies && command === "/idea") {
+      if (!cleanMessageText(rest)) await retrySendAt(destination, "Use /idea your text");
+      else if (tooLong(rest)) await retrySendAt(destination, replyRefusal("too_long"), undefined, message.message_id);
+      else await retrySendAt(destination, `💡 Saved to Ideas (#${saveIdea(rest, "owner").id}).`, undefined, message.message_id);
+    } else if (replies && command === "/ideas") {
+      const view = ideasView();
+      await retrySendAt(destination, view.html, view.keyboard);
     } else if (command === "/cancel") {
       const cancelled = replies?.cancelAll() ?? [];
       await retrySendAt(destination, `Cancelled ${cancelled.length} pending replies.`);
@@ -1390,6 +1511,7 @@ export function createTelegram(opts: TelegramOptions) {
     } else if (command === "/help") await retrySendAt(destination, [
       "<b>dash commands</b>",
       "<b>Sessions and replies</b>\n/status — list sessions and reply numbers\n/r N text — reply to a numbered session\n/cancel — cancel pending replies",
+      ...(replies ? ["<b>New messages</b>\nSend any text here to pick a session\n/to name text — send to a session by name\n/idea text — save an idea\n/ideas — list open ideas"] : []),
       "<b>Notifications</b>\n/mode input|turns|off — choose alert types\n/mute 30m|1h|4h|off — pause or resume alerts",
       "<b>Help</b>\n/help — show this guide\nYou can also reply to an alert to answer it.",
       ...(topicsEnabled && botUsername ? [`In group topics, use /cmd@${escapeHtml(botUsername)} in place of /cmd.`] : []),
@@ -1466,6 +1588,83 @@ export function createTelegram(opts: TelegramOptions) {
     cardStatus(card, label, outcome);
     await answerCallback(callback, `Sent to ${clipped(dto.displayName, 60)}`);
   };
+  // C3: like handleCard, every check and the draft's conditional state move run before the first await.
+  const handlePicker = async (callback: TelegramCallback, callbackChatId: string, data: string) => {
+    const match = pickerCode.exec(data), messageId = callback.message?.message_id;
+    const draft = match ? db.getDraft(parseInt(match[1]!, 36)) : undefined;
+    if (!replies) { await answerCallback(callback, "Replies are off on the hub."); return; }
+    if (!draft || draft.chatId !== callbackChatId || messageId === undefined || draft.pickerMessageId !== messageId) {
+      await answerCallback(callback, "Expired"); return;
+    }
+    if (draft.state !== "pending" || draft.expiresAt <= now()) {
+      await answerCallback(callback, draft.state === "idea" && draft.expiresAt <= now() ? "Expired: saved to Ideas" :
+        draft.state === "pending" || draft.state === "expired" ? "Expired" : "Already handled"); return;
+    }
+    if (parseInt(match![2]!, 36) !== draft.rev) { await answerCallback(callback, "Out of date: use the updated picker"); return; }
+    const destination: Destination = { chatId: draft.chatId, threadId: draft.threadId, name: null }, action = match![3]!;
+    if (action === "x") {
+      if (!db.transitionDraft(draft.id, "pending", "cancelled")) { await answerCallback(callback, "Already handled"); return; }
+      void editWith(destination, messageId, "✖️ Cancelled.");
+      await answerCallback(callback, "Cancelled"); return;
+    }
+    if (action === "i") {
+      // A picker opened from an idea is already in Ideas: keep that idea instead of saving a duplicate.
+      if (draft.ideaId !== null) {
+        if (!db.transitionDraft(draft.id, "pending", "cancelled")) { await answerCallback(callback, "Already handled"); return; }
+        void editWith(destination, messageId, `💡 Kept in Ideas (#${draft.ideaId}).`);
+        await answerCallback(callback, `Kept in Ideas (#${draft.ideaId})`); return;
+      }
+      const idea = db.draftToIdea(draft.id, "pending", ideaFields(draft.text, "owner"), now());
+      if (!idea) { await answerCallback(callback, "Already handled"); return; }
+      void editWith(destination, messageId, `💡 Saved to Ideas (#${idea.id}).`);
+      await answerCallback(callback, `Saved to Ideas (#${idea.id})`); return;
+    }
+    const key = draft.targets[Number(action)];
+    if (key === undefined) { await answerCallback(callback, "Expired"); return; }
+    if (!db.transitionDraft(draft.id, "pending", "sent")) { await answerCallback(callback, "Already handled"); return; }
+    let submitted: ReturnType<NonNullable<typeof replies>["submit"]>;
+    try {
+      submitted = replies.submit({ key, text: draft.text, kind: "message", source: "telegram", actor: `telegram:${userId}`,
+        ideaId: draft.ideaId ?? undefined, listener: "telegram" });
+    } catch (error) {
+      db.transitionDraft(draft.id, "sent", "pending");
+      throw error;
+    }
+    if ("refused" in submitted) {
+      db.transitionDraft(draft.id, "sent", "pending");
+      const fresh = deliverable(), keys = fresh.slice(0, PICKER_ROWS).map(dto => dto.key);
+      db.setDraftTargets(draft.id, keys);
+      const view = pickerView(draft.id, db.getDraft(draft.id)?.rev ?? draft.rev + 1, "Send to which session?", keys, fresh.length - keys.length);
+      void editWith(destination, messageId, view.html, view.keyboard);
+      await answerCallback(callback, replyRefusal(submitted.reason)); return;
+    }
+    db.transitionDraft(draft.id, "sent", "sent", submitted.replyId);
+    db.setReplyTgMsg(submitted.replyId, draft.chatId, messageId);
+    const dto = db.getSession(key);
+    void editWith(destination, messageId, `📨 Queued for <b>${escapeHtml(clipped(dto?.displayName ?? "session", 256))}</b> · ${escapeHtml(clipped(dto?.host ?? "", 256))}`);
+    // A waiting Claude hook can take the message inside submit(), before its Telegram message was recorded.
+    const current = db.getReply(submitted.replyId);
+    if (current && ["delivered", "expired", "cancelled"].includes(current.state)) {
+      const latest = db.getSession(key);
+      replyOutcome(current, current.state as Outcome, current.state === "cancelled" && latest?.status !== "ended" ? undefined : latest ?? dto);
+    }
+    await answerCallback(callback, `Queued for ${clipped(dto?.displayName ?? "session", 60)}`);
+  };
+  const handleIdea = async (callback: TelegramCallback, callbackChatId: string, data: string) => {
+    const match = ideaCode.exec(data), idea = match ? db.getIdea(parseInt(match[1]!, 36)) : undefined;
+    if (!replies) { await answerCallback(callback, "Replies are off on the hub."); return; }
+    if (!idea) { await answerCallback(callback, "Expired"); return; }
+    if (match![2] === "a") {
+      await answerCallback(callback, db.archiveIdea(idea.id, now()) ? `Archived #${idea.id}` :
+        idea.state === "archived" ? "Already archived" : replyRefusal("idea_not_open"));
+      return;
+    }
+    if (idea.state !== "open") { await answerCallback(callback, replyRefusal("idea_not_open")); return; }
+    const thread = callback.message?.message_thread_id;
+    await answerCallback(callback, "Pick a session.");
+    await openPicker({ chatId: callbackChatId, threadId: thread === undefined || thread === 1 ? null : thread, name: null }, idea.text,
+      undefined, "Send to which session?", undefined, idea.id);
+  };
   const handleCallback = async (callback: TelegramCallback) => {
     const callbackChat = callback.message?.chat, fromId = callback.from?.id;
     if (!paired() || String(fromId) !== userId || !callbackChat) return;
@@ -1475,6 +1674,8 @@ export function createTelegram(opts: TelegramOptions) {
     if (!privateDm && !boundGroup) return;
     if (callback.data?.startsWith("q:")) { await handleQuestionCallback(callback, callbackChatId, callback.data); return; }
     if (callback.data?.startsWith("d:")) { await handleCard(callback, callbackChatId, callback.data); return; }
+    if (callback.data?.startsWith("c:")) { await handlePicker(callback, callbackChatId, callback.data); return; }
+    if (callback.data?.startsWith("i:")) { await handleIdea(callback, callbackChatId, callback.data); return; }
     const id = callback.data?.startsWith("ms:") ? callback.data.slice(3) : "";
     const key = ids.get(id), dto = key ? db.listSessions(true, true).find(row => row.key === key) : undefined;
     if (key && dto) muted.set(key, now() + 3_600_000);
@@ -1534,7 +1735,7 @@ export function createTelegram(opts: TelegramOptions) {
       running = true;
       if (topicsEnabled) seedUrgentEpisodes();
       failStrandedCards();
-      stopAlertTimer = setTimer(() => { sweepUrgentEpisodes(); sweepAlertUpdates(); failStrandedCards(); }, 60_000);
+      stopAlertTimer = setTimer(() => { sweepUrgentEpisodes(); sweepAlertUpdates(); failStrandedCards(); sweepDrafts(); }, 60_000);
       void run();
     },
     close() { running = false; stopAlertTimer(); stopAlertTimer = () => {}; abort.abort(); queue.length = 0; token = undefined; },

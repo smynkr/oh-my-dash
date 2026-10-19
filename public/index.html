@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <title>Oh My Dash · Session feed</title>
+  <title>Dash · Operations console</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/vendor/marked.js" defer></script>
   <script src="/vendor/purify.js" defer></script>
@@ -12,21 +12,27 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">D</span><div><strong>Oh My Dash</strong><span class="brand-subtitle">Local session feed</span></div></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">D</span><div><strong>Dash</strong><span class="brand-subtitle">Operations console</span></div></div>
     <div class="counts" aria-live="polite">
-      <span class="count needs-count"><b id="needs-count">0</b> needs you</span>
-      <span class="count unread-count"><b id="unread-count">0</b> unread</span>
-      <span class="count working-count"><b id="working-count">0</b> working</span>
+      <button type="button" class="count needs-count" id="needs-filter-toggle" aria-pressed="false" title="Show sessions needing you"><b id="needs-count">0</b> needs you</button>
+      <button type="button" class="count unread-count" id="unread-filter-toggle" aria-pressed="false" title="Show sessions with unread responses"><b id="unread-count">0</b> unread</button>
+      <button type="button" class="count working-count" id="working-filter-toggle" aria-pressed="false" title="Show working sessions"><b id="working-count">0</b> working</button>
     </div>
     <div id="telegram-status" class="telegram-status" aria-live="polite" hidden></div>
+    <button id="ideas-open" class="button button-secondary ideas-open" type="button" aria-haspopup="dialog" title="Ideas" hidden>Ideas <span id="ideas-badge" class="ideas-badge">0</span></button>
     <button id="notification-enable" class="button button-secondary" type="button">Enable desktop notifications</button>
     <button id="mark-all" class="button button-secondary" type="button">Mark all read</button>
   </header>
   <main>
-    <nav class="tabs" aria-label="Feed views">
-      <div id="feed-tabs" class="tab-list" role="tablist" aria-label="Session feed view">
-        <button class="tab active" id="sessions-tab" type="button" role="tab" aria-selected="true" aria-controls="sessions-view" tabindex="0">Sessions</button>
+    <nav class="tabs" aria-label="Session views">
+      <div id="feed-tabs" class="tab-list" role="tablist" aria-label="Session views">
+        <button class="tab active" id="console-tab" type="button" role="tab" aria-selected="true" aria-controls="console-view" tabindex="0">Console</button>
+        <button class="tab" id="sessions-tab" type="button" role="tab" aria-selected="false" aria-controls="sessions-view" tabindex="-1">Feed</button>
         <button class="tab" id="timeline-tab" type="button" role="tab" aria-selected="false" aria-controls="timeline-view" tabindex="-1">Timeline</button>
+      </div>
+      <div class="navigation-tools">
+        <button id="command-open" class="button button-secondary" type="button" aria-label="Commands" aria-keyshortcuts="Control+k Meta+k" title="Commands (Ctrl/Cmd+K)" data-hint="Commands · Ctrl/Cmd+K">Commands</button>
+        <button id="shortcut-open" class="button button-secondary" type="button" aria-label="Keyboard shortcuts" aria-keyshortcuts="Shift+/" title="Keyboard shortcuts (?)" data-hint="Keyboard shortcuts · ?">?</button>
       </div>
       <span id="connection" class="connection"><i></i> Connecting</span>
     </nav>
@@ -53,14 +59,213 @@
         </div>
       </section>
     </details>
-    <div class="filters" aria-label="Feed filters">
-      <label>Host <select id="host-filter"><option value="">All hosts</option></select></label>
+    <details id="sources-disclosure" class="sources-disclosure">
+      <summary class="sources-summary" aria-controls="sources-panel">
+        <span>Sources</span>
+        <span id="sources-summary-state" class="sources-summary-help">Loading inventory…</span>
+      </summary>
+      <section id="sources-panel" class="sources-panel" aria-label="Source inventory">
+        <p class="sources-explainer">Hub reports describe source freshness; a live browser stream only describes this page’s connection and does not prove a source is fresh. Account aliases are labels, not proof of login or quota.</p>
+        <div class="sources-toolbar">
+          <p id="sources-status" class="sources-status" role="status" aria-live="off">Loading source inventory…</p>
+          <button id="sources-refresh" class="button button-secondary" type="button">Refresh inventory</button>
+        </div>
+        <p id="sources-unlabelled" class="sources-unlabelled" hidden></p>
+        <div id="sources-list" class="sources-list"></div>
+      </section>
+    </details>
+
+    <div class="filters" aria-label="Session filters">
+      <label class="session-filter session-search-label" for="session-search">Search <input id="session-search" type="search" maxlength="1024" autocomplete="off" placeholder="Session, project, machine, account, path" aria-keyshortcuts="/" title="Search sessions (/)"></label>
+      <label class="session-filter">Project <select id="project-filter"><option value="">All projects</option></select></label>
+      <label>Machine <select id="host-filter"><option value="">All machines</option></select></label>
       <label>Harness <select id="harness-filter"><option value="">All harnesses</option><option value="claude">Claude Code</option><option value="omp">Oh My Pi</option></select></label>
-      <label title="Options are grouped by host and working directory, not detected Git roots or worktrees.">Repository <select id="project-filter" aria-description="Options are grouped by host and working directory, not detected Git roots or worktrees."><option value="">All repositories</option></select></label>
+      <label class="session-filter">Account <select id="account-filter"><option value="">All accounts</option></select></label>
+      <label class="session-filter">State <select id="status-filter"><option value="">All states</option><option value="needs_input">Needs you</option><option value="unread">Unread</option><option value="working">Working</option><option value="your_turn">Your turn</option><option value="ended">Ended</option><option value="unknown">Unknown</option></select></label>
       <label class="check-label"><input id="headless-filter" type="checkbox"> Show headless</label>
       <label class="check-label" id="ended-filter-label"><input id="ended-filter" type="checkbox"> Show ended</label>
+      <button id="clear-filters" type="button" class="button button-secondary">Clear filters</button>
     </div>
-    <section id="sessions-view" class="view" role="tabpanel" aria-labelledby="sessions-tab" tabindex="0">
+    <p id="filter-summary" class="filter-summary session-filter" role="status"></p>
+    <p id="timeline-filter-note" class="filter-summary" hidden>Timeline uses Machine, Harness and Show headless. Search, Project, Account and State filter the Console and Feed session views.</p>
+    <details id="output-search-disclosure" class="output-search-disclosure">
+      <summary class="output-search-summary" aria-controls="output-search-panel">
+        <span>Search outputs</span>
+        <span class="output-search-summary-help">Retained responses · 25 per page</span>
+      </summary>
+      <section id="output-search-panel" class="output-search-panel" aria-label="Search retained output">
+        <p class="output-search-note">Search only retained response text and session identity metadata; reply text and transcript files aren't searched. Project, Machine, Account, Harness, Show headless and Show ended above apply here. Session-search text and State do not filter output results.</p>
+        <form id="output-search-form" class="output-search-form">
+          <label for="output-search-query">Search retained responses
+            <input id="output-search-query" type="search" maxlength="256" autocomplete="off" placeholder="A phrase from a response">
+          </label>
+          <button class="button button-secondary" type="submit">Search outputs</button>
+        </form>
+        <p id="output-search-status" class="output-search-status" role="status" aria-live="polite">Enter a phrase to search retained output.</p>
+        <ol id="output-search-results" class="output-search-results" aria-label="Output search results"></ol>
+        <button id="output-search-more" class="button button-secondary" type="button" hidden>Load more results</button>
+      </section>
+    </details>
+
+    <section id="console-view" class="view console-view" data-density="compact" role="tabpanel" aria-labelledby="console-tab" tabindex="0">
+      <div class="console-toolbar">
+        <label class="console-density-control" for="console-density">Density
+          <select id="console-density">
+            <option value="compact" selected>Compact</option>
+            <option value="comfortable">Comfortable</option>
+          </select>
+        </label>
+        <div class="console-preference-controls">
+          <label class="console-density-control" for="console-view-select">View
+            <select id="console-view-select" aria-label="Saved view">
+              <option value="">Custom</option>
+            </select>
+          </label>
+          <button id="console-view-apply" class="button button-secondary" type="button" disabled>Apply view</button>
+          <details id="console-views-management" class="console-preferences-disclosure">
+            <summary>Manage views</summary>
+            <div class="console-preferences-panel">
+              <button id="console-views-close" class="button button-secondary console-panel-close" type="button">Close view tools</button>
+              <form id="console-view-create-form" class="console-view-create">
+                <label for="console-view-create-name">New view name
+                  <input id="console-view-create-name" type="text" maxlength="80" autocomplete="off" required>
+                </label>
+                <button id="console-view-create" class="button button-secondary" type="submit">Create view</button>
+              </form>
+              <div class="console-view-edit">
+                <label for="console-view-name">Selected view name
+                  <input id="console-view-name" type="text" maxlength="80" autocomplete="off">
+                </label>
+                <div class="console-view-actions">
+                  <button id="console-view-rename" class="button button-secondary" type="button" disabled>Rename</button>
+                  <button id="console-view-update" class="button button-secondary" type="button" disabled>Update from current filters</button>
+                  <button id="console-view-delete" class="button button-secondary" type="button" disabled>Delete view</button>
+                </div>
+              </div>
+            </div>
+          </details>
+          <details id="console-pins-disclosure" class="console-pins-disclosure">
+            <summary>Pins <span id="console-pins-count">0</span></summary>
+            <div class="console-pins-panel">
+              <button id="console-pins-close" class="button button-secondary console-panel-close" type="button">Close pins</button>
+              <p id="console-pins-status" role="status" aria-live="polite">Pinned sessions stay here without changing session filters.</p>
+              <button id="console-pins-refresh" class="button button-secondary" type="button">Refresh availability</button>
+              <ul id="console-pins-list" class="console-pins-list"></ul>
+            </div>
+          </details>
+          <p id="console-preferences-status" class="console-preferences-status" role="status" aria-live="polite">Loading saved views and pins…</p>
+        </div>
+        <label class="console-density-control" for="group-filter">Group
+          <select id="group-filter"><option value="">None</option><option value="project">Project</option><option value="host">Machine</option><option value="account">Account</option><option value="harness">Harness</option></select>
+        </label>
+        <button id="next-unresolved" class="button button-secondary" type="button">Next unresolved</button>
+        <details class="console-column-chooser">
+          <summary>Columns</summary>
+          <div class="console-column-options">
+            <label><input type="checkbox" data-console-column="project" checked> Project</label>
+            <label><input type="checkbox" data-console-column="host" checked> Machine</label>
+            <label><input type="checkbox" data-console-column="account" checked> Account</label>
+            <label><input type="checkbox" data-console-column="harness" checked> Harness</label>
+            <label><input type="checkbox" data-console-column="age" checked> Age</label>
+          </div>
+        </details>
+        <button id="console-sort" class="button button-secondary" type="button">Sort by attention</button>
+      </div>
+      <div class="console-layout">
+        <div class="console-table-column">
+          <div class="console-table-wrap">
+            <table class="console-table">
+              <caption class="visually-hidden">Sessions across connected machines and accounts</caption>
+              <thead>
+                <tr>
+                  <th scope="col">State</th>
+                  <th scope="col" data-column="project" title="Project">Project</th>
+                  <th scope="col">Session</th>
+                  <th scope="col" data-column="host" title="Machine">Machine</th>
+                  <th scope="col" data-column="account" title="Account">Account</th>
+                  <th scope="col" data-column="harness" title="Harness">Harness</th>
+                  <th scope="col" data-column="age" title="Age">Age</th>
+                </tr>
+              </thead>
+              <tbody id="console-rows"></tbody>
+            </table>
+          </div>
+          <p id="console-empty" class="empty-state" hidden>No sessions match these filters.</p>
+        </div>
+        <section class="console-pane" aria-label="Selected session">
+          <div class="console-pane-toolbar">
+            <span id="console-selection-status" aria-live="polite">Select a session</span>
+            <button id="console-pin-selected" class="button button-secondary" type="button" aria-pressed="false" disabled>Pin session</button>
+            <label class="console-follow-label"><input id="console-follow" type="checkbox"> Follow live</label>
+            <button id="console-update" class="button button-secondary" type="button" hidden>Show latest</button>
+            <button id="console-copy-link" class="button button-secondary" type="button">Copy session link</button>
+            <div id="console-read-boundary" class="console-read-boundary" role="group" aria-label="Unread response controls">
+              <span id="console-read-status" class="console-read-status" role="status" aria-live="polite">Select a session to check retained unread responses.</span>
+              <button id="console-next-unread" class="button button-secondary" type="button" disabled>Next unread</button>
+              <button id="console-mark-response-read" class="button button-secondary" type="button" disabled>Mark displayed response read</button>
+              <span class="console-read-guidance">Opening or viewing output never marks it read.</span>
+              <span id="console-read-feedback" class="console-read-feedback" role="status" aria-live="polite" hidden></span>
+            </div>
+          </div>
+          <div id="console-detail" class="console-detail">
+            <p class="console-placeholder">Select a session to inspect its latest response and conversation history.</p>
+          </div>
+          <div class="console-history-section">
+            <ol id="console-history" class="console-history" aria-label="Earlier responses"></ol>
+            <button id="console-history-more" class="button button-secondary" type="button">Load older responses</button>
+            <p id="console-history-status" class="console-history-status" role="status" aria-live="polite"></p>
+          </div>
+        </section>
+      </div>
+      <details id="output-comparison" class="output-comparison">
+        <summary>Compare outputs <span class="comparison-hint">Two frozen responses · read-only</span></summary>
+        <p id="comparison-selection" class="comparison-selection" role="status">Select a session or open an exact response from Search outputs, then set either side.</p>
+        <div class="comparison-grid">
+          <section id="comparison-a" class="comparison-slot" aria-labelledby="comparison-a-title">
+            <div class="comparison-toolbar">
+              <h3 id="comparison-a-title">A</h3>
+              <button class="button button-secondary" type="button" data-comparison-set="a" disabled>Set A from selection</button>
+              <button class="button button-secondary" type="button" data-comparison-copy="a" title="Copy A's original Markdown" disabled>Copy A</button>
+              <button class="button button-secondary" type="button" data-comparison-clear="a" disabled>Clear A</button>
+            </div>
+            <p id="comparison-a-source" class="comparison-source">No response selected.</p>
+            <div id="comparison-a-body" class="comparison-body markdown-body" tabindex="0" role="region" aria-label="Comparison A output">Open a retained response, then set A.</div>
+            <p id="comparison-a-status" class="comparison-status" role="status"></p>
+          </section>
+          <section id="comparison-b" class="comparison-slot" aria-labelledby="comparison-b-title">
+            <div class="comparison-toolbar">
+              <h3 id="comparison-b-title">B</h3>
+              <button class="button button-secondary" type="button" data-comparison-set="b" disabled>Set B from selection</button>
+              <button class="button button-secondary" type="button" data-comparison-copy="b" title="Copy B's original Markdown" disabled>Copy B</button>
+              <button class="button button-secondary" type="button" data-comparison-clear="b" disabled>Clear B</button>
+            </div>
+            <p id="comparison-b-source" class="comparison-source">No response selected.</p>
+            <div id="comparison-b-body" class="comparison-body markdown-body" tabindex="0" role="region" aria-label="Comparison B output">Open a retained response, then set B.</div>
+            <p id="comparison-b-status" class="comparison-status" role="status"></p>
+          </section>
+        </div>
+        <p class="comparison-guidance">Snapshots stay fixed across new events and navigation. Replace either side explicitly to compare newer output. Comparison never marks responses read or sends replies; the composer above keeps its own target.</p>
+      </details>
+      <details id="selective-send" class="selective-send">
+        <summary>Send to selected sessions <span class="comparison-hint">Ordinary prompt · separate receipts</span></summary>
+        <p class="selective-guidance">Add targets explicitly, then preview before sending. No batch approvals, recommendation authorization or destructive quick actions are offered. Your text is not semantically screened. Queue acceptance is not delivery or task completion.</p>
+        <button id="selective-add" class="button button-secondary" type="button" disabled>Add current session</button>
+        <ol id="selective-targets" class="selective-targets" aria-label="Explicit prompt targets"></ol>
+        <label class="selective-prompt-label" for="selective-prompt">Ordinary prompt for these targets</label>
+        <textarea id="selective-prompt" class="reply-input" rows="3" maxlength="4000" placeholder="Write one ordinary prompt"></textarea>
+        <p class="selective-guidance">Up to 4,000 characters through the existing broker. This draft, selection and batch receipts are kept only in this page; reload clears them. Accepted replies remain in each session's reply history.</p>
+        <div class="selective-actions">
+          <button id="selective-preview" class="button button-secondary" type="button" disabled>Preview targets and prompt</button>
+          <button id="selective-confirm" class="button button-primary" type="button" hidden>Queue prompt to these targets</button>
+          <button id="selective-edit" class="button button-secondary" type="button" hidden>Back to editing</button>
+          <button id="selective-refresh" class="button button-secondary" type="button" hidden>Refresh receipts</button>
+          <button id="selective-new" class="button button-secondary" type="button" hidden>Clear receipts and start new batch</button>
+        </div>
+        <p id="selective-status" class="selective-status" role="status">No targets selected. Filters never add targets.</p>
+        <p class="selective-guidance">Receipt states are last observed, not a live guarantee. Pending receipts refresh for one minute and on delivery events; use Refresh receipts to check again. This never resends the prompt.</p>
+      </details>
+    </section>
+    <section id="sessions-view" class="view" role="tabpanel" aria-labelledby="sessions-tab" tabindex="0" hidden>
       <div id="sessions" class="card-grid" aria-live="polite"></div>
       <p id="sessions-empty" class="empty-state" hidden>No sessions match these filters.</p>
     </section>
@@ -70,6 +275,45 @@
       <button id="timeline-more" class="button button-secondary timeline-more" type="button" hidden>Load older responses</button>
     </section>
   </main>
+  <dialog id="command-dialog" class="navigation-dialog" aria-labelledby="command-title">
+    <form method="dialog"><button class="dialog-close" aria-label="Close commands">×</button></form>
+    <h2 id="command-title">Commands</h2>
+    <p id="command-context" class="muted"></p>
+    <label for="command-search">Find an action</label>
+    <input id="command-search" type="search" autocomplete="off" placeholder="Search commands">
+    <p id="command-status" class="muted" role="status"></p>
+    <div id="command-results" class="command-results" aria-label="Available commands"></div>
+  </dialog>
+  <dialog id="shortcut-dialog" class="navigation-dialog" aria-labelledby="shortcut-title">
+    <form method="dialog"><button class="dialog-close" aria-label="Close keyboard shortcuts">×</button></form>
+    <h2 id="shortcut-title">Keyboard shortcuts</h2>
+    <dl class="shortcut-list">
+      <div><dt><kbd>/</kbd></dt><dd>Focus session search</dd></div>
+      <div><dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Next / previous console row</dd></div>
+      <div><dt><kbd>↓</kbd> / <kbd>↑</kbd></dt><dd>Next / previous row when a row is focused</dd></div>
+      <div><dt><kbd>Home</kbd> / <kbd>End</kbd></dt><dd>First / last row when a row is focused</dd></div>
+      <div><dt><kbd>r</kbd></dt><dd>Focus the selected session's available reply composer</dd></div>
+      <div><dt><kbd>?</kbd></dt><dd>Open this reference</dd></div>
+      <div><dt><kbd>Ctrl/Cmd K</kbd></dt><dd>Open commands</dd></div>
+      <div><dt><kbd>Esc</kbd></dt><dd>Close a dialog and restore focus</dd></div>
+    </dl>
+    <p class="muted">Global shortcuts are off while editing, choosing an option, composing with an IME, or using a dialog. Commands never send a reply or authorize an action.</p>
+    <p class="muted">In Commands: type to filter, use arrows to focus an available action, and Enter to run it. Every action is also available by touch.</p>
+  </dialog>
+  <dialog id="ideas-dialog" class="navigation-dialog ideas-dialog" aria-labelledby="ideas-title">
+    <form method="dialog"><button class="dialog-close" aria-label="Close ideas">×</button></form>
+    <h2 id="ideas-title">Ideas</h2>
+    <p class="muted">Ideas wait here until you send or archive them. Nothing is sent until you pick a session and press Send.</p>
+    <form id="idea-form" class="idea-form">
+      <label for="idea-text">New idea</label>
+      <textarea id="idea-text" rows="3"></textarea>
+      <div class="idea-actions"><button id="idea-add" class="button button-primary" type="submit">Add idea</button></div>
+    </form>
+    <div class="ideas-toolbar"><button id="ideas-show-all" class="button button-secondary" type="button" aria-pressed="false">Show sent and archived</button></div>
+    <p id="ideas-status" class="muted" role="status"></p>
+    <ul id="ideas-list" class="ideas-list"></ul>
+    <p id="ideas-empty" class="empty-state" hidden></p>
+  </dialog>
   <dialog id="notifications-dialog" class="notification-dialog">
     <form method="dialog"><button class="dialog-close" aria-label="Close">×</button></form>
     <h2>Desktop notifications</h2>

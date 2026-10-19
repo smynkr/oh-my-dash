@@ -74,7 +74,7 @@ function shellQuote(value: string): string { return `'${value.replaceAll("'", "'
 function dashGroups(options: Pick<Args, "url" | "host" | "replyBase" | "replyScript" | "noReply" |
   "remoteQuestions" | "questionTimeoutMs" | "questionHelper" | "python3">) {
   const { url, host } = options;
-  const command = `curl -s -m 3 -o /dev/null -X POST -H 'Content-Type: application/json' -H 'X-Dash-Host: ${host}' -H "X-Dash-Entrypoint: \${CLAUDE_CODE_ENTRYPOINT:-}" -H "X-Dash-Attended: \${CLAUDE_CODE_SESSION_ATTENDED:-}" -H "X-Dash-Kind: \${CLAUDE_CODE_SESSION_KIND:-}" --data-binary @- ${shellQuote(url)} >/dev/null 2>&1; true # dash-hook`;
+  const command = `curl -s -m 3 -o /dev/null -X POST -H 'Content-Type: application/json' -H 'X-Dash-Host: ${host}' -H "X-Dash-Account-Alias: \${DASH_ACCOUNT_ALIAS:-}" -H "X-Dash-Entrypoint: \${CLAUDE_CODE_ENTRYPOINT:-}" -H "X-Dash-Attended: \${CLAUDE_CODE_SESSION_ATTENDED:-}" -H "X-Dash-Kind: \${CLAUDE_CODE_SESSION_KIND:-}" --data-binary @- ${shellQuote(url)} >/dev/null 2>&1; true # dash-hook`;
   return EVENTS.flatMap(([event, matcher]) => {
     const groups: Array<readonly [string, unknown]> = [[event, { ...(matcher ? { matcher } : {}), hooks: [{ type: "command", async: true, timeout: 5, command }] }]];
     if (event === "PreToolUse" && options.remoteQuestions) {
