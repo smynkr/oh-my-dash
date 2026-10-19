@@ -3495,3 +3495,303 @@ describe("Telegram server routes", () => {
     }
   });
 });
+
+describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
+  const seedAt = (db: DashDB, name: string, status: "needs_input" | "your_turn" | "working" | "ended", activity: number, display = name) => {
+    const row = db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: name, kind: "question", ts: 1_000_000, text: "Synthetic question", interactive: true });
+    db.sqlite.query("UPDATE sessions SET status=?,needs_reason=?,display_name=?,last_activity=? WHERE key=?")
+      .run(status, status === "needs_input" ? "waiting" : null, display, activity, row.key);
+    return db.getSession(row.key)!;
+  };
+  let cb = 0;
+  const tap = (f: { bot: FakeBot }, data: string, messageId: number, overrides: Record<string, any> = {}) =>
+    f.bot.enqueueUpdate({ callback_query: { id: `cb${++cb}`, from: { id: owner }, data,
+      message: { message_id: messageId, chat: { id: chat, type: "private" } }, ...overrides } });
+  const answers = (bot: FakeBot) => bot.calls.filter(call => call.method === "answerCallbackQuery").map(call => call.body.text as string);
+  const edits = (bot: FakeBot) => bot.calls.filter(call => call.method === "editMessageText").map(call => call.body);
+  const buttons = (send: Record<string, any>) => (send.reply_markup?.inline_keyboard ?? []).flat() as { text: string; callback_data: string }[];
+  const MARKER = "zebra-marker-words";
+
+  test("plain DM text stores a draft, sends a text-free picker, and a tap queues a 4 h message that is delivered", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    seedAt(f.db, "working-one", "working", 5);
+    seedAt(f.db, "idle-old", "your_turn", 2);
+    seedAt(f.db, "idle-new", "your_turn", 4);
+    seedAt(f.db, "needs", "needs_input", 1);
+    seedAt(f.db, "gone", "ended", 9);
+    f.bot.enqueue(message(`${MARKER} please`, { message_id: 50 }));
+    await apiSettled(() => f.bot.sent.length === 1);
+    const picker = f.bot.sent[0]!;
+    expect(picker.text).toBe("Send to which session?");
+    expect(picker.reply_parameters).toEqual({ message_id: 50, allow_sending_without_reply: true });
+    expect(JSON.stringify(picker)).not.toContain(MARKER);
+    expect(buttons(picker).map(b => b.text)).toEqual(["🟡 needs · synthetic-host", "🟢 idle-new · synthetic-host", "🟢 idle-old · synthetic-host",
+      "⚙️ working-one · synthetic-host", "💡 Save to Ideas", "✖️ Cancel"]);
+    expect(buttons(picker).map(b => b.callback_data)).toEqual(["c:1:0:0", "c:1:0:1", "c:1:0:2", "c:1:0:3", "c:1:0:i", "c:1:0:x"]);
+    const draft = f.db.getDraft(1)!;
+    expect(draft).toMatchObject({ state: "pending", pickerMessageId: 1, sourceMessageId: 50, text: `${MARKER} please` });
+    expect(draft.expiresAt - draft.createdAt).toBe(30 * 60_000);
+    tap(f, "c:1:0:1", 1);
+    await eventually(() => f.db.queuedReplies().length === 1);
+    const item = f.db.queuedReplies()[0]!;
+    expect(item).toMatchObject({ kind: "message", source: "telegram", sessionKey: draft.targets[1] });
+    expect(item.expiresAt - item.createdAt).toBe(4 * 3_600_000);
+    await apiSettled(() => edits(f.bot).length === 1);
+    expect(edits(f.bot)[0]).toMatchObject({ message_id: 1, text: "📨 Queued for <b>idle-new</b> · synthetic-host" });
+    expect(edits(f.bot)[0]!.reply_markup).toBeUndefined();
+    expect(f.db.getDraft(1)).toMatchObject({ state: "sent", replyId: item.id });
+    const delivered = await f.replies!.waitClaude(item.sessionKey, "waiteraaaaaaaaaa", 1, 100);
+    expect(delivered.status).toBe(200);
+    expect(JSON.stringify(delivered)).toContain("The owner sent a new message from Telegram (not an answer to your last turn)");
+    await apiSettled(() => edits(f.bot).length === 2);
+    expect(edits(f.bot)[1]!.text).toBe("✅ Delivered to <b>idle-new</b> · synthetic-host");
+    expect(JSON.stringify(f.bot.calls.filter(call => call.method !== "getUpdates" && call.method !== "editMessageText" &&
+      call.method !== "sendMessage"))).not.toContain(MARKER);
+  });
+
+  test("a replayed or concurrent tap queues exactly one message; another chat's or message's tap is refused", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    seedAt(f.db, "alpha", "your_turn", 2);
+    f.bot.enqueue(message("hello"));
+    await apiSettled(() => f.bot.sent.length === 1);
+    tap(f, "c:1:0:0", 7);
+    tap(f, "c:1:0:0", 1, { message: { message_id: 1, chat: { id: chat + 1, type: "private" } } });
+    tap(f, "c:1:0:0", 1, { from: { id: owner + 1 } });
+    await apiSettled(() => answers(f.bot).length === 1);
+    tap(f, "c:1:0:0", 1); tap(f, "c:1:0:0", 1);
+    await apiSettled(() => answers(f.bot).length === 3);
+    expect(f.db.queuedReplies()).toHaveLength(1);
+    expect(answers(f.bot)).toEqual(["Expired", "Queued for alpha", "Already handled"]);
+  });
+
+  test("a tap on a session that ended after the picker gives a visible refusal and the draft stays usable", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    const a = seedAt(f.db, "alpha", "your_turn", 3);
+    seedAt(f.db, "beta", "your_turn", 2);
+    f.bot.enqueue(message("hello"));
+    await apiSettled(() => f.bot.sent.length === 1);
+    f.db.applyEvent({ host: a.host, harness: a.harness, sessionId: a.sessionId, kind: "session_end", ts: f.clock.now, interactive: true });
+    tap(f, "c:1:0:0", 1);
+    await apiSettled(() => answers(f.bot).length === 1 && edits(f.bot).length === 1);
+    expect(answers(f.bot)[0]).toBe("That session has ended.");
+    expect(f.db.getDraft(1)).toMatchObject({ state: "pending", replyId: null });
+    expect(buttons(edits(f.bot)[0]!).map(b => b.text)).toEqual(["🟢 beta · synthetic-host", "💡 Save to Ideas", "✖️ Cancel"]);
+    expect(buttons(edits(f.bot)[0]!).map(b => b.callback_data)).toEqual(["c:1:1:0", "c:1:1:i", "c:1:1:x"]);
+    // Index 0 now maps to beta: a tap from the old keyboard must not send to it.
+    tap(f, "c:1:0:0", 1);
+    await apiSettled(() => answers(f.bot).length === 2);
+    expect(answers(f.bot)[1]).toBe("Out of date: use the updated picker");
+    expect(f.db.queuedReplies()).toHaveLength(0);
+    expect(f.db.getDraft(1)).toMatchObject({ state: "pending", rev: 1 });
+    tap(f, "c:1:1:0", 1);
+    await eventually(() => f.db.queuedReplies().length === 1);
+    expect(f.db.getSession(f.db.queuedReplies()[0]!.sessionKey)?.displayName).toBe("beta");
+  });
+
+  test("picker caps rows at 8 with an overflow line, clips labels to 48 code points, and shows a no-deliverable line", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    f.bot.enqueue(message("first"));
+    await apiSettled(() => f.bot.sent.length === 1);
+    expect(f.bot.sent[0]!.text).toBe("Send to which session?\nNo session can take a message right now.");
+    expect(buttons(f.bot.sent[0]!).map(b => b.callback_data)).toEqual(["c:1:0:i", "c:1:0:x"]);
+    for (let i = 0; i < 10; i++) seedAt(f.db, `s${i}`, "your_turn", 10 + i, i === 9 ? "x".repeat(80) : `s${i}`);
+    f.bot.enqueue(message("second", { message_id: 11 }));
+    await apiSettled(() => f.bot.sent.length === 2);
+    expect(f.bot.sent[1]!.text).toBe("Send to which session?\n2 more: use /to &lt;name&gt; &lt;text&gt;");
+    const labels = buttons(f.bot.sent[1]!).map(b => b.text);
+    expect(labels).toHaveLength(10);
+    expect([...labels[0]!].length).toBe(48);
+    expect(f.db.getDraft(2)!.targets).toHaveLength(8);
+  });
+
+  test("Ideas and Cancel taps, and stale taps after the sweep", async () => {
+    let sweep!: () => void;
+    const f = await pairedFixture({ repliesEnabled: true, setTimer: fn => { sweep = fn; return () => {}; } });
+    seedAt(f.db, "alpha", "your_turn", 2);
+    f.bot.enqueue(message("keep this"));
+    f.bot.enqueue(message("drop this", { message_id: 11 }));
+    f.bot.enqueue(message("forget this", { message_id: 12 }));
+    await apiSettled(() => f.bot.sent.length === 3);
+    tap(f, "c:1:0:i", 1); tap(f, "c:2:0:x", 2);
+    await apiSettled(() => edits(f.bot).length === 2 && answers(f.bot).length === 2);
+    expect(f.db.getIdea(1)).toMatchObject({ text: "keep this", origin: "owner", state: "open", source: "telegram" });
+    expect(f.db.getDraft(1)!.state).toBe("idea");
+    expect(f.db.getDraft(2)!.state).toBe("cancelled");
+    expect(edits(f.bot).map(e => e.text)).toEqual(["💡 Saved to Ideas (#1).", "✖️ Cancelled."]);
+    f.clock.now += 30 * 60_000;
+    sweep();
+    await apiSettled(() => edits(f.bot).length === 3);
+    expect(edits(f.bot)[2]).toMatchObject({ message_id: 3, text: "⌛ No session picked in 30 min: saved to Ideas (#2)." });
+    expect(f.db.getIdea(2)).toMatchObject({ text: "forget this", origin: "draft_expired" });
+    expect(f.db.getDraft(3)!.state).toBe("idea");
+    tap(f, "c:3:0:0", 3);
+    await apiSettled(() => answers(f.bot).length === 3);
+    expect(answers(f.bot)[2]).toBe("Expired: saved to Ideas");
+    expect(f.db.listIdeas("all")).toHaveLength(2);
+  });
+
+  test("a send claim stranded before submit recorded a reply is swept to Ideas with its text; a submit throw reopens the draft", async () => {
+    let sweep!: () => void;
+    const f = await pairedFixture({ repliesEnabled: true, setTimer: fn => { sweep = fn; return () => {}; } });
+    seedAt(f.db, "alpha", "your_turn", 2);
+    f.bot.enqueue(message("crash between claim and submit"));
+    f.bot.enqueue(message("submit throws", { message_id: 11 }));
+    await apiSettled(() => f.bot.sent.length === 2);
+    expect(f.db.transitionDraft(1, "pending", "sent")).toBe(true);
+    const submit = f.replies!.submit;
+    f.replies!.submit = () => { throw new Error("synthetic submit failure"); };
+    tap(f, "c:2:0:0", 2);
+    await eventually(() => f.db.getDraft(2)?.state === "pending");
+    f.replies!.submit = submit;
+    expect(f.db.getDraft(2)).toMatchObject({ state: "pending", replyId: null, text: "submit throws" });
+    f.clock.now += 30 * 60_000;
+    sweep();
+    expect(f.db.getDraft(1)).toMatchObject({ state: "idea", text: "" });
+    expect(f.db.listIdeas("all").map(idea => [idea.text, idea.origin])).toEqual(
+      expect.arrayContaining([["crash between claim and submit", "draft_expired"], ["submit throws", "draft_expired"]]));
+    expect(f.db.queuedReplies()).toHaveLength(0);
+  });
+
+  test("/to queues directly on exact, unique prefix and space-to-dash matches", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    seedAt(f.db, "a", "your_turn", 3, "invest-5a");
+    seedAt(f.db, "b", "your_turn", 2, "Dash Board");
+    seedAt(f.db, "c", "working", 1, "invest-5ab");
+    f.bot.enqueue(message("/to invest-5a exact text"));
+    f.bot.enqueue(message("/to dash-b prefix text", { message_id: 11 }));
+    f.bot.enqueue(message("/to DASH_BOARD variant text", { message_id: 12 }));
+    await eventually(() => f.db.queuedReplies().length === 3);
+    const rows = f.db.queuedReplies().map(r => [f.db.getSession(r.sessionKey)!.displayName, r.kind, r.text]);
+    expect(rows).toEqual([["invest-5a", "message", "exact text"], ["Dash Board", "message", "prefix text"], ["Dash Board", "message", "variant text"]]);
+    await apiSettled(() => f.bot.sent.length === 3);
+    expect(f.bot.sent[0]!.text).toBe("📨 Queued for <b>invest-5a</b> · synthetic-host");
+  });
+
+  test("/to shows a picker of the matches, the full picker, the ended refusal, and usage", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    seedAt(f.db, "a", "your_turn", 3, "invest-1");
+    seedAt(f.db, "b", "your_turn", 2, "invest-2");
+    seedAt(f.db, "c", "working", 1, "other");
+    seedAt(f.db, "d", "ended", 4, "old-5a");
+    f.bot.enqueue(message("/to invest hi"));
+    await apiSettled(() => f.bot.sent.length === 1);
+    expect(f.bot.sent[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
+    expect(buttons(f.bot.sent[0]!)).toHaveLength(4);
+    f.bot.enqueue(message("/to nobody hi", { message_id: 11 }));
+    await apiSettled(() => f.bot.sent.length === 2);
+    expect(f.bot.sent[1]!.text).toBe("No session matches &quot;nobody&quot;.");
+    expect(buttons(f.bot.sent[1]!)).toHaveLength(5);
+    f.bot.enqueue(message("/to old-5a hi", { message_id: 12 }));
+    f.bot.enqueue(message("/to invest-1", { message_id: 13 }));
+    await apiSettled(() => f.bot.sent.length === 4);
+    expect(f.bot.sent[2]!.text).toBe("<b>old-5a</b> has ended.");
+    expect(f.bot.sent[3]!.text).toBe("Use /to &lt;session-name&gt; your text");
+    expect(f.db.queuedReplies()).toHaveLength(0);
+  });
+
+  test("/to@bot works in a bound group, /to@otherbot is ignored, and a non-owner is ignored in DM and group", async () => {
+    const f = await topicFixture({ repliesEnabled: true });
+    seedAt(f.db, "a", "your_turn", 3, "alpha");
+    f.bot.enqueue(groupMessage("/to@otherbot alpha nope", 42));
+    f.bot.enqueue(groupMessage("/to@dash_test_bot alpha nope", 42, { from: { id: owner + 1 } }));
+    f.bot.enqueue(message("plain from stranger", { from: { id: owner + 1 } }));
+    f.bot.enqueue(groupMessage("/to@dash_test_bot alpha group text", 42, { message_id: 30 }));
+    await eventually(() => f.db.queuedReplies().length === 1);
+    await apiSettled(() => f.bot.sent.length === 1);
+    expect(f.db.queuedReplies()[0]).toMatchObject({ kind: "message", text: "group text" });
+    expect(f.bot.sent[0]).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
+    expect(f.db.getDraft(1)).toBeUndefined();
+  });
+
+  test("/idea, /ideas with Send and Archive, and a sent idea returning to open after its message expires", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    seedAt(f.db, "alpha", "your_turn", 2);
+    f.bot.enqueue(message("/idea first idea"));
+    f.bot.enqueue(message("/idea second idea", { message_id: 11 }));
+    await apiSettled(() => f.bot.sent.length === 2);
+    expect(f.bot.sent.map(s => s.text)).toEqual(["💡 Saved to Ideas (#1).", "💡 Saved to Ideas (#2)."]);
+    f.bot.enqueue(message("/ideas", { message_id: 12 }));
+    await apiSettled(() => f.bot.sent.length === 3);
+    expect(f.bot.sent[2]!.text).toBe("<b>Ideas</b>\n#2 · 0m · second idea\n#1 · 0m · first idea");
+    expect(buttons(f.bot.sent[2]!).map(b => [b.text, b.callback_data])).toEqual([["Send #2…", "i:2:s"], ["Archive #2", "i:2:a"], ["Send #1…", "i:1:s"], ["Archive #1", "i:1:a"]]);
+    tap(f, "i:2:a", 3); tap(f, "i:2:a", 3);
+    await apiSettled(() => answers(f.bot).length === 2);
+    expect(answers(f.bot)).toEqual(["Archived #2", "Already archived"]);
+    tap(f, "i:1:s", 3);
+    await apiSettled(() => f.bot.sent.length === 4);
+    expect(f.db.getDraft(1)).toMatchObject({ ideaId: 1, text: "first idea" });
+    tap(f, "c:1:0:0", 4);
+    await eventually(() => f.db.queuedReplies().length === 1);
+    expect(f.db.getIdea(1)!.state).toBe("sent");
+    f.clock.now += 4 * 3_600_000 + 1;
+    f.replies!.sweep();
+    expect(f.db.getIdea(1)!.state).toBe("open");
+    await apiSettled(() => edits(f.bot).some(e => e.text.includes("saved to Ideas (#1)")));
+    expect(edits(f.bot).at(-1)!.text).toBe("⌛ Not delivered to <b>alpha</b>: it wasn't ready within 240 min. · saved to Ideas (#1)");
+  });
+
+  test("an undelivered message becomes an idea; a draft from an idea just expires; an owner cancel creates no idea", async () => {
+    let sweep!: () => void;
+    const f = await pairedFixture({ repliesEnabled: true, setTimer: fn => { sweep = fn; return () => {}; } });
+    const a = seedAt(f.db, "alpha", "your_turn", 2);
+    f.bot.enqueue(message("/to alpha to be ended"));
+    await eventually(() => f.db.queuedReplies().length === 1);
+    await apiSettled(() => f.bot.sent.length === 1 && !!f.db.queuedReplies()[0]!.tgMsgId);
+    f.db.applyEvent({ host: a.host, harness: a.harness, sessionId: a.sessionId, kind: "session_end", ts: f.clock.now, interactive: true });
+    f.replies!.observe(f.db.getSession(a.key)!);
+    expect(f.db.getIdea(1)).toMatchObject({ origin: "undelivered", text: "to be ended", state: "open" });
+    await apiSettled(() => edits(f.bot).length === 1);
+    expect(edits(f.bot)[0]!.text).toBe("✖️ Not delivered: <b>alpha</b> ended. · saved to Ideas (#1)");
+    seedAt(f.db, "beta", "your_turn", 3);
+    f.bot.enqueue(message("/to beta owner cancels", { message_id: 11 }));
+    await eventually(() => f.db.queuedReplies().length === 1);
+    await apiSettled(() => f.bot.sent.length === 2);
+    f.replies!.cancelAll();
+    expect(f.db.listIdeas("all")).toHaveLength(1);
+    tap(f, "i:1:s", 99);
+    await apiSettled(() => !!f.db.getDraft(1)?.pickerMessageId);
+    expect(f.db.getDraft(1)!.ideaId).toBe(1);
+    f.clock.now += 30 * 60_000;
+    sweep();
+    await apiSettled(() => edits(f.bot).some(e => e.text === "⌛ Expired."));
+    expect(f.db.getDraft(1)!.state).toBe("expired");
+    expect(f.db.listIdeas("all")).toHaveLength(1);
+    expect(f.db.getIdea(1)!.state).toBe("open");
+  });
+
+  test("non-text and over-4000 DMs are refused visibly with no draft; /help and /status list the new commands", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    f.bot.enqueue(message("", { photo: [{ file_id: "x" }] }));
+    f.bot.enqueue(message("x".repeat(4001), { message_id: 11 }));
+    f.bot.enqueue(message("/to alpha " + "y".repeat(4001), { message_id: 12 }));
+    await apiSettled(() => f.bot.sent.length === 3);
+    expect(f.bot.sent[0]!.text).toBe("Only text can be sent to a session.");
+    expect(f.bot.sent[1]!.text).toBe("That message is over 4000 characters. Shorten it and send again.");
+    expect(f.bot.sent[2]!.text).toBe(f.bot.sent[1]!.text);
+    expect(f.db.getDraft(1)).toBeUndefined();
+    f.bot.enqueue(message("/help", { message_id: 13 }));
+    f.bot.enqueue(message("/status", { message_id: 14 }));
+    await apiSettled(() => f.bot.sent.length === 5);
+    expect(f.bot.sent[3]!.text).toContain("<b>New messages</b>\nSend any text here to pick a session\n/to name text");
+    expect(f.bot.sent[3]!.text).toContain("/idea text");
+    expect(f.bot.sent[3]!.text).toContain("/ideas");
+    expect(f.bot.sent[4]!.text).toContain("/to name text");
+  });
+
+  test("with replies off there is no picker, /to, /idea or /ideas", async () => {
+    const f = await pairedFixture();
+    f.bot.enqueue(message("plain text"));
+    f.bot.enqueue(message("/to alpha hi", { message_id: 11 }));
+    f.bot.enqueue(message("/idea hi", { message_id: 12 }));
+    f.bot.enqueue(message("/ideas", { message_id: 13 }));
+    f.bot.enqueue(message("/help", { message_id: 14 }));
+    await apiSettled(() => f.bot.sent.length === 5);
+    for (const sent of f.bot.sent.slice(0, 4)) {
+      expect(sent.text).toBe("Reply to an alert to answer it, or use /status then /r N your text.");
+      expect(sent.reply_markup).toBeUndefined();
+    }
+    expect(f.bot.sent[4]!.text).not.toContain("New messages");
+    expect(f.db.getDraft(1)).toBeUndefined();
+    expect(f.db.listIdeas("all")).toHaveLength(0);
+  });
+});

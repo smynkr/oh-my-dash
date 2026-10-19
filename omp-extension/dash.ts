@@ -262,6 +262,7 @@ function install(pi: Pi): void {
         kind,
         cwd: typeof ctx?.cwd === "string" ? ctx.cwd : undefined,
         title: typeof pi.getSessionName?.() === "string" ? pi.getSessionName() : undefined,
+        accountAlias: process.env.DASH_ACCOUNT_ALIAS,
         text,
         detail,
         questionIdentity,

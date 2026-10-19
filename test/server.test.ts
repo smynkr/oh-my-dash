@@ -2,11 +2,35 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DashDB } from "../src/db.ts";
+import { DashDB, type ResponseDTO, type ResponsePage, type SearchPage, type SearchResult } from "../src/db.ts";
 import { createDashServer } from "../src/server.ts";
 import { localHost } from "../src/normalize.ts";
+import { SseReader } from "./sse.ts";
 
 type App = ReturnType<typeof createDashServer>;
+type SourceInventoryForTest = {
+  generatedAt: number;
+  staleAfterMs: number;
+  unlabelledPeerEntries: number;
+  sources: {
+    host: string;
+    configured: boolean;
+    status: "reporting" | "stale" | "unreported" | "unknown";
+    lastReportAt: number | null;
+    lastHeartbeatAt: number | null;
+    accounts: {
+      accountAlias: string | null;
+      sessions: {
+        key: string;
+        displayName: string;
+        harness: "claude" | "omp";
+        status: string;
+        lastActivity: number;
+        interactive: boolean;
+      }[];
+    }[];
+  }[];
+};
 let app: App;
 let base: string;
 let tailnetBase: string;
@@ -45,10 +69,10 @@ afterEach(() => {
     if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }
 });
-function startTailnet(now?: () => number) {
+function startTailnet(now?: () => number, peers = " , 192.0.2.10 , ") {
   app.close();
   process.env.DASH_ALLOWED_HOSTS = " DASH.TAILNET.TEST , ";
-  process.env.DASH_ALLOWED_PEERS = " , 192.0.2.10 , ";
+  process.env.DASH_ALLOWED_PEERS = peers;
   app = createDashServer({ port: 0, tailnetPort: 0, dataPath: ":memory:", backfill: false, liveness: false, now });
   base = `http://127.0.0.1:${app.server.port}`;
   tailnetBase = `http://127.0.0.1:${app.tailnetServer!.port}`;
@@ -158,6 +182,59 @@ describe("sessions and timeline API", () => {
     expect(second.map((r: any) => r.text)).toEqual(["synthetic response 2", "synthetic response 1"]);
   });
 
+  test("session response history pages beyond the three-response session DTO without marking rows seen", async () => {
+    const event = { host: "synthetic-host", harness: "claude" as const, sessionId, kind: "response" as const,
+      interactive: true, ts: 1_700_000_000_000 };
+    for (let index = 1; index <= 7; index++) {
+      app.db.applyEvent({ ...event, text: `synthetic history response ${index}` });
+    }
+    app.db.applyEvent({ ...event, sessionId: "synthetic-other-session", text: "response from another session" });
+
+    const route = `/api/sessions/${encodeURIComponent(key)}/responses`;
+    const all: ResponsePage["responses"] = [];
+    let before: number | undefined, hasMore = true;
+    while (hasMore) {
+      const page = await (await fetch(`${base}${route}?limit=2${before === undefined ? "" : `&before=${before}`}`)).json() as ResponsePage;
+      expect(page.responses.length).toBeLessThanOrEqual(2);
+      all.push(...page.responses);
+      hasMore = page.hasMore;
+      if (hasMore) before = page.responses.at(-1).ts;
+    }
+    expect(all.map(response => response.text)).toEqual(Array.from({ length: 7 }, (_, index) =>
+      `synthetic history response ${7 - index}`));
+    expect(all.every(response => response.sessionKey === key)).toBe(true);
+    expect(new Set(all.map(response => response.ts)).size).toBe(7);
+    expect(all.every(response => response.seen === false)).toBe(true);
+    expect(app.db.getSession(key)?.unreadCount).toBe(7);
+
+    const defaultPage = await (await fetch(`${base}${route}`)).json() as ResponsePage;
+    expect(defaultPage.responses).toHaveLength(7);
+    expect(defaultPage.hasMore).toBe(false);
+  });
+
+  test("session response history rejects invalid cursors and pagination but reads headless and ended sessions", async () => {
+    const route = `/api/sessions/${encodeURIComponent(key)}/responses`;
+    for (const query of ["before=not-a-timestamp", "before=1.5", "limit=0", "limit=-1", "limit=1.5", "limit=101"]) {
+      const response = await fetch(`${base}${route}?${query}`);
+      expect(response.status).toBe(400);
+    }
+    expect((await fetch(`${base}/api/sessions/${encodeURIComponent("synthetic-host|claude|missing")}/responses`)).status).toBe(404);
+    expect((await fetch(`${base}/api/sessions/%ZZ/responses`)).status).toBe(400);
+
+    app.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "synthetic-headless", kind: "response",
+      ts: 1_700_000_000_100, text: "headless response", interactive: false });
+    const headless = await fetch(`${base}/api/sessions/${encodeURIComponent("synthetic-host|claude|synthetic-headless")}/responses`);
+    expect(headless.status).toBe(200);
+    expect(await headless.json()).toMatchObject({ responses: [{ text: "headless response" }], hasMore: false });
+
+    const endedEvent = { host: "synthetic-host", harness: "claude" as const, sessionId: "synthetic-ended", interactive: true };
+    app.db.applyEvent({ ...endedEvent, kind: "response", ts: 1_700_000_000_200, text: "ended response" });
+    app.db.applyEvent({ ...endedEvent, kind: "session_end", ts: 1_700_000_000_201 });
+    const ended = await fetch(`${base}/api/sessions/${encodeURIComponent("synthetic-host|claude|synthetic-ended")}/responses`);
+    expect(ended.status).toBe(200);
+    expect(await ended.json()).toMatchObject({ responses: [{ text: "ended response" }], hasMore: false });
+  });
+
   test("timeline hides headless but includes ended sessions by default", async () => {
     const headlessHeaders = { "Content-Type": "application/json", "X-Dash-Host": "synthetic-host", "X-Dash-Entrypoint": "sdk-py", "X-Dash-Attended": "0" };
     await fetch(`${base}/ingest/claude`, { method: "POST", headers: headlessHeaders, body: JSON.stringify({ ...JSON.parse(payload("Stop", { last_assistant_message: "synthetic headless response" })), session_id: "synthetic-headless" }) });
@@ -174,6 +251,362 @@ describe("sessions and timeline API", () => {
     expect((await getJson("/api/sessions?ended=1")).sessions).toHaveLength(1);
   });
 });
+describe("output search API", () => {
+  function addResponse(sessionId: string, text: string, options: {
+    host?: string; harness?: "claude" | "omp"; cwd?: string; title?: string; accountAlias?: string;
+    interactive?: boolean; ts?: number;
+  } = {}) {
+    const session = app.db.applyEvent({
+      host: options.host ?? "search-host", harness: options.harness ?? "claude", sessionId, kind: "response",
+      ts: options.ts ?? 1_700_000_000_000, text, interactive: options.interactive ?? true,
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.title === undefined ? {} : { title: options.title }),
+      ...(options.accountAlias === undefined ? {} : { accountAlias: options.accountAlias }),
+    });
+    const response = session.lastResponses[0];
+    if (!response) throw new Error("response fixture was not retained");
+    return { key: session.key, id: response.id, ts: response.ts };
+  }
+
+  test("search treats punctuation literally and returns only bounded contextual text", async () => {
+    const first = addResponse("literal-one",
+      `${"context ".repeat(100)}Needle%_ <img src=x onerror=1>${" ending".repeat(100)}`);
+    addResponse("literal-two", `${"context ".repeat(100)}NeedleXX without HTML`);
+    const params = new URLSearchParams({ q: "  needle%_  " });
+    const { results, nextCursor } = await getJson(`/api/search?${params}`) as SearchPage;
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ key: first.key, responseId: first.id, match: "response" });
+    expect(Object.keys(results[0]).sort()).toEqual([
+      "accountAlias", "displayName", "excerpt", "harness", "host", "key", "match", "project", "responseId", "ts",
+    ]);
+    expect(results[0].excerpt.length).toBeLessThanOrEqual(400);
+    expect(results[0].excerpt).toContain("Needle%_");
+    expect(results[0].excerpt).toContain("<img src=x onerror=1>");
+    expect(nextCursor).toBeNull();
+    const html = await getJson(`/api/search?${new URLSearchParams({ q: "<img src=x onerror=1>" })}`) as SearchPage;
+    expect(html.results.map(result => result.responseId)).toEqual([first.id]);
+    addResponse("unicode-excerpt", `${"🌙".repeat(300)}needle unicode`);
+    const unicode = await getJson(`/api/search?${new URLSearchParams({ q: "needle unicode" })}`) as SearchPage;
+    expect(unicode.results[0].excerpt.length).toBeLessThanOrEqual(400);
+    expect(unicode.results[0].excerpt).toContain("needle unicode");
+  });
+
+  test("identity-only excerpts retain the matching field and phrase even with an output or long path", async () => {
+    const cwd = `/work/${"folder/".repeat(100)}needle-path/${"end/".repeat(100)}`;
+    const retained = addResponse("identity-with-output", "Unrelated retained output", { cwd, title: "Visible title" });
+    const empty = app.db.applyEvent({
+      host: "search-host", harness: "omp", sessionId: "identity-without-output", kind: "prompt",
+      ts: 1_700_000_000_100, text: "Unrelated prompt", cwd, title: "Another title", interactive: true,
+    });
+    const page = await getJson(`/api/search?${new URLSearchParams({ q: "NEEDLE-PATH" })}`) as SearchPage;
+    expect(page.results.map(result => [result.key, result.responseId, result.match])).toEqual([
+      [empty.key, null, "identity"], [retained.key, retained.id, "identity"],
+    ]);
+    for (const result of page.results) {
+      expect(result.excerpt).toContain("needle-path");
+      expect(result.excerpt.length).toBeLessThanOrEqual(400);
+      expect(result.excerpt).not.toContain("Unrelated retained output");
+    }
+    app.db.setSessionIdentity(retained.key, "Renamed session", null);
+    const titleMatch = await getJson(`/api/search?${new URLSearchParams({ q: "Visible title" })}`) as SearchPage;
+    expect(titleMatch.results[0]).toMatchObject({ key: retained.key, displayName: "Renamed session", match: "identity" });
+    expect(titleMatch.results[0].excerpt).toContain("Visible title");
+  });
+
+  test("rejects malformed search controls and treats an empty query as no search", async () => {
+    expect(await getJson("/api/search")).toEqual({ results: [], nextCursor: null });
+    expect(await getJson(`/api/search?${new URLSearchParams({ q: "   " })}`)).toEqual({ results: [], nextCursor: null });
+    const invalid = [
+      "limit=0", "limit=101", "limit=1.5", "harness=codex", "headless=true", "ended=",
+      "cursor=not-a-cursor", "q=x&q=y", "unknown=value",
+    ];
+    for (const query of invalid) expect((await fetch(`${base}/api/search?${query}`)).status).toBe(400);
+    expect((await fetch(`${base}/api/search?${new URLSearchParams({ q: "x".repeat(257) })}`)).status).toBe(400);
+  });
+
+  test("search filters use effective project and account identities, including unassigned values", async () => {
+    enableTopics();
+    app.db.setSetting("projects.rules", JSON.stringify([{ pattern: "^/work/([^/]+)$", project: "project-$1" }]));
+    const owned = addResponse("owned", "scoped phrase", {
+      host: "filter-host", cwd: "/work/alpha", accountAlias: "reported-account",
+    });
+    app.db.setSessionIdentity(owned.key, "Owner label", "owner-account");
+    addResponse("owned", "another retained result", {
+      host: "filter-host", cwd: "/work/alpha", accountAlias: "reported-account",
+    });
+    const unassigned = addResponse("unassigned", "scoped phrase", {
+      host: "filter-host", harness: "omp", cwd: "/",
+    });
+    app.db.setSessionIdentity(unassigned.key, "Clear label", "");
+
+    expect(app.db.getSession(owned.key)?.project).toBe("project-alpha");
+    const ownedSearch = await getJson(`/api/search?${new URLSearchParams({
+      q: "scoped phrase", host: "filter-host", harness: "claude", project: "project-alpha", account: "owner-account",
+    })}`) as SearchPage;
+    expect(ownedSearch.results.map(result => result.key)).toEqual([owned.key]);
+    expect(ownedSearch.results[0]).toMatchObject({ project: "project-alpha", accountAlias: "owner-account" });
+    const unassignedSearch = await getJson(`/api/search?${new URLSearchParams({
+      q: "scoped phrase", project: "", account: "",
+    })}`) as SearchPage;
+    expect(unassignedSearch.results.map(result => result.key)).toEqual([unassigned.key]);
+    expect(unassignedSearch.results[0]).toMatchObject({ project: "", accountAlias: "" });
+    const identitySearch = await getJson(`/api/search?${new URLSearchParams({ q: "project-alpha" })}`) as SearchPage;
+    expect(identitySearch.results.map(result => [result.key, result.match])).toEqual([
+      [owned.key, "identity"], [owned.key, "identity"],
+    ]);
+  });
+
+  test("headless and ended switches include exactly their hidden session classes", async () => {
+    const active = addResponse("visible-active", "visibility phrase");
+    const headless = addResponse("visible-headless", "visibility phrase", { interactive: false });
+    const ended = addResponse("visible-ended", "visibility phrase");
+    app.db.applyEvent({
+      host: "search-host", harness: "claude", sessionId: "visible-ended", kind: "session_end",
+      ts: 1_700_000_000_200, interactive: true,
+    });
+
+    const readKeys = async (params: URLSearchParams) =>
+      (await getJson(`/api/search?${params}`) as SearchPage).results.map(result => result.key).sort();
+    expect(await readKeys(new URLSearchParams({ q: "visibility phrase" }))).toEqual([active.key].sort());
+    expect(await readKeys(new URLSearchParams({ q: "visibility phrase", headless: "1" })))
+      .toEqual([active.key, headless.key].sort());
+    expect(await readKeys(new URLSearchParams({ q: "visibility phrase", ended: "1" })))
+      .toEqual([active.key, ended.key].sort());
+    expect(await readKeys(new URLSearchParams({ q: "visibility phrase", headless: "1", ended: "1" })))
+      .toEqual([active.key, headless.key, ended.key].sort());
+  });
+
+  test("cursor pagination preserves timestamp ties and no-response identity results", async () => {
+    const responses = Array.from({ length: 7 }, (_, index) =>
+      addResponse(`tie-response-${index}`, `shared page phrase ${index}`));
+    app.db.sqlite.query("UPDATE responses SET ts=? WHERE text LIKE ?").run(1_700_000_000_500, "%shared page phrase%");
+    const firstParams = new URLSearchParams({ q: "shared page phrase", limit: "3" });
+    const firstPage = await getJson(`/api/search?${firstParams}`) as SearchPage;
+    expect(firstPage.results.map(result => result.responseId))
+      .toEqual(responses.map(response => response.id).sort((left, right) => right - left).slice(0, 3));
+    const firstCursor = firstPage.nextCursor;
+    if (!firstCursor) throw new Error("expected a continuation cursor");
+    expect((await fetch(`${base}/api/search?${new URLSearchParams({
+      q: "shared page phrase", limit: "4", cursor: firstCursor,
+    })}`)).status).toBe(400);
+    const collected: SearchResult[] = [...firstPage.results];
+    let cursor: string | null = firstCursor;
+    while (cursor) {
+      const page = await getJson(`/api/search?${new URLSearchParams({ q: "shared page phrase", limit: "3", cursor })}`) as SearchPage;
+      collected.push(...page.results);
+      cursor = page.nextCursor;
+    }
+    expect(collected).toHaveLength(responses.length);
+    expect(new Set(collected.map(result => result.responseId)).size).toBe(responses.length);
+    expect(collected.map(result => result.responseId))
+      .toEqual(responses.map(response => response.id).sort((left, right) => right - left));
+
+    const stamp = 1_700_000_000_700;
+    for (let index = 0; index < 4; index++) {
+      app.db.applyEvent({
+        host: "search-host", harness: "claude", sessionId: `identity-tie-${index}`, kind: "session_start",
+        ts: stamp, title: `label phrase ${index}`, cwd: "/", interactive: true,
+      });
+    }
+    const identityFirst = await getJson(`/api/search?${new URLSearchParams({ q: "label phrase", limit: "2" })}`) as SearchPage;
+    expect(identityFirst.results).toHaveLength(2);
+    expect(identityFirst.results.every(result => result.responseId === null)).toBe(true);
+    const identityCursor = identityFirst.nextCursor;
+    if (!identityCursor) throw new Error("expected a continuation cursor");
+    const identitySecond = await getJson(`/api/search?${new URLSearchParams({
+      q: "label phrase", limit: "2", cursor: identityCursor,
+    })}`) as SearchPage;
+    expect([...identityFirst.results, ...identitySecond.results].map(result => result.key))
+      .toEqual(["identity-tie-0", "identity-tie-1", "identity-tie-2", "identity-tie-3"]
+        .map(id => `search-host|claude|${id}`));
+  });
+
+  test("exact response reads are session-scoped and do not change seen state", async () => {
+    const first = addResponse("exact-read", "first captured response");
+    const second = addResponse("exact-read", "second captured response");
+    const other = addResponse("different-session", "other captured response");
+    const path = (key: string, id: number | string) =>
+      `/api/sessions/${encodeURIComponent(key)}/responses/${id}`;
+    const before = app.db.getSession(first.key)!.unreadCount;
+    const response = await getJson(path(first.key, first.id)) as { response: ResponseDTO };
+    expect(response.response).toMatchObject({ id: first.id, sessionKey: first.key, text: "first captured response", seen: false });
+    expect(response.response.id).not.toBe(second.id);
+    expect(app.db.getSession(first.key)?.unreadCount).toBe(before);
+    expect((await fetch(`${base}${path(other.key, first.id)}`)).status).toBe(404);
+    expect((await fetch(`${base}${path(first.key, 9_999_999)}`)).status).toBe(404);
+    for (const id of ["0", "-1", "1.5", "9007199254740992", "not-an-id"]) {
+      expect((await fetch(`${base}${path(first.key, id)}`)).status).toBe(400);
+    }
+    expect((await fetch(`${base}/api/sessions/%ZZ/responses/${first.id}`)).status).toBe(400);
+    app.db.sqlite.query("DELETE FROM responses WHERE id=?").run(first.id);
+    expect((await fetch(`${base}${path(first.key, first.id)}`)).status).toBe(404);
+    app.db.sqlite.query("DELETE FROM sessions WHERE key=?").run(other.key);
+    expect((await fetch(`${base}${path(other.key, other.id)}`)).status).toBe(404);
+  });
+  test("read-position returns the oldest retained unread response without marking history", async () => {
+    const ts = 1_700_000_100_000;
+    const first = addResponse("read-position", "first retained response", { ts });
+    const second = addResponse("read-position", "second retained response", { ts:ts + 1 });
+    const tiedTs = ts + 10;
+    app.db.sqlite.query("UPDATE responses SET ts=? WHERE id IN (?,?)").run(tiedTs, first.id, second.id);
+    const route = `/api/sessions/${encodeURIComponent(first.key)}/read-position`;
+    const position = await getJson(route) as { firstUnread: ResponseDTO | null; unreadCount: number; retainedCount: number };
+    expect(Object.keys(position).sort()).toEqual(["firstUnread", "retainedCount", "unreadCount"]);
+    expect(position).toMatchObject({
+      firstUnread: {
+        id:first.id, sessionKey:first.key, ts:tiedTs, text:"first retained response", seen:false,
+        host:"search-host", harness:"claude", sessionId:"read-position", displayName:"read-position",
+      },
+      unreadCount:2, retainedCount:2,
+    });
+    expect(app.db.getSession(first.key)?.unreadCount).toBe(2);
+    expect((await fetch(`${base}/api/sessions/${encodeURIComponent("search-host|claude|missing")}/read-position`)).status).toBe(404);
+    expect((await fetch(`${base}/api/sessions/%ZZ/read-position`)).status).toBe(400);
+  });
+
+  test("read-position includes retained output from ended and headless sessions", async () => {
+    const headless = app.db.applyEvent({
+      host:"read-host", harness:"claude", sessionId:"headless-read", kind:"response",
+      ts:1_700_000_200_000, text:"headless retained response", interactive:false,
+    });
+    const ended = app.db.applyEvent({
+      host:"read-host", harness:"claude", sessionId:"ended-read", kind:"response",
+      ts:1_700_000_200_001, text:"ended retained response", interactive:true,
+    });
+    app.db.applyEvent({
+      host:"read-host", harness:"claude", sessionId:"ended-read", kind:"session_end",
+      ts:1_700_000_200_002, interactive:true,
+    });
+    for (const session of [headless, ended]) {
+      const position = await getJson(`/api/sessions/${encodeURIComponent(session.key)}/read-position`);
+      expect(position).toMatchObject({
+        firstUnread:{id:session.lastResponses[0].id, sessionKey:session.key, seen:false},
+        unreadCount:1, retainedCount:1,
+      });
+    }
+  });
+
+  test("exact acknowledgement validates scope and version, retries safely, and leaves newer output unread", async () => {
+    const ts = 1_700_000_300_000;
+    const first = addResponse("exact-ack", "first acknowledgement target", { ts });
+    const second = addResponse("exact-ack", "second acknowledgement target", { ts:ts + 1 });
+    const other = addResponse("different-ack-session", "other session target", { ts:ts + 2 });
+    const responsePath = (key: string, id: number | string) =>
+      `/api/sessions/${encodeURIComponent(key)}/responses/${id}/seen`;
+    const positionPath = `/api/sessions/${encodeURIComponent(first.key)}/read-position`;
+    const postSeen = (key: string, id: number | string, body: unknown) =>
+      projectPost(responsePath(key, id), body);
+
+    const missingOrigin = await fetch(`${base}${responsePath(first.key, first.id)}`, {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ts:first.ts}),
+    });
+    expect(missingOrigin.status).toBe(403);
+    const malformedJson = await fetch(`${base}${responsePath(first.key, first.id)}`, {
+      method:"POST", headers:{Origin:base, "Content-Type":"application/json"}, body:"{",
+    });
+    expect(malformedJson.status).toBe(400);
+    const unsupportedMedia = await fetch(`${base}${responsePath(first.key, first.id)}`, {
+      method:"POST", headers:{Origin:base, "Content-Type":"text/plain"}, body:JSON.stringify({ts:first.ts}),
+    });
+    expect(unsupportedMedia.status).toBe(415);
+    for (const body of [
+      {}, {ts:first.ts, extra:true}, {ts:first.ts + 0.5}, {ts:Number.MAX_SAFE_INTEGER + 1},
+      {ts:"not-a-timestamp"}, null, [],
+    ]) {
+      expect((await postSeen(first.key, first.id, body)).status).toBe(400);
+    }
+    for (const id of ["0", "-1", "1.5", "9007199254740992", "not-an-id"]) {
+      expect((await postSeen(first.key, id, {ts:first.ts})).status).toBe(400);
+    }
+    expect((await postSeen(first.key, other.id, {ts:other.ts})).status).toBe(404);
+    expect((await postSeen(first.key, 9_999_999, {ts:first.ts})).status).toBe(404);
+    expect((await postSeen("search-host|claude|missing", first.id, {ts:first.ts})).status).toBe(404);
+    expect((await projectPost(`/api/sessions/%ZZ/responses/${first.id}/seen`, {ts:first.ts})).status).toBe(400);
+    expect(app.db.getSession(first.key)?.unreadCount).toBe(2);
+    expect(app.db.getSession(other.key)?.unreadCount).toBe(1);
+
+    const controller = new AbortController();
+    const streamResponse = await fetch(`${base}/api/stream`, { signal:controller.signal });
+    const stream = new SseReader(streamResponse.body!.getReader());
+    try {
+      expect(await stream.nextFrame()).toBe(": connected");
+      const acknowledged = await postSeen(first.key, first.id, {ts:first.ts});
+      expect(acknowledged.status).toBe(200);
+      const body = await acknowledged.json() as {
+        ok:boolean; session:{key:string; unreadCount:number; capabilities?:unknown};
+        readPosition:{firstUnread:ResponseDTO|null; unreadCount:number; retainedCount:number};
+      };
+      expect(body).toMatchObject({
+        ok:true, session:{key:first.key, unreadCount:1},
+        readPosition:{firstUnread:{id:second.id}, unreadCount:1, retainedCount:2},
+      });
+      expect(body.session.capabilities).toBeDefined();
+      expect(Object.keys(body.readPosition).sort()).toEqual(["firstUnread", "retainedCount", "unreadCount"]);
+      const published = await stream.nextEvent("session");
+      expect(published).toMatchObject({key:first.key, unreadCount:1});
+
+      const third = addResponse("exact-ack", "newer arriving response", {ts:ts + 3});
+      expect(await getJson(positionPath)).toMatchObject({
+        firstUnread:{id:second.id}, unreadCount:2, retainedCount:3,
+      });
+      const retries = await Promise.all([
+        postSeen(first.key, second.id, {ts:second.ts}),
+        postSeen(first.key, second.id, {ts:second.ts}),
+      ]);
+      expect(retries.map(response => response.status)).toEqual([200, 200]);
+      expect(await Promise.all(retries.map(response => response.json()))).toEqual([
+        expect.objectContaining({ok:true}), expect.objectContaining({ok:true}),
+      ]);
+      expect(await getJson(positionPath)).toMatchObject({
+        firstUnread:{id:third.id}, unreadCount:1, retainedCount:3,
+      });
+
+      expect((await projectPost("/api/seen-all", {})).status).toBe(200);
+      expect(await getJson(positionPath)).toEqual({firstUnread:null, unreadCount:0, retainedCount:3});
+      expect((await getJson(`/api/sessions/${encodeURIComponent(other.key)}/read-position`)))
+        .toMatchObject({firstUnread:null, unreadCount:0, retainedCount:1});
+    } finally {
+      await stream.close();
+      controller.abort();
+    }
+  });
+
+  test("replayed output rejects the old acknowledgement version and pruned output returns not found", async () => {
+    const original = addResponse("replayed-ack", "reused live response", { ts:1_700_000_400_000 });
+    const responsePath = (key: string, id: number) =>
+      `/api/sessions/${encodeURIComponent(key)}/responses/${id}/seen`;
+    const route = `/api/sessions/${encodeURIComponent(original.key)}/read-position`;
+    const oldTs = app.db.sessionResponse(original.key, original.id)!.ts;
+    expect((await projectPost(responsePath(original.key, original.id), {ts:oldTs})).status).toBe(200);
+    app.db.applyEvent({
+      host:"search-host", harness:"claude", sessionId:"replayed-ack", kind:"response",
+      ts:oldTs + 1, text:"reused live response", interactive:true,
+    });
+    const replayed = app.db.sessionResponse(original.key, original.id)!;
+    expect(replayed.ts).toBeGreaterThan(oldTs);
+    expect(replayed.seen).toBe(false);
+    const stale = await projectPost(responsePath(original.key, original.id), {ts:oldTs});
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toEqual({error:"stale_response"});
+    expect(await getJson(route)).toMatchObject({firstUnread:{id:original.id}, unreadCount:1, retainedCount:1});
+
+    const pruned = addResponse("pruned-ack", "pruned response", {ts:1_700_000_500_000});
+    app.db.sqlite.query("DELETE FROM responses WHERE id=?").run(pruned.id);
+    expect((await projectPost(responsePath(pruned.key, pruned.id), {ts:pruned.ts})).status).toBe(404);
+    expect(await getJson(`/api/sessions/${encodeURIComponent(pruned.key)}/read-position`))
+      .toEqual({firstUnread:null, unreadCount:0, retainedCount:0});
+  });
+
+  test("search never finds prompt or reply text", async () => {
+    const captured = addResponse("content-boundary", "ordinary captured output");
+    app.db.sqlite.query("UPDATE responses SET prompt=? WHERE id=?").run("prompt-only phrase", captured.id);
+    app.db.enqueueReply(captured.key, "reply-only phrase", "web", "synthetic-agent", undefined, Date.now(), 10_000);
+    for (const q of ["prompt-only phrase", "reply-only phrase"]) {
+      expect((await getJson(`/api/search?${new URLSearchParams({ q })}`) as SearchPage).results).toEqual([]);
+    }
+  });
+});
+
 
 test("rejects forged hosts and foreign API origins while silently dropping unsafe ingest", async () => {
   const forged = await fetch(`${base}/api/sessions`, { headers: { Host: "other.example" } });
@@ -413,22 +846,19 @@ test("SSE publishes a session event within one second of ingest", async () => {
   const response = await fetch(`${base}/api/stream`, { signal: controller.signal });
   expect(response.status).toBe(200);
   expect(response.headers.get("content-type")).toStartWith("text/event-stream");
-  const reader = response.body!.getReader();
+  const stream = new SseReader(response.body!.getReader());
   try {
-    const connected = await reader.read();
-    expect(new TextDecoder().decode(connected.value)).toContain(": connected");
+    expect(await stream.nextFrame()).toBe(": connected");
     const start = performance.now();
     await ingest(payload("SessionStart"));
     const next = await Promise.race([
-      reader.read(),
+      stream.nextEvent("session"),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("SSE timeout")), 1000)),
     ]);
     expect(performance.now() - start).toBeLessThan(1000);
-    const data = new TextDecoder().decode(next.value);
-    expect(data).toContain("event: session\n");
-    expect(JSON.parse(data.match(/^data: (.*)$/m)![1])).toMatchObject({ key, status: "your_turn" });
+    expect(next).toMatchObject({ key, status: "your_turn" });
   } finally {
-    await reader.cancel();
+    await stream.close();
     controller.abort();
   }
 });
@@ -467,17 +897,16 @@ test("identical liveness polls publish one changed session DTO", async () => {
   await fetch(`${base}/ingest/claude`, {method:"POST",headers:{...headers,"X-Dash-Host":host},body:JSON.stringify({hook_event_name:"Stop",session_id:sessionId,last_assistant_message:"synthetic response"})});
   const controller = new AbortController();
   const stream = await fetch(`${base}/api/stream`,{signal:controller.signal});
-  const reader = stream.body!.getReader();
+  const events = new SseReader(stream.body!.getReader());
   try {
-    await reader.read();
+    await events.nextFrame();
     await app.runLiveness();
-    const first = new TextDecoder().decode((await reader.read()).value);
-    expect(first).toContain("event: session");
+    expect(await events.nextEvent("session")).toMatchObject({ sessionId });
     await app.runLiveness();
-    const second = await Promise.race([reader.read().then(() => "event"), new Promise<string>(resolve => setTimeout(() => resolve("quiet"), 250))]);
+    const second = await Promise.race([events.nextEvent("session").then(() => "event"), new Promise<string>(resolve => setTimeout(() => resolve("quiet"), 250))]);
     expect(second).toBe("quiet");
     expect((app.db.sqlite.query("SELECT COUNT(*) AS n FROM events WHERE kind='liveness'").get() as any).n).toBe(1);
-  } finally { await reader.cancel(); controller.abort(); }
+  } finally { await events.close(); controller.abort(); }
 });
 
 test("page responses send the strict content security policy", async () => {
@@ -487,6 +916,7 @@ test("page responses send the strict content security policy", async () => {
     "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
   );
 });
+
 
 describe("project rules API", () => {
 
@@ -851,4 +1281,235 @@ esac
     expect((await sessions.json() as any).sessions[0].lastResponses[0].decisions).toBeNull();
     expect((await timeline.json() as any).responses[0].decisions).toBeNull();
   });
+});
+
+describe("session identity", () => {
+  const identityPath = `/api/sessions/${encodeURIComponent(key)}/identity`;
+
+  test("owner identity survives source updates and liveness without changing routing or activity", async () => {
+    await fetch(`${base}/ingest/claude`, { method: "POST",
+      headers: { ...headers, "X-Dash-Account-Alias": "claude-work" }, body: payload("Stop", { last_assistant_message: "Review ready." }) });
+    const before = app.db.getSession(key)!;
+    const saved = await projectPost(identityPath, { displayName: "Pricing review", accountAlias: "work-main" });
+    expect(saved.status).toBe(200);
+    expect((await saved.json()).session).toMatchObject({
+      key, host: "synthetic-host", harness: "claude", sessionId, displayName: "Pricing review",
+      accountAlias: "work-main", reportedAccountAlias: "claude-work", lastActivity: before.lastActivity, turnSeq: before.turnSeq,
+    });
+    await fetch(`${base}/ingest/claude`, { method: "POST",
+      headers: { ...headers, "X-Dash-Account-Alias": "new-source" }, body: payload("UserPromptSubmit", { prompt: "Continue reviewing." }) });
+    app.db.markLiveness("claude", [{ sessionId, host: "synthetic-host", harness: "claude", name: "Source name", cwd: "/synthetic/project", pid: 123, detail: "working" }], "synthetic-host");
+    expect(app.db.getSession(key)).toMatchObject({ displayName: "Pricing review", accountAlias: "work-main", reportedAccountAlias: "new-source" });
+    expect((await getJson("/api/timeline")).responses[0]).toMatchObject({ displayName: "Pricing review", accountAlias: "work-main" });
+    await projectPost(identityPath, { displayName: null, accountAlias: "" });
+    await ingest(payload("Stop", { last_assistant_message: "Another result." }));
+    expect(app.db.getSession(key)).toMatchObject({ displayName: "Source name", accountAlias: "" });
+    await projectPost(identityPath, { displayName: null, accountAlias: null });
+    expect(app.db.getSession(key)).toMatchObject({ displayName: "Source name", accountAlias: "new-source" });
+  });
+
+  test("identity edits retain write gates and reject invalid metadata atomically", async () => {
+    await ingest(payload("SessionStart"));
+    const values = { displayName: "Owner label", accountAlias: "work" };
+    expect((await fetch(`${base}${identityPath}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) })).status).toBe(403);
+    expect((await projectPost(identityPath, values, "https://foreign.test")).status).toBe(403);
+    expect((await projectPost(identityPath, values, base, { "Content-Type": "text/plain" })).status).toBe(415);
+    for (const invalid of [
+      { ...values, accountAlias: "a".repeat(65) }, { ...values, accountAlias: "owner@example.test" },
+      { ...values, displayName: "line\nbreak" }, { ...values, displayName: "a".repeat(129) },
+      { ...values, host: "another-machine" }, { displayName: "missing alias" }, [],
+    ]) expect((await projectPost(identityPath, invalid)).status).toBe(400);
+    expect(app.db.getSession(key)?.displayNameOverride).toBeUndefined();
+    expect((await projectPost("/api/sessions/missing/identity", values)).status).toBe(404);
+    startTailnet();
+    const denied = await fetch(`${tailnetBase}${identityPath}`, { method: "POST",
+      headers: { Host: "dash.tailnet.test", "X-Forwarded-For": "100.1.2.3", Origin: "https://dash.tailnet.test", "Content-Type": "application/json" },
+      body: JSON.stringify(values) });
+    expect(denied.status).toBe(403);
+  });
+
+  test("different account labels never merge sessions or retarget queued replies", async () => {
+    enableActionRoutes();
+    for (const [id, alias] of [["account-one", "work"], ["account-two", "personal"]]) {
+      await fetch(`${base}/ingest/omp`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host: "same-machine", harness: "omp", sessionId: id, interactive: true, kind: "response", text: `Output for ${id}`, accountAlias: alias }) });
+    }
+    const one = "same-machine|omp|account-one", two = "same-machine|omp|account-two";
+    await projectPost(`/api/sessions/${encodeURIComponent(one)}/identity`, { displayName: "Review", accountAlias: "personal" });
+    expect((await projectPost(`/api/sessions/${encodeURIComponent(one)}/reply`, { text: "Only the first session should receive this." })).status).toBe(200);
+    expect(app.db.getReplies(one)[0]?.state).toBe("queued");
+    expect(app.db.getReplies(two)).toEqual([]);
+    expect(app.db.listSessions().map(s => s.key).sort()).toEqual([one, two].sort());
+    expect(app.db.getSession(two)?.displayNameOverride).toBeUndefined();
+  });
+
+  test("identity persists across collector restarts and legacy source events", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dash-identity-")), dataPath = join(dir, "dash.sqlite");
+    try {
+      app.close();
+      app = createDashServer({ port: 0, dataPath, backfill: false, liveness: false });
+      base = `http://127.0.0.1:${app.server.port}`;
+      await ingest(payload("SessionStart"));
+      expect(app.db.getSession(key)?.accountAlias).toBeUndefined();
+      await projectPost(identityPath, { displayName: "Persisted name", accountAlias: "personal" });
+      app.close();
+      app = createDashServer({ port: 0, dataPath, backfill: false, liveness: false });
+      base = `http://127.0.0.1:${app.server.port}`;
+      await ingest(payload("Stop", { last_assistant_message: "Legacy sender still works." }));
+      expect(app.db.getSession(key)).toMatchObject({ displayName: "Persisted name", accountAlias: "personal" });
+    } finally { app.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+test("source inventory deduplicates configured labels without exposing bare peer addresses", async () => {
+  startTailnet(() => 55_000, "source-peer=192.0.2.51,source-peer=192.0.2.52,192.0.2.53");
+  app.db.recordSourceReport("future-peer", 55_001, true);
+  app.db.recordSourceReport("future-peer", 55_000);
+  const inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  expect(inventory.generatedAt).toBe(55_000);
+  expect(inventory.staleAfterMs).toBe(120_000);
+  expect(inventory.unlabelledPeerEntries).toBe(1);
+  expect(inventory.sources.filter(source => source.host === "source-peer")).toHaveLength(1);
+  expect(inventory.sources.find(source => source.host === "source-peer")).toMatchObject({
+    configured: true, status: "unreported", lastReportAt: null, lastHeartbeatAt: null, accounts: [],
+  });
+  expect(inventory.sources.some(source => source.host.startsWith("100."))).toBe(false);
+  expect(inventory.sources.some(source => source.host === localHost())).toBe(true);
+  expect(inventory.sources.find(source => source.host === "future-peer")).toMatchObject({
+    status: "unknown", lastReportAt: 55_000, lastHeartbeatAt: 55_001,
+  });
+  const hosts = inventory.sources.map(source => source.host);
+  expect(hosts).toEqual([...hosts].sort());
+});
+
+test("source inventory groups unassigned sessions and exposes metadata, not retained output", async () => {
+  const send = (id: string, hook: string, extra: Record<string, unknown> = {}, alias?: string) =>
+    fetch(`${base}/ingest/claude`, { method: "POST",
+      headers: { ...headers, ...(alias ? { "X-Dash-Account-Alias": alias } : {}) },
+      body: payload(hook, { session_id: id, cwd: "/synthetic/project", ...extra }) });
+  await send("unassigned-session", "SessionStart", { credential: "not-for-inventory" });
+  await send("unassigned-session", "Stop", { last_assistant_message: "private retained output" });
+  await send("assigned-session", "SessionStart", {}, " Work ");
+  const inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  const source = inventory.sources.find(entry => entry.host === "synthetic-host");
+  expect(source).toMatchObject({
+    configured: false, status: "reporting", lastHeartbeatAt: null,
+    accounts: [
+      { accountAlias: null, sessions: [expect.objectContaining({ key: "synthetic-host|claude|unassigned-session", harness: "claude", interactive: true })] },
+      { accountAlias: "Work", sessions: [expect.objectContaining({ key: "synthetic-host|claude|assigned-session", harness: "claude" })] },
+    ],
+  });
+  expect(JSON.stringify(source)).not.toContain("private retained output");
+  expect(JSON.stringify(source)).not.toContain("not-for-inventory");
+});
+
+test("empty remote heartbeats recover stale inventory while malformed reports never refresh or end sessions", async () => {
+  let clock = 1_000_000;
+  startTailnet(() => clock);
+  const remoteKey = "mbp|claude|inventory-session";
+  const push = (body: unknown, forwarded = remoteHeaders["X-Forwarded-For"]) => fetch(`${tailnetBase}/ingest/liveness/claude`, {
+    method: "POST", headers: { ...remoteHeaders, "X-Forwarded-For": forwarded, "Content-Type": "application/json", "X-Dash-Host": "mbp" }, body: JSON.stringify(body),
+  });
+  const record = { sessionId: "inventory-session", pid: 10, status: "idle" };
+  await push([record]);
+  let inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  let source = inventory.sources.find(entry => entry.host === "mbp");
+  expect(source).toMatchObject({ status: "reporting", lastReportAt: clock, lastHeartbeatAt: clock });
+  clock += 1_000;
+  await push([]);
+  expect(app.db.getSession(remoteKey)).toMatchObject({ alive: false, status: "your_turn" });
+  clock += 120_001;
+  inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  source = inventory.sources.find(entry => entry.host === "mbp");
+  expect(source).toMatchObject({ status: "stale", lastReportAt: 1_001_000, lastHeartbeatAt: 1_001_000 });
+  expect(app.db.getSession(remoteKey)?.status).toBe("your_turn");
+  await push({ invalid: true });
+  expect(app.malformedCount).toBe(1);
+  inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  source = inventory.sources.find(entry => entry.host === "mbp");
+  expect(source).toMatchObject({ status: "stale", lastReportAt: 1_001_000, lastHeartbeatAt: 1_001_000 });
+  expect(app.db.getSession(remoteKey)?.status).toBe("your_turn");
+  const forged = await push([], "1.2.3.4");
+  expect(forged.status).toBe(200);
+  expect(await forged.text()).toBe("{}");
+  expect(app.rejectedCount).toBe(1);
+  inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  source = inventory.sources.find(entry => entry.host === "mbp");
+  expect(source).toMatchObject({ status: "stale", lastReportAt: 1_001_000, lastHeartbeatAt: 1_001_000 });
+  clock += 1;
+  await push([]);
+  inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  source = inventory.sources.find(entry => entry.host === "mbp");
+  expect(source).toMatchObject({ status: "reporting", lastReportAt: clock, lastHeartbeatAt: clock });
+  expect(app.db.getSession(remoteKey)?.status).toBe("ended");
+});
+
+test("successful empty local polls record receipts while unsupported or failed OMP polls do not", async () => {
+  let clock = 3_000_000;
+  let claudeFails = false;
+  let ompResult: "empty" | "null" | "error" = "null";
+  app.close();
+  app = createDashServer({ port: 0, dataPath: ":memory:", backfill: false, liveness: false, now: () => clock,
+    pollClaude: async () => { if (claudeFails) throw new Error("poll failed"); return []; },
+    pollOmp: async () => { if (ompResult === "error") throw new Error("poll failed"); return ompResult === "empty" ? [] : null; } });
+  base = `http://127.0.0.1:${app.server.port}`;
+  await app.runLiveness();
+  let inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  let source = inventory.sources.find(entry => entry.host === localHost());
+  expect(source).toMatchObject({ status: "reporting", lastReportAt: clock, lastHeartbeatAt: clock });
+  clock += 5_000;
+  claudeFails = true;
+  ompResult = "empty";
+  await app.runLiveness();
+  inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  source = inventory.sources.find(entry => entry.host === localHost());
+  expect(source).toMatchObject({ status: "reporting", lastReportAt: clock, lastHeartbeatAt: clock });
+  const ompReceipt = { lastReportAt: clock, lastHeartbeatAt: clock };
+  clock += 5_000;
+  ompResult = "null";
+  await app.runLiveness();
+  inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  source = inventory.sources.find(entry => entry.host === localHost());
+  expect(source).toMatchObject({ status: "reporting", ...ompReceipt });
+  clock += 5_000;
+  ompResult = "error";
+  await app.runLiveness();
+  inventory = await getJson("/api/sources") as SourceInventoryForTest;
+  source = inventory.sources.find(entry => entry.host === localHost());
+  expect(source).toMatchObject({ status: "reporting", ...ompReceipt });
+});
+
+test("source report receipt timestamps survive database restarts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dash-source-report-"));
+  const dataPath = join(dir, "dash.sqlite");
+  const first = new DashDB(dataPath);
+  try { first.recordSourceReport("persisted-peer", 42_000, true); }
+  finally { first.close(); }
+  const reopened = new DashDB(dataPath);
+  try {
+    expect(reopened.sourceReports()).toEqual([{ host: "persisted-peer", lastReportAt: 42_000, lastHeartbeatAt: 42_000 }]);
+  } finally { reopened.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an empty heartbeat notifies inventory subscribers without a session event", async () => {
+  const clock = 7_000_000;
+  startTailnet(() => clock, "source-peer=192.0.2.10");
+  expect((await getJson("/api/sources")).sources.find((source: { host: string }) => source.host === "source-peer").status).toBe("unreported");
+  const stream = new SseReader((await fetch(`${base}/api/stream`)).body!.getReader());
+  try {
+    expect(await stream.nextFrame()).toBe(": connected");
+    await fetch(`${tailnetBase}/ingest/liveness/claude`, {
+      method: "POST",
+      headers: { ...remoteHeaders, "Content-Type": "application/json", "X-Dash-Host": "source-peer" },
+      body: "[]",
+    });
+    await Promise.race([
+      stream.nextEvent("sources"),
+      Bun.sleep(1_000).then(() => { throw new Error("timed out waiting for inventory refresh"); }),
+    ]);
+    const inventory = await getJson("/api/sources") as SourceInventoryForTest;
+    expect(inventory.sources.find(source => source.host === "source-peer")).toMatchObject({
+      status: "reporting", lastReportAt: clock, lastHeartbeatAt: clock, accounts: [],
+    });
+    expect((await getJson("/api/sessions")).sessions).toEqual([]);
+  } finally { await stream.close(); }
 });

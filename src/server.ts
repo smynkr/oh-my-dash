@@ -1,14 +1,16 @@
 import { dirname, join, resolve } from "node:path";
 import { isIP } from "node:net";
-import { DashDB, type SessionDTO } from "./db.ts";
+import { DashDB, type Idea, type SearchOptions, type SessionDTO, type SourceReportRecord, type SourceSessionMetadata } from "./db.ts";
 import { createTelegram, type TelegramOptions } from "./telegram.ts";
-import { createReplies } from "./replies.ts";
+import { createReplies, cleanMessageText, MAX_MESSAGE_CHARS, messageTtlFromEnv } from "./replies.ts";
 import { createJudge } from "./judge.ts";
 import { createExtraction } from "./extraction.ts";
-import { normalizeClaude, normalizeOmp, localHost, type EventKind } from "./normalize.ts";
+import { normalizeClaude, normalizeOmp, normalizeAccountAlias, localHost, type EventKind, type Harness } from "./normalize.ts";
 import { scanBackfill, parseClaudeTranscript, findClaudeTranscript } from "./backfill.ts";
 import { parseClaudeAgents, pollClaudeAgents, pollOmpPresence, type LivenessRecord } from "./liveness.ts";
 import { resolveProject, ruleErrors, type ProjectRule } from "./projects.ts";
+import { sessionCapabilities, type SessionWithCapabilities } from "./capabilities.ts";
+import { applyConsolePreferencesAction, getConsolePreferences, type ConsolePreferences, type ConsolePreferencesActionResult } from "./console-preferences.ts";
 
 export const CSP = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 // DASH_ROOT lets a `bun build --compile` binary (where import.meta.dir is virtual) find public/ and node_modules/.
@@ -26,6 +28,16 @@ const json = (payload: unknown, status = 200) => new Response(JSON.stringify(pay
 const ack = () => new Response("{}", { status: 200, headers: headers({ "Content-Type": "application/json" }) });
 const jsonContentType = (value: string | null) => /^application\/json(?:\s*;\s*charset\s*=\s*[^;\s]+)?$/i.test(value ?? "");
 const hostLabel = (value: string | null): value is string => !!value && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+
+type SourceStatus = "reporting" | "stale" | "unreported" | "unknown";
+type SourceSessionFields = Omit<SourceSessionMetadata, "host" | "accountAlias">;
+type SourceInventoryEntry = { configured: boolean; accounts: Map<string | null, SourceSessionFields[]> };
+function sourceStatus(report: SourceReportRecord | undefined, generatedAt: number): SourceStatus {
+  const reportAt = report?.lastReportAt ?? null, heartbeatAt = report?.lastHeartbeatAt ?? null;
+  if (reportAt === null && heartbeatAt === null) return "unreported";
+  if ((reportAt !== null && reportAt > generatedAt) || (heartbeatAt !== null && heartbeatAt > generatedAt)) return "unknown";
+  return generatedAt - Math.max(reportAt ?? -Infinity, heartbeatAt ?? -Infinity) > 120_000 ? "stale" : "reporting";
+}
 
 function allowedPeers(raw: string): Map<string, string> {
   const peers = new Map<string, string>();
@@ -83,6 +95,38 @@ function projectRulesShapeError(value: unknown): number | undefined {
       typeof rule.project !== "string" || rule.project.length < 1 || rule.project.length > 128) return index;
   }
 }
+function parseSearchOptions(params: URLSearchParams): SearchOptions | null {
+  const allowed: Record<string, true> = {
+    q: true, limit: true, cursor: true, host: true, project: true, account: true, harness: true, headless: true, ended: true,
+  };
+  for (const key of params.keys()) if (!Object.hasOwn(allowed, key)) return null;
+  for (const key of Object.keys(allowed)) if (params.getAll(key).length > 1) return null;
+
+  const q = (params.get("q") ?? "").trim();
+  if (q.length > 256) return null;
+  const rawLimit = params.get("limit");
+  const limit = rawLimit === null ? 25 : Number(rawLimit);
+  if (rawLimit !== null && (!/^\d+$/.test(rawLimit) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100)) return null;
+  const rawCursor = params.get("cursor");
+  if (rawCursor !== null && rawCursor.length === 0) return null;
+  const host = params.get("host");
+  const project = params.get("project");
+  const account = params.get("account");
+  const rawHarness = params.get("harness");
+  if (rawHarness !== null && rawHarness !== "" && rawHarness !== "claude" && rawHarness !== "omp") return null;
+  const rawHeadless = params.get("headless");
+  const rawEnded = params.get("ended");
+  if (rawHeadless !== null && rawHeadless !== "0" && rawHeadless !== "1") return null;
+  if (rawEnded !== null && rawEnded !== "0" && rawEnded !== "1") return null;
+
+  return {
+    q, limit, ...(rawCursor === null ? {} : { cursor: rawCursor }),
+    ...(host === null ? {} : { host }), ...(project === null ? {} : { project }),
+    ...(account === null ? {} : { account }),
+    ...(rawHarness === null || rawHarness === "" ? {} : { harness: rawHarness as Harness }),
+    headless: rawHeadless === "1", ended: rawEnded === "1",
+  };
+}
 
 export function createDashServer(options: ServerOptions = {}) {
   const topicsEnabled = process.env.DASH_TG_TOPICS === "1";
@@ -100,16 +144,35 @@ export function createDashServer(options: ServerOptions = {}) {
   const lastDto = new Map<string, string>();
   let telegram: ReturnType<typeof createTelegram> | undefined;
   let replies: ReturnType<typeof createReplies> | undefined;
+  const withCapabilities = (dto: SessionDTO): SessionWithCapabilities => ({
+    ...dto,
+    capabilities: sessionCapabilities(dto, decisionsEnabled, replies?.deliveryObservation(dto.key), now()),
+  });
+  const emitSession = (dto: SessionDTO, force = false) => {
+    const session = withCapabilities(dto);
+    const { actions, delivery } = session.capabilities;
+    const semantic = JSON.stringify({ ...dto, capabilities: { actions, delivery } });
+    if (!force && lastDto.get(dto.key) === semantic) return false;
+    lastDto.set(dto.key, semantic);
+    const serialized = JSON.stringify(session);
+    const message = encoder.encode(`event: session\ndata: ${serialized}\n\n`);
+    for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
+    return true;
+  };
+  const emitSources = () => {
+    const message = encoder.encode("event: sources\ndata: {}\n\n");
+    for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
+  };
+  const emitConsolePreferences = (preferences: ConsolePreferences) => {
+    const message = encoder.encode(`event: console-preferences\ndata: ${JSON.stringify(preferences)}\n\n`);
+    for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
+  };
   const send = (dto: SessionDTO, eventKind?: EventKind, force = false) => {
     // An error event can have the same DTO as an earlier liveness/update event.
     // Let Telegram see the actual event before DTO dedupe, without inferring
     // errors from a DTO's potentially stale lastError field.
     if (eventKind === "error") telegram?.observe(dto, eventKind);
-    const serialized = JSON.stringify(dto);
-    if (!force && lastDto.get(dto.key) === serialized) return;
-    lastDto.set(dto.key, serialized);
-    const message = encoder.encode(`event: session\ndata: ${serialized}\n\n`);
-    for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
+    if (!emitSession(dto, force)) return;
     if (eventKind !== "error") telegram?.observe(dto, eventKind);
     replies?.observe(dto);
   };
@@ -128,9 +191,16 @@ export function createDashServer(options: ServerOptions = {}) {
     const message = encoder.encode(`event: reply\ndata: ${JSON.stringify({ key: reply.sessionKey, replyId: reply.id, state, source: reply.source })}\n\n`);
     for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
   };
-  if (process.env.DASH_REPLIES === "1") replies = createReplies({ db, now, ttlMs: ttlMin * 60_000, send,
+  const emitIdeas = () => {
+    const message = encoder.encode(`event: ideas\ndata: ${JSON.stringify({ open: db.openIdeaCount() })}\n\n`);
+    for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
+  };
+  if (process.env.DASH_REPLIES === "1") db.onIdeasChange = emitIdeas;
+  if (process.env.DASH_REPLIES === "1") replies = createReplies({ db, now, ttlMs: ttlMin * 60_000,
+    messageTtlMs: messageTtlFromEnv(process.env.DASH_MESSAGE_TTL_MS), send,
     onQueued: reply => emitReply(reply, "queued"),
-    onOutcome: (reply, outcome, dto) => { telegram?.replyOutcome(reply, outcome, dto, ttlMin); emitReply(reply, outcome); } });
+    onOutcome: (reply, outcome, dto) => { telegram?.replyOutcome(reply, outcome, dto, ttlMin); emitReply(reply, outcome); },
+    onWaiterChange: key => { const dto = db.getSession(key); if (dto) emitSession(dto); } });
   if (process.env.DASH_TELEGRAM === "1") telegram = createTelegram({ ...options.telegram, topicsEnabled, db, now: options.telegram?.now ?? now, reportError, replies });
   // The Luna tier exists only with both flags on; otherwise no codex process can ever be spawned.
   const extraction = judgeEnabled ? createExtraction({ db, reportError,
@@ -153,6 +223,9 @@ export function createDashServer(options: ServerOptions = {}) {
   async function runLiveness() {
     try {
       const rows = await (options.pollClaude ?? pollClaudeAgents)();
+      if (!Array.isArray(rows)) throw new Error("Invalid Claude liveness response");
+      db.recordSourceReport(localHost(), now(), true);
+      emitSources();
       for (const dto of db.markLiveness("claude", rows, localHost())) {
         send(dto);
         if (dto.host !== localHost()) continue;
@@ -166,7 +239,11 @@ export function createDashServer(options: ServerOptions = {}) {
     for (const dto of db.sweepDeadClaude(localHost())) send(dto);
     try {
       const omp = await (options.pollOmp ?? pollOmpPresence)();
-      if (omp) for (const dto of db.markLiveness("omp", omp, localHost())) send(dto);
+      if (Array.isArray(omp)) {
+        db.recordSourceReport(localHost(), now(), true);
+        emitSources();
+        for (const dto of db.markLiveness("omp", omp, localHost())) send(dto);
+      }
     } catch (error) { reportError("omp liveness", error); }
   }
   const backfillAttempted = new Set<string>();
@@ -198,6 +275,7 @@ export function createDashServer(options: ServerOptions = {}) {
     }
     const projectRulesRoute = path === "/api/projects/rules";
     const projectPreviewRoute = path === "/api/projects/preview";
+    const consolePreferencesRoute = path === "/api/console/preferences";
     if (request.method === "POST" && path.startsWith("/api/")) {
       const origin = request.headers.get("origin");
       const originAllowed = origin !== null && (listener === "loopback"
@@ -331,13 +409,18 @@ export function createDashServer(options: ServerOptions = {}) {
           if (remoteHost === localHost()) { rejected++; return ack(); }
           const records = parseClaudeAgents(body, remoteHost);
           const acceptedAt = now();
+          db.recordSourceReport(remoteHost, acceptedAt, true);
+          emitSources();
           for (const dto of db.markLiveness("claude", records, remoteHost, acceptedAt, () => false, true)) send(dto);
           lastRemoteLiveness.set(remoteHost, acceptedAt);
           return ack();
         }
-        const event = path.endsWith("claude") ? normalizeClaude(body, request.headers, now()) : normalizeOmp(body, now());
+        const receivedAt = now();
+        const event = path.endsWith("claude") ? normalizeClaude(body, request.headers, receivedAt) : normalizeOmp(body, receivedAt);
         if (event) {
           const dto = db.applyEvent(event);
+          db.recordSourceReport(event.host, receivedAt);
+          emitSources();
           send(dto, event.kind);
           if (event.kind === "response") extraction?.schedule(dto.key, dto.turnSeq);
         } else malformed++;
@@ -348,7 +431,63 @@ export function createDashServer(options: ServerOptions = {}) {
       uptimeSec: Math.floor((now()-started)/1000), tailnetPort: tailnetServer?.port ?? null,
       remoteHosts: Object.fromEntries([...lastRemoteLiveness].map(([h, ts]) => [h, Math.floor((now()-ts)/1000)])),
       telegram: telegram?.health() ?? { state: "disabled", mode: "input", paired: false, queued: 0, sent: 0, dropped: 0 },
+      ...(replies ? { ideas: { open: db.openIdeaCount() } } : {}),
       replies: replies?.health() ?? { enabled: false } });
+    if (request.method === "GET" && consolePreferencesRoute) {
+      try { return json(getConsolePreferences(db)); }
+      catch (error) {
+        reportError("console preferences read", error);
+        return json({ error: "unable to read console preferences" }, 500);
+      }
+    }
+    if (request.method === "POST" && consolePreferencesRoute) {
+      let result: ConsolePreferencesActionResult;
+      try {
+        result = applyConsolePreferencesAction(db, key => db.getSession(key) !== null, await boundedJson(request));
+      } catch (error) {
+        reportError("console preferences write", error);
+        return json({ error: "unable to save console preferences" }, 500);
+      }
+      if (!result.ok) return json({ error: result.error }, result.status);
+      if (result.changed) emitConsolePreferences(result.preferences);
+      return json(result.preferences);
+    }
+    if (request.method === "GET" && path === "/api/sources") {
+      const generatedAt = now();
+      const reports = db.sourceReports();
+      const reportByHost = new Map<string, SourceReportRecord>();
+      for (const report of reports) reportByHost.set(report.host, report);
+      const inventory = new Map<string, SourceInventoryEntry>();
+      const sourceEntry = (host: string): SourceInventoryEntry => {
+        let entry = inventory.get(host);
+        if (!entry) { entry = { configured: false, accounts: new Map() }; inventory.set(host, entry); }
+        return entry;
+      };
+      for (const label of peers.values()) if (label !== "*") sourceEntry(label).configured = true;
+      sourceEntry(localHost());
+      for (const report of reports) sourceEntry(report.host);
+      for (const session of db.sourceSessions()) {
+        const { host, accountAlias, ...fields } = session;
+        const accounts = sourceEntry(host).accounts;
+        const sessions = accounts.get(accountAlias) ?? [];
+        sessions.push(fields);
+        accounts.set(accountAlias, sessions);
+      }
+      const sources = [...inventory].map(([host, entry]) => {
+        const report = reportByHost.get(host);
+        const accounts = [...entry.accounts].sort(([left], [right]) =>
+          left === right ? 0 : left === null ? -1 : right === null ? 1 : left < right ? -1 : 1)
+          .map(([accountAlias, sessions]) => ({
+            accountAlias,
+            sessions: sessions.sort((left, right) => right.lastActivity - left.lastActivity ||
+              (left.key < right.key ? -1 : left.key > right.key ? 1 : 0)),
+          }));
+        return { host, configured: entry.configured, status: sourceStatus(report, generatedAt),
+          lastReportAt: report?.lastReportAt ?? null, lastHeartbeatAt: report?.lastHeartbeatAt ?? null, accounts };
+      }).sort((left, right) => left.host < right.host ? -1 : left.host > right.host ? 1 : 0);
+      return json({ generatedAt, staleAfterMs: 120_000,
+        unlabelledPeerEntries: [...peers.values()].filter(value => value === "*").length, sources });
+    }
     if (request.method === "GET" && path === "/api/telegram") return json(telegram?.info(listener === "loopback") ??
       { state: "disabled", mode: "input", paired: false, botUsername: null, pairingCode: null });
     if (request.method === "GET" && projectRulesRoute) {
@@ -391,6 +530,72 @@ export function createDashServer(options: ServerOptions = {}) {
       telegram?.unpair();
       return json({ ok: true });
     }
+    const capabilitiesRoute = request.method === "GET" && path.match(/^\/api\/sessions\/([^/]+)\/capabilities$/);
+    if (capabilitiesRoute) {
+      let key: string;
+      try { key = decodeURIComponent(capabilitiesRoute[1]!); } catch { return json({ error: "invalid key" }, 400); }
+      const dto = db.getSession(key);
+      if (!dto) return json({ error: "not found" }, 404);
+      return json(withCapabilities(dto).capabilities);
+    }
+    const identityRoute = path.match(/^\/api\/sessions\/([^/]+)\/identity$/);
+    if (request.method === "POST" && identityRoute) {
+      let key: string;
+      try { key = decodeURIComponent(identityRoute[1]); } catch { return json({ error: "invalid key" }, 400); }
+      const body = await boundedJson(request) as Record<string, unknown> | null;
+      if (!body || typeof body !== "object" || Array.isArray(body) ||
+        Object.keys(body).some(field => field !== "displayName" && field !== "accountAlias") ||
+        !(body.displayName === null || typeof body.displayName === "string") ||
+        !(body.accountAlias === null || typeof body.accountAlias === "string")) return json({ error: "invalid identity" }, 400);
+      const displayName = typeof body.displayName === "string" ? body.displayName.trim() : null;
+      const accountAlias = typeof body.accountAlias === "string" ? body.accountAlias.trim() : null;
+      if (displayName !== null && (displayName.length > 128 || /[\u0000-\u001f\u007f]/.test(displayName)) ||
+        accountAlias !== null && accountAlias !== "" && normalizeAccountAlias(accountAlias) !== accountAlias) {
+        return json({ error: "Use a name up to 128 characters and an account alias up to 64 letters, numbers, spaces, dots, hyphens or underscores." }, 400);
+      }
+      const dto = db.setSessionIdentity(key, displayName || null, accountAlias);
+      if (!dto) return json({ error: "not found" }, 404);
+      send(dto);
+      return json({ session: withCapabilities(dto) });
+    }
+    const ideasRoute = path.match(/^\/api\/ideas(?:\/([^/]+)\/(archive|send))?$/);
+    if (ideasRoute) {
+      if (!replies) return json({ error: "not found" }, 404);
+      const actor = listener === "loopback" ? "web:loopback" :
+        `web:${peers.get(peer) === "*" ? `tailnet-peer-${peer.replace(/[^A-Za-z0-9_-]/g, "-")}` : peers.get(peer)}`;
+      const dto = (idea: Idea) => ({ id: idea.id, text: idea.text, source: idea.source, origin: idea.origin, state: idea.state,
+        createdAt: idea.createdAt, doneAt: idea.doneAt, sentSessionKey: idea.sentSessionKey });
+      if (!ideasRoute[1]) {
+        if (request.method === "GET") {
+          const state = url.searchParams.get("state") ?? "open";
+          if (state !== "open" && state !== "sent" && state !== "archived" && state !== "all") return json({ error: "bad request" }, 400);
+          return json({ ideas: db.listIdeas(state, 200).map(dto), open: db.openIdeaCount() });
+        }
+        if (request.method !== "POST") return json({ error: "not found" }, 404);
+        const body = await boundedJson(request) as Record<string, unknown> | null;
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(field => field !== "text") || typeof body.text !== "string") return json({ error: "bad request" }, 400);
+        const text = cleanMessageText(body.text);
+        if (!text || [...text].length > MAX_MESSAGE_CHARS) return json({ error: text ? "too_long" : "empty_text" }, 400);
+        return json({ idea: dto(db.createIdea({ text, source: "web", actor, origin: "owner" }, now())) });
+      }
+      if (request.method !== "POST") return json({ error: "not found" }, 404);
+      const id = /^[1-9]\d{0,15}$/.test(ideasRoute[1]) ? Number(ideasRoute[1]) : NaN;
+      if (!Number.isSafeInteger(id)) return json({ error: "bad request" }, 400);
+      const body = await boundedJson(request) as Record<string, unknown> | null;
+      const idea = db.getIdea(id);
+      if (ideasRoute[2] === "archive") {
+        if (!idea) return json({ error: "not found" }, 404);
+        return db.archiveIdea(id, now()) ? json({ ok: true }) : json({ error: "idea_not_open" }, 409);
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(field => field !== "key") || typeof body.key !== "string") return json({ error: "bad request" }, 400);
+      if (!idea) return json({ error: "not found" }, 404);
+      if (idea.state !== "open") return json({ error: "idea_not_open" }, 409);
+      const result = replies.submit({ key: body.key, text: idea.text, source: "web", actor, kind: "message", ideaId: id, listener });
+      if ("ok" in result) return json(result);
+      const status = result.reason === "session_not_found" || result.reason === "disabled" ? 404 :
+        result.reason.startsWith("invalid_") || result.reason === "empty_text" || result.reason === "too_long" ? 400 : 409;
+      return json(result, status);
+    }
     const questionRoute = request.method === "POST" && path.match(/^\/api\/sessions\/([^/]+)\/question$/);
     if (questionRoute) {
       if (!replies) return json({ error:"not found" },404);
@@ -419,24 +624,66 @@ export function createDashServer(options: ServerOptions = {}) {
       if (replyRoute[2] === "reply") {
         const body = await boundedJson(request) as Record<string, unknown> | null;
         if (!body || typeof body !== "object" || Array.isArray(body) ||
-          Object.keys(body).some(field => field !== "text" && field !== "answersTurn" && field !== "answersQuestion")) return json({ error: "bad request" }, 400);
+          Object.keys(body).some(field => field !== "text" && field !== "answersTurn" && field !== "expectedTurn" && field !== "answersQuestion")) return json({ error: "bad request" }, 400);
         const actor = listener === "loopback" ? "web:loopback" :
           `web:${peers.get(peer) === "*" ? `tailnet-peer-${peer.replace(/[^A-Za-z0-9_-]/g, "-")}` : peers.get(peer)}`;
         const result = replies.submit({ key, text: body.text as string, source: "web", actor,
-          answersTurn: body.answersTurn as number | undefined, answersQuestion: body.answersQuestion as string | undefined, listener });
+          answersTurn: body.answersTurn as number | undefined, expectedTurn: body.expectedTurn as number | undefined,
+          answersQuestion: body.answersQuestion as string | undefined, listener });
         if ("ok" in result) return json(result);
         const status = result.reason === "session_not_found" || result.reason === "disabled" ? 404 :
           result.reason.startsWith("invalid_") || result.reason === "empty_text" ? 400 : 409;
         return json(result, status);
       }
-      if (!db.getSession(key)) return json({ error: "not found" }, 404);
-      if (replyRoute[2] === "replies") return json({ replies: db.getReplies(key) });
+      const dto = db.getSession(key);
+      if (!dto) return json({ error: "not found" }, 404);
+      if (replyRoute[2] === "replies") return json({ replies: db.getReplies(key), capabilities: withCapabilities(dto).capabilities });
       const body = await boundedJson(request) as Record<string, unknown> | null;
       if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(field => field !== "id") ||
         (body.id !== undefined && (!Number.isSafeInteger(body.id) || Number(body.id) < 1))) return json({ error: "bad request" }, 400);
       return json({ ok: true, cancelled: replies.cancel(key, body.id as number | undefined).length });
     }
-    if (request.method === "GET" && path === "/api/sessions") return json({ sessions: db.listSessions(url.searchParams.get("headless") === "1", url.searchParams.get("ended") === "1") });
+    if (request.method === "GET" && path === "/api/search") {
+      const search = parseSearchOptions(url.searchParams);
+      if (!search) return json({ error: "bad request" }, 400);
+      const page = db.search(search);
+      return page ? json(page) : json({ error: "invalid cursor" }, 400);
+    }
+    const readPositionMatch = request.method === "GET" && path.match(/^\/api\/sessions\/([^/]+)\/read-position$/);
+    if (readPositionMatch) {
+      let key: string;
+      try { key = decodeURIComponent(readPositionMatch[1]); } catch { return json({ error: "invalid key" }, 400); }
+      const position = db.readPosition(key);
+      return position ? json(position) : json({ error: "session not found" }, 404);
+    }
+    const responsesMatch = request.method === "GET" && path.match(/^\/api\/sessions\/([^/]+)\/responses$/);
+    if (responsesMatch) {
+      let key: string;
+      try { key = decodeURIComponent(responsesMatch[1]); } catch { return json({ error: "invalid key" }, 400); }
+      const rawLimit = url.searchParams.get("limit"), rawBefore = url.searchParams.get("before");
+      const limit = rawLimit === null ? 50 : Number(rawLimit);
+      const before = rawBefore === null ? undefined : Number(rawBefore);
+      if (url.searchParams.getAll("limit").length > 1 || url.searchParams.getAll("before").length > 1 ||
+        (rawLimit !== null && (!/^\d+$/.test(rawLimit) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100)) ||
+        (rawBefore !== null && (!/^-?\d+$/.test(rawBefore) || !Number.isSafeInteger(before)))) {
+        return json({ error: "bad request" }, 400);
+      }
+      const page = db.sessionResponses(key, limit, before);
+      return page ? json(page) : json({ error: "session not found" }, 404);
+    }
+    const exactResponseMatch = request.method === "GET" && path.match(/^\/api\/sessions\/([^/]+)\/responses\/([^/]+)$/);
+    if (exactResponseMatch) {
+      let key: string, rawId: string;
+      try {
+        key = decodeURIComponent(exactResponseMatch[1]);
+        rawId = decodeURIComponent(exactResponseMatch[2]);
+      } catch { return json({ error: "invalid response path" }, 400); }
+      const responseId = Number(rawId);
+      if (!/^\d+$/.test(rawId) || !Number.isSafeInteger(responseId) || responseId < 1) return json({ error: "invalid response id" }, 400);
+      const response = db.sessionResponse(key, responseId);
+      return response ? json({ response }) : json({ error: "response not found" }, 404);
+    }
+    if (request.method === "GET" && path === "/api/sessions") return json({ sessions: db.listSessions(url.searchParams.get("headless") === "1", url.searchParams.get("ended") === "1").map(withCapabilities) });
     if (request.method === "GET" && path === "/api/timeline") {
       const limit = Number(url.searchParams.get("limit") ?? 100);
       const before = url.searchParams.has("before") ? Number(url.searchParams.get("before")) : undefined;
@@ -450,6 +697,27 @@ export function createDashServer(options: ServerOptions = {}) {
       return json({ ok: true });
     }
     if (request.method === "POST" && path === "/api/backfill") return json({ ok: true, ...await runBackfill() });
+    const responseSeenMatch = request.method === "POST" && path.match(/^\/api\/sessions\/([^/]+)\/responses\/([^/]+)\/seen$/);
+    if (responseSeenMatch) {
+      let key: string, rawId: string;
+      try {
+        key = decodeURIComponent(responseSeenMatch[1]);
+        rawId = decodeURIComponent(responseSeenMatch[2]);
+      } catch { return json({ error: "invalid response path" }, 400); }
+      const responseId = Number(rawId);
+      if (!/^\d+$/.test(rawId) || !Number.isSafeInteger(responseId) || responseId < 1) {
+        return json({ error: "invalid response id" }, 400);
+      }
+      const body = await boundedJson(request) as Record<string, unknown> | null;
+      if (!body || typeof body !== "object" || Array.isArray(body) ||
+        Object.keys(body).some(field => field !== "ts") || !Number.isSafeInteger(body.ts)) return json({ error: "bad request" }, 400);
+      const result = db.markResponseSeen(key, responseId, body.ts as number);
+      if (result.kind === "missing-session") return json({ error: "session not found" }, 404);
+      if (result.kind === "missing-response") return json({ error: "response not found" }, 404);
+      if (result.kind === "stale") return json({ error: "stale_response" }, 409);
+      send(result.session);
+      return json({ ok: true, session: withCapabilities(result.session), readPosition: result.readPosition });
+    }
     const seenMatch = request.method === "POST" && path.match(/^\/api\/sessions\/([^/]+)\/seen$/);
     if (seenMatch) {
       let key: string;
@@ -457,7 +725,7 @@ export function createDashServer(options: ServerOptions = {}) {
       const dto = db.markSeen(key);
       if (!dto) return json({ error: "session not found" }, 404);
       send(dto);
-      return json({ ok: true, session: dto });
+      return json({ ok: true, session: withCapabilities(dto) });
     }
     if (request.method === "GET" && path === "/api/stream") {
       disableTimeout();

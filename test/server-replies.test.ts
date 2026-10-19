@@ -4,9 +4,12 @@ import { localHost } from "../src/normalize.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { GO_REC_AUTH_TEXT } from "../src/actions.ts";
+import type { SessionCapabilities, SessionWithCapabilities } from "../src/capabilities.ts";
+import { SseReader } from "./sse.ts";
 
 type App = ReturnType<typeof createDashServer>;
 type Harness = "claude" | "omp";
+type ReplyHealth = { replies: { waiters: Record<Harness, number> } };
 let app: App | undefined;
 let base = "";
 let tailnetBase = "";
@@ -65,6 +68,7 @@ const apiJson = (url: string, body: unknown, headers: Record<string, string> = {
 const apiReplyPath = (key: string) => `/api/sessions/${encodeURIComponent(key)}/reply`;
 const apiCancelPath = (key: string) => `/api/sessions/${encodeURIComponent(key)}/replies/cancel`;
 const apiListPath = (key: string) => `/api/sessions/${encodeURIComponent(key)}/replies`;
+const apiCapabilitiesPath = (key: string) => `/api/sessions/${encodeURIComponent(key)}/capabilities`;
 
 async function expectExactJson(response: Response, status: number, body: unknown) {
   expect(response.status).toBe(status);
@@ -79,24 +83,9 @@ async function waitFor(predicate: () => Promise<boolean>, message: string) {
   throw new Error(message);
 }
 
-class SseReader {
-  private buffer = "";
-  private readonly decoder = new TextDecoder();
-  constructor(private readonly reader: ReadableStreamDefaultReader<Uint8Array>) {}
-  async nextFrame() {
-    while (true) {
-      const separator = this.buffer.indexOf("\n\n");
-      if (separator >= 0) {
-        const frame = this.buffer.slice(0, separator);
-        this.buffer = this.buffer.slice(separator + 2);
-        return frame;
-      }
-      const { value, done } = await this.reader.read();
-      if (done) throw new Error("SSE stream closed before the expected event");
-      this.buffer += this.decoder.decode(value, { stream: true });
-    }
-  }
-  async close() { await this.reader.cancel(); }
+async function waiterCount(harness: Harness) {
+  const health: ReplyHealth = await (await fetch(base + "/healthz")).json();
+  return health.replies.waiters[harness];
 }
 
 async function connectSse(url = `${base}/api/stream`, headers: Record<string, string> = {}) {
@@ -261,6 +250,54 @@ test("web Rec auth'd action is turn-bound and refused when stale or not delivera
   await expectExactJson(await apiJson(baseUrl + apiReplyPath(session.key), { text: GO_REC_AUTH_TEXT, answersTurn: turn }),
     409, { refused: true, reason: "not_deliverable" });
   expect(app!.db.replyCounts()).toEqual(before);
+});
+
+test("submission snapshot guards allow working-session text without binding later delivery to that turn", async () => {
+  const baseUrl = setup(true);
+  const session = app!.db.applyEvent({ host: localHost(), harness: "omp", sessionId: sid, kind: "prompt", ts: nowMs, interactive: true, text: "Current work" });
+  expect(session.status).toBe("working");
+  const response = await apiJson(baseUrl + apiReplyPath(session.key), { text: "Synthetic ordinary prompt", expectedTurn: session.turnSeq });
+  expect(response.status).toBe(200);
+  const { replyId } = await response.json() as { replyId: number };
+  app!.db.applyEvent({ host: localHost(), harness: "omp", sessionId: sid, kind: "response", ts: ++nowMs, interactive: true, text: "Finished existing work" });
+  const delivered = await fetch(baseUrl + waitPath("omp", nowMs, "&commit=1"));
+  expect(delivered.status).toBe(200);
+  expect(await delivered.json()).toEqual({ id: replyId, text: "Synthetic ordinary prompt", source: "web" });
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", { id: replyId, waiter }), 200, { ok: true });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", { id: replyId, waiter, outcome: "sent" }), 200, { ok: true });
+  expect(app!.db.getReplies(session.key)).toMatchObject([{ id: replyId, state: "delivered", answersTurn: null }]);
+});
+
+test("submission snapshot guards reject malformed versions without queueing text", async () => {
+  const baseUrl = setup(true), session = seed("omp");
+  for (const expectedTurn of [-1, 0.5, "0", null, Number.MAX_SAFE_INTEGER + 1]) {
+    await expectExactJson(await apiJson(baseUrl + apiReplyPath(session.key), { text: "Do not queue", expectedTurn }),
+      400, { refused: true, reason: "invalid_turn" });
+  }
+  expect(app!.db.getReplies(session.key)).toEqual([]);
+});
+
+test("independent guarded submissions preserve successful targets and audit a stale target refusal", async () => {
+  const baseUrl = setup(true);
+  const first = seed("omp", "first"), second = seed("claude", "second"), stale = seed("omp", "stale");
+  app!.db.applyEvent({ host: stale.host, harness: "omp", sessionId: sid, kind: "response", ts: ++nowMs, interactive: true, text: "New output after selection" });
+  const accepted: number[] = [];
+  for (const target of [first, stale, second]) {
+    const response = await apiJson(baseUrl + apiReplyPath(target.key), { text: "Same ordinary prompt", expectedTurn: target.turnSeq });
+    if (target === stale) {
+      await expectExactJson(response, 409, { refused: true, reason: "stale_turn" });
+    } else {
+      expect(response.status).toBe(200);
+      const { replyId } = await response.json() as { replyId: number };
+      accepted.push(replyId);
+      expect(app!.db.getReply(replyId)).toMatchObject({ sessionKey: target.key, text: "Same ordinary prompt", state: "queued", source: "web" });
+    }
+  }
+  expect(accepted[0]).not.toBe(accepted[1]);
+  expect(app!.db.getReplies(first.key).map(reply => reply.id)).toEqual([accepted[0]]);
+  expect(app!.db.getReplies(second.key).map(reply => reply.id)).toEqual([accepted[1]]);
+  expect(app!.db.getReplies(stale.key)).toEqual([]);
+  expect(app!.db.sqlite.query("SELECT outcome FROM reply_audit WHERE session_key=?").all(stale.key)).toEqual([{ outcome: "refused:stale_turn" }]);
 });
 
 // The dashboard's pure wording helpers, taken verbatim from app.js so the payload is tested without a DOM.
@@ -537,6 +574,196 @@ test("the dashboard recommendation quote is redacted like the Telegram line", as
     text: "Which credential should the job use? I recommend the scoped one, token=aaaabbbbcccc, for the deploy." });
   const session = (await (await fetch(baseUrl + "/api/sessions")).json() as any).sessions[0];
   expect(session.lastResponses[0].recommendation).toBe("I recommend the scoped one, token=[redacted] for the deploy.");
+});
+
+test("capabilities remain queryable with replies disabled and do not claim liveness", async () => {
+  const baseUrl = setup(false);
+  const session = seed("claude");
+  const response = await fetch(baseUrl + apiCapabilitiesPath(session.key));
+  expect(response.status).toBe(200);
+  const capabilities: SessionCapabilities = await response.json();
+  expect(capabilities.actions.message).toMatchObject({ status: "unavailable", code: "disabled" });
+  expect(capabilities.actions.view).toMatchObject({ status: "supported" });
+  expect(capabilities.actions.approve.status).toBe("unavailable");
+  expect(capabilities.actions.interrupt.status).toBe("unavailable");
+  expect(capabilities.actions.resume.status).toBe("unavailable");
+  expect(capabilities.actions.launch.status).toBe("unavailable");
+  expect(capabilities.delivery.status).toBe("unavailable");
+
+  await expectExactJson(await fetch(baseUrl + "/api/sessions/%E0%A4%A/capabilities"), 400, { error: "invalid key" });
+  await expectExactJson(await fetch(baseUrl + apiCapabilitiesPath("synthetic-host|claude|missing_session")), 404, { error: "not found" });
+});
+
+test("retained output with an unroutable identity does not advertise message support", async () => {
+  const baseUrl = setup(true);
+  const sessionId = "unroutable session";
+  const key = `${localHost()}|omp|${sessionId}`;
+  await apiJson(baseUrl + "/ingest/omp", {
+    host: localHost(), harness: "omp", sessionId, kind: "response",
+    text: "Retained source output", interactive: true,
+  });
+  const capabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(key))).json();
+  expect(capabilities.actions.view.status).toBe("supported");
+  expect(capabilities.actions.message).toMatchObject({ status: "unavailable", code: "invalid_key" });
+  await expectExactJson(await apiJson(baseUrl + apiReplyPath(key), { text: "Do not queue" }), 400,
+    { refused: true, reason: "invalid_key" });
+  expect(app!.db.getReplies(key)).toEqual([]);
+});
+
+test("message refusals match capabilities for native dialogs and retained ended output", async () => {
+  const baseUrl = setup(true);
+  const claude = seed("claude");
+  app!.db.sqlite.query("UPDATE sessions SET status='needs_input', needs_reason='question' WHERE key=?").run(claude.key);
+  const claudeCapabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(claude.key))).json();
+  expect(claudeCapabilities.actions.message).toMatchObject({ status: "unavailable", code: "claude_dialog" });
+  expect(claudeCapabilities.actions.structuredQuestion).toMatchObject({ status: "unavailable", code: "claude_dialog" });
+  await expectExactJson(await apiJson(baseUrl + apiReplyPath(claude.key), { text: "synthetic answer" }), 409,
+    { refused: true, reason: claudeCapabilities.actions.message.code });
+  for (const action of ["approve", "interrupt", "resume", "launch"] as const) {
+    expect(claudeCapabilities.actions[action].status).toBe("unavailable");
+    const rejected = await apiJson(baseUrl + `/api/sessions/${encodeURIComponent(claude.key)}/${action}`, {});
+    expect(rejected.status).toBe(404);
+  }
+
+  const omp = seed("omp");
+  app!.db.sqlite.query("UPDATE sessions SET status='needs_input', needs_reason='permission' WHERE key=?").run(omp.key);
+  const ompCapabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(omp.key))).json();
+  expect(ompCapabilities.actions.message).toMatchObject({ status: "unavailable", code: "omp_approval" });
+  expect(ompCapabilities.actions.structuredQuestion).toMatchObject({ status: "unknown", code: "feature_unreported" });
+  await expectExactJson(await apiJson(baseUrl + apiReplyPath(omp.key), { text: "synthetic approval answer" }), 409,
+    { refused: true, reason: ompCapabilities.actions.message.code });
+
+  const ended = app!.db.applyEvent({ host: localHost(), harness: "claude", sessionId: "ended_session", kind: "session_start", ts: nowMs + 1, interactive: true });
+  app!.db.applyEvent({ host: ended.host, harness: ended.harness, sessionId: ended.sessionId, kind: "response", ts: nowMs + 2, text: "retained synthetic output", interactive: true });
+  app!.db.applyEvent({ host: ended.host, harness: ended.harness, sessionId: ended.sessionId, kind: "session_end", ts: nowMs + 3, interactive: true });
+  const endedCapabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(ended.key))).json();
+  expect(endedCapabilities.actions.view).toMatchObject({ status: "supported" });
+  expect(endedCapabilities.actions.message).toMatchObject({ status: "unavailable", code: "session_ended" });
+  expect(endedCapabilities.delivery.status).toBe("unavailable");
+  await expectExactJson(await apiJson(baseUrl + apiReplyPath(ended.key), { text: "synthetic ended reply" }), 409,
+    { refused: true, reason: endedCapabilities.actions.message.code });
+
+  const listed: { sessions: SessionWithCapabilities[] } = await (await fetch(baseUrl + "/api/sessions?ended=1")).json();
+  const retained = listed.sessions.find(row => row.key === ended.key);
+  expect(retained?.lastResponses[0]?.text).toBe("retained synthetic output");
+});
+
+test("delivery observation is tied to a pending waiter and the hub-clock expiry", async () => {
+  const baseUrl = setup(true);
+  const session = seed("omp");
+  const initial: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(session.key))).json();
+  expect(initial.actions.message.status).toBe("supported");
+  expect(initial.delivery.status).toBe("unknown");
+  const stream = await connectSse();
+  const abort = new AbortController();
+  const started = nowMs - 100_000;
+  const pending = fetch(baseUrl + waitPath("omp", started).replace("&wait=1", "&wait=55") + "&commit=1", { signal: abort.signal });
+  try {
+    await waitFor(async () => (await waiterCount("omp")) === 1, "OMP waiter did not register");
+    const response = await fetch(baseUrl + apiCapabilitiesPath(session.key));
+    const capabilities: SessionCapabilities = await response.json();
+    expect(response.status).toBe(200);
+    expect(capabilities.delivery).toMatchObject({
+      status: "observed",
+      observedAt: nowMs,
+      expiresAt: nowMs + 55_000,
+      protocol: "omp-commit",
+    });
+
+    nowMs += 1;
+    const refreshed: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(session.key))).json();
+    expect(refreshed.delivery).toEqual(capabilities.delivery);
+
+    const event = parseSse(await stream.nextFrame());
+    expect(event.event).toBe("session");
+    expect(event.data?.capabilities).toEqual(capabilities);
+
+    nowMs += 54_999;
+    const expired: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(session.key))).json();
+    expect(expired.delivery.status).toBe("unknown");
+  } finally {
+    abort.abort();
+    await pending.catch(() => {});
+    await stream.close();
+  }
+});
+
+test("delivery protocols identify Claude waiters and legacy OMP waits", async () => {
+  const baseUrl = setup(true);
+  const claude = seed("claude");
+  const claudeAbort = new AbortController();
+  const claudePending = fetch(baseUrl + waitPath("claude").replace("&wait=1", "&wait=55"), { signal: claudeAbort.signal });
+  try {
+    await waitFor(async () => (await waiterCount("claude")) === 1, "Claude waiter did not register");
+    const capabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(claude.key))).json();
+    expect(capabilities.delivery).toMatchObject({ status: "observed", protocol: "claude-waiter", observedAt: nowMs, expiresAt: nowMs + 55_000 });
+  } finally {
+    claudeAbort.abort();
+    await claudePending.catch(() => {});
+  }
+
+  const omp = seed("omp");
+  const ompAbort = new AbortController();
+  const ompPending = fetch(baseUrl + waitPath("omp").replace("&wait=1", "&wait=55"), { signal: ompAbort.signal });
+  try {
+    await waitFor(async () => (await waiterCount("omp")) === 1, "OMP waiter did not register");
+    const capabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(omp.key))).json();
+    expect(capabilities.delivery).toMatchObject({ status: "observed", protocol: "omp-legacy", observedAt: nowMs, expiresAt: nowMs + 55_000 });
+  } finally {
+    ompAbort.abort();
+    await ompPending.catch(() => {});
+  }
+});
+
+test("ideas API is 404 with replies off, including healthz omitting ideas", async () => {
+  const baseUrl = setup(false);
+  for (const response of [await fetch(`${baseUrl}/api/ideas`), await apiJson(`${baseUrl}/api/ideas`, { text: "synthetic" }),
+    await apiJson(`${baseUrl}/api/ideas/1/archive`, {}), await apiJson(`${baseUrl}/api/ideas/1/send`, { key: "x" })]) expect(response.status).toBe(404);
+  expect((await (await fetch(baseUrl + "/healthz")).json() as any).ideas).toBeUndefined();
+});
+
+test("ideas API creates, lists, archives once, sends, and emits SSE ideas counts", async () => {
+  const baseUrl = setup(true);
+  const dto = seed("claude");
+  const stream = await connectSse();
+  try {
+    expect((await apiJson(`${baseUrl}/api/ideas`, { text: "  " })).status).toBe(400);
+    expect((await apiJson(`${baseUrl}/api/ideas`, { text: "x".repeat(4001) })).status).toBe(400);
+    expect((await apiJson(`${baseUrl}/api/ideas`, { text: "synthetic", extra: 1 })).status).toBe(400);
+    expect((await fetch(`${baseUrl}/api/ideas`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
+    const created = await (await apiJson(`${baseUrl}/api/ideas`, { text: "synthetic first idea" })).json() as any;
+    expect(created.idea).toMatchObject({ text: "synthetic first idea", source: "web", origin: "owner", state: "open", doneAt: null, sentSessionKey: null });
+    expect(await stream.nextEvent("ideas")).toEqual({ open: 1 });
+    const second = (await (await apiJson(`${baseUrl}/api/ideas`, { text: "synthetic second idea" })).json() as any).idea;
+    expect(await stream.nextEvent("ideas")).toEqual({ open: 2 });
+    expect(app!.db.getIdea(created.idea.id)!.actor).toBe("web:loopback");
+    expect(((await (await fetch(`${baseUrl}/api/ideas`)).json()) as any).ideas.map((i: any) => i.id)).toEqual([second.id, created.idea.id]);
+    // The badge reads the true open count, not the capped list length.
+    expect(((await (await fetch(`${baseUrl}/api/ideas?state=all`)).json()) as any).open).toBe(2);
+    expect((await fetch(`${baseUrl}/api/ideas?state=bogus`)).status).toBe(400);
+
+    expect((await apiJson(`${baseUrl}/api/ideas/${second.id}/archive`, {})).status).toBe(200);
+    expect(await stream.nextEvent("ideas")).toEqual({ open: 1 });
+    expect((await apiJson(`${baseUrl}/api/ideas/${second.id}/archive`, {})).status).toBe(409);
+    expect((await apiJson(`${baseUrl}/api/ideas/999/archive`, {})).status).toBe(404);
+    expect(((await (await fetch(`${baseUrl}/api/ideas?state=archived`)).json()) as any).ideas.map((i: any) => i.id)).toEqual([second.id]);
+
+    expect((await apiJson(`${baseUrl}/api/ideas/${created.idea.id}/send`, { key: "synthetic|claude|missing" })).status).toBe(404);
+    expect(app!.db.getIdea(created.idea.id)!.state).toBe("open");
+    expect((await apiJson(`${baseUrl}/api/ideas/${second.id}/send`, { key: dto.key })).status).toBe(409);
+    const sent = await apiJson(`${baseUrl}/api/ideas/${created.idea.id}/send`, { key: dto.key });
+    expect(sent.status).toBe(200);
+    const { replyId } = await sent.json() as { replyId: number };
+    expect(await stream.nextEvent("ideas")).toEqual({ open: 0 });
+    expect(app!.db.getReply(replyId)).toMatchObject({ kind: "message", source: "web", ideaId: created.idea.id, expiresAt: nowMs + 4 * 3_600_000 });
+    expect(app!.db.getIdea(created.idea.id)).toMatchObject({ state: "sent", sentSessionKey: dto.key });
+    expect((await (await fetch(baseUrl + "/healthz")).json() as any).ideas).toEqual({ open: 0 });
+
+    nowMs += 4 * 3_600_000;
+    app!.db.expireReplies(nowMs);
+    expect(await stream.nextEvent("ideas")).toEqual({ open: 1 });
+    expect(app!.db.getIdea(created.idea.id)!.state).toBe("open");
+  } finally { await stream.close(); }
 });
 
 const questionId = Buffer.alloc(32, 7).toString("base64url");

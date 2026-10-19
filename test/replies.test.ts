@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { DashDB, type SessionDTO } from "../src/db.ts";
 import type { NormalizedEvent } from "../src/normalize.ts";
-import { createReplies } from "../src/replies.ts";
+import { createReplies, messageTtlFromEnv } from "../src/replies.ts";
 import { GO_REC_AUTH_TEXT } from "../src/actions.ts";
 
 function fixture(harness: "claude" | "omp" = "claude", status: SessionDTO["status"] = "your_turn", needsReason?: string, ttlMs = 1000) {
@@ -574,5 +574,83 @@ describe("reply broker", () => {
       expect(f.db.getReply(auto.id)?.state).toBe("cancelled");
       expect(f.db.getReply(laterAuto.id)?.state).toBe("queued");
     } finally { f.close(); }
+  });
+});
+
+describe("new messages (kind message)", () => {
+  const send = (f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}, text = "synthetic new message") =>
+    f.broker.submit({ key: f.key, text, source: "telegram", actor: "telegram:123", kind: "message", ...extra } as never);
+
+  test("queue with the 4 h default TTL and deliver Claude a new-message header; replies keep ttlMs", async () => {
+    const f = fixture();
+    try {
+      const result = send(f) as { ok: true; replyId: number };
+      const reply = f.db.getReply(result.replyId)!;
+      expect([reply.kind, reply.expiresAt - reply.createdAt]).toEqual(["message", 4 * 3_600_000]);
+      expect(f.submit("synthetic reply").expiresAt - f.clock.now).toBe(1000);
+      expect(await f.broker.waitClaude(f.key, waiter, 1, 100)).toEqual({ status: 200, reply:
+        "[dash] The owner sent a new message from Telegram (not an answer to your last turn). Treat this as their next message:\nsynthetic new message" });
+      const web = f.broker.submit({ key: f.key, text: "synthetic web", source: "web", actor: "web:loopback", kind: "message" });
+      expect("ok" in web).toBe(true);
+    } finally { f.close(); }
+  });
+
+  test("omp gets the raw text and the message TTL is configurable and clamped", async () => {
+    expect([messageTtlFromEnv(undefined), messageTtlFromEnv(""), messageTtlFromEnv("abc"), messageTtlFromEnv("1"),
+      messageTtlFromEnv("120000"), messageTtlFromEnv(String(7 * 3_600_000))]).toEqual([4 * 3_600_000, 4 * 3_600_000, 4 * 3_600_000, 60_000, 120_000, 6 * 3_600_000]);
+    const db = new DashDB(":memory:");
+    const key = "synthetic-host|omp|synthetic-session";
+    db.applyEvent({ host: "synthetic-host", harness: "omp", sessionId: "synthetic-session", kind: "session_start", ts: 1, interactive: true });
+    const broker = createReplies({ db, now: () => 10, messageTtlMs: 5, setTimer: () => () => {} });
+    try {
+      const result = broker.submit({ key, text: "synthetic omp message", source: "web", actor: "web:loopback", kind: "message" }) as { replyId: number };
+      expect(db.getReply(result.replyId)!.expiresAt).toBe(10 + 60_000);
+      const got = await broker.waitOmp(key, waiter, 1, 100);
+      expect(got).toEqual({ status: 200, reply: { id: result.replyId, text: "synthetic omp message", source: "web" } });
+    } finally { broker.close(); db.close(); }
+  });
+
+  test("message refuses answersTurn, refuses over 4000 chars without clipping, and replies still clip", () => {
+    const f = fixture();
+    try {
+      expect(send(f, { answersTurn: 0 })).toEqual({ refused: true, reason: "invalid_turn" });
+      expect(send(f, {}, "x".repeat(4001))).toEqual({ refused: true, reason: "too_long" });
+      expect(send(f, {}, `  ${"é".repeat(4000)}  `)).toMatchObject({ ok: true });
+      expect(f.db.queuedReplies().length).toBe(1);
+      expect([...f.submit("y".repeat(4001)).text].length).toBe(4000);
+    } finally { f.close(); }
+  });
+
+  test("ideaId sends an open idea, marks it sent, and expiry reopens it; owner cancel saves nothing", () => {
+    const f = fixture();
+    try {
+      const idea = f.db.createIdea({ text: "synthetic idea text", source: "web", actor: "web:loopback", origin: "owner" }, 1);
+      expect(f.broker.submit({ key: f.key, text: "x", source: "web", actor: "web:loopback", ideaId: idea.id })).toEqual({ refused: true, reason: "idea_not_open" });
+      const ok = send(f, { ideaId: idea.id }, idea.text) as { replyId: number };
+      expect(f.db.getIdea(idea.id)).toMatchObject({ state: "sent", sentReplyId: ok.replyId, sentSessionKey: f.key });
+      expect(send(f, { ideaId: idea.id })).toEqual({ refused: true, reason: "idea_not_open" });
+      f.clock.now += 4 * 3_600_000;
+      f.sweep();
+      expect(f.db.getIdea(idea.id)!.state).toBe("open");
+      expect(f.outcomes).toEqual(["expired"]);
+      const owned = send(f) as { replyId: number };
+      f.broker.cancel(f.key, owned.replyId);
+      expect(f.db.listIdeas("all").length).toBe(1);
+    } finally { f.close(); }
+  });
+
+  test("a message cancelled because its session ended becomes an undelivered idea and onOutcome learns its id", () => {
+    const db = new DashDB(":memory:");
+    const key = "synthetic-host|claude|synthetic-session";
+    const seen: (number | undefined)[] = [];
+    let dto = db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "synthetic-session", kind: "session_start", ts: 1, interactive: true });
+    const broker = createReplies({ db, now: () => 10, setTimer: () => () => {}, onOutcome: reply => seen.push(reply.savedIdeaId) });
+    try {
+      broker.submit({ key, text: "synthetic stranded", source: "telegram", actor: "telegram:123", kind: "message" });
+      dto = db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "synthetic-session", kind: "session_end", ts: 2, interactive: true });
+      broker.observe(dto);
+      expect(seen.length).toBe(1);
+      expect(db.getIdea(seen[0]!)).toMatchObject({ origin: "undelivered", text: "synthetic stranded", source: "telegram" });
+    } finally { broker.close(); db.close(); }
   });
 });

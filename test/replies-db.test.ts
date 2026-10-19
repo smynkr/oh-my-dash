@@ -253,6 +253,122 @@ test("project rules are cached, malformed settings fall back safely, and flag-of
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("replies.kind migrates onto older databases and older rows read as reply", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dash-kind-"));
+  const path = join(dir, "db.sqlite");
+  const raw = new Database(path);
+  raw.exec(`CREATE TABLE replies (id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, text TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued','leased','delivered','expired','cancelled')), created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL, lease_until INTEGER, done_at INTEGER, tg_msg_id INTEGER, tg_chat_id TEXT)`);
+  raw.query("INSERT INTO replies(session_key,text,state,created_at,expires_at) VALUES('host|claude|a','synthetic old','queued',1,2)").run();
+  raw.close();
+  const db = new DashDB(path);
+  try {
+    const old = db.nextQueuedReply("host|claude|a")!;
+    expect([old.kind, old.ideaId]).toEqual(["reply", null]);
+    const message = db.enqueueReply("host|claude|a","synthetic new","web","web:loopback",undefined,3,10,undefined,"message");
+    expect(db.getReply(message.id)!.kind).toBe("message");
+    expect(() => db.sqlite.query("UPDATE replies SET kind='other' WHERE id=?").run(message.id)).toThrow();
+  } finally { db.close(); rmSync(dir,{recursive:true,force:true}); }
+});
+
+test("draft and idea transitions are single conditional updates that act once", () => {
+  const db = new DashDB(":memory:");
+  try {
+    const draft = db.createDraft({ chatId:"42", threadId:null, sourceMessageId:7, text:"synthetic draft", targets:["h|claude|a","h|omp|b"] }, 1_000);
+    expect([draft.state, draft.expiresAt, draft.targets, draft.pickerMessageId]).toEqual(["pending", 1_000 + 30*60_000, ["h|claude|a","h|omp|b"], null]);
+    expect(db.setDraftPicker(draft.id, 99)).toBe(true);
+    expect(db.dueDrafts(1_000 + 30*60_000 - 1)).toEqual([]);
+    expect(db.dueDrafts(1_000 + 30*60_000).map(d => d.id)).toEqual([draft.id]);
+    expect(db.transitionDraft(draft.id, "pending", "sent")).toBe(true);
+    expect(db.transitionDraft(draft.id, "pending", "sent")).toBe(false);
+    // The text survives the pre-submit claim (a refusal returns the draft to pending) and is dropped once finished.
+    expect(db.getDraft(draft.id)!.text).toBe("synthetic draft");
+    expect(db.transitionDraft(draft.id, "sent", "sent", 5)).toBe(true);
+    expect([db.getDraft(draft.id)!.replyId, db.getDraft(draft.id)!.text]).toEqual([5, ""]);
+    for (const to of ["idea", "cancelled", "expired"] as const) {
+      const other = db.createDraft({ chatId:"42", text:"synthetic other", targets:[] }, 1_000);
+      expect(db.transitionDraft(other.id, "pending", to)).toBe(true);
+      expect(db.getDraft(other.id)!.text).toBe("");
+    }
+    expect(db.transitionDraft(draft.id, "sent", "pending")).toBe(true);
+    expect(db.getDraft(draft.id)!.replyId).toBe(null);
+    expect(db.transitionDraft(draft.id, "pending", "cancelled")).toBe(true);
+    expect(db.setDraftPicker(draft.id, 100)).toBe(false);
+    expect(db.dueDrafts(Number.MAX_SAFE_INTEGER)).toEqual([]);
+
+    let changes = 0;
+    db.onIdeasChange = () => changes++;
+    const idea = db.createIdea({ text:"synthetic idea", source:"telegram", actor:"telegram:1", origin:"owner" }, 5);
+    expect([idea.state, idea.origin, db.openIdeaCount(), changes]).toEqual(["open", "owner", 1, 1]);
+    expect(db.markIdeaSent(idea.id, "h|claude|a", 11, 6)).toBe(true);
+    expect(db.markIdeaSent(idea.id, "h|claude|a", 12, 6)).toBe(false);
+    expect(db.archiveIdea(idea.id, 7)).toBe(false);
+    expect(db.reopenIdea(idea.id, 12)).toBe(false);
+    expect(db.reopenIdea(idea.id, 11)).toBe(true);
+    expect(db.getIdea(idea.id)).toMatchObject({ state:"open", sentReplyId:null, sentSessionKey:null, doneAt:null });
+    expect(db.archiveIdea(idea.id, 8)).toBe(true);
+    expect(db.archiveIdea(idea.id, 9)).toBe(false);
+    expect([db.openIdeaCount(), changes]).toEqual([0, 4]);
+    const second = db.createIdea({ text:"synthetic second", source:"web", actor:"web:loopback", origin:"owner" }, 10);
+    expect(db.listIdeas("all").map(i => i.id)).toEqual([second.id, idea.id]);
+    expect(db.listIdeas("archived").map(i => i.id)).toEqual([idea.id]);
+    expect(db.listIdeas().map(i => i.id)).toEqual([second.id]);
+  } finally { db.close(); }
+});
+
+test("picker re-map bumps rev, a stranded send claim comes back due, and draft->idea is atomic", () => {
+  const db = new DashDB(":memory:");
+  try {
+    // Re-mapping targets bumps the picker rev; finished drafts are never re-mapped.
+    const remap = db.createDraft({ chatId:"42", text:"synthetic remap", targets:["h|claude|a"] }, 1_000);
+    expect(remap.rev).toBe(0);
+    expect(db.setDraftTargets(remap.id, ["h|omp|b"])).toBe(true);
+    expect(db.getDraft(remap.id)).toMatchObject({ rev:1, targets:["h|omp|b"] });
+    // A send claim that never recorded a reply comes back due, so its text is not stranded.
+    expect(db.transitionDraft(remap.id, "pending", "sent")).toBe(true);
+    expect(db.setDraftTargets(remap.id, [])).toBe(false);
+    expect(db.dueDrafts(1_000 + 30*60_000).map(d => [d.id, d.state])).toEqual([[remap.id, "sent"]]);
+    // draft->idea is one transaction: a failure saving the idea leaves the draft and its text untouched.
+    db.onIdeasChange = () => { throw new Error("synthetic idea failure"); };
+    expect(() => db.draftToIdea(remap.id, "sent", { text:"synthetic remap", source:"telegram", actor:"telegram:1", origin:"draft_expired" }, 2_000)).toThrow();
+    expect(db.getDraft(remap.id)).toMatchObject({ state:"sent", text:"synthetic remap" });
+    expect(db.listIdeas("all")).toEqual([]);
+    db.onIdeasChange = undefined;
+    const saved = db.draftToIdea(remap.id, "sent", { text:"synthetic remap", source:"telegram", actor:"telegram:1", origin:"draft_expired" }, 2_000)!;
+    expect([saved.text, db.getDraft(remap.id)!.state, db.getDraft(remap.id)!.text]).toEqual(["synthetic remap", "idea", ""]);
+    expect(db.draftToIdea(remap.id, "sent", { text:"again", source:"telegram", actor:"telegram:1", origin:"draft_expired" }, 2_000)).toBeUndefined();
+  } finally { db.close(); }
+});
+
+test("undelivered messages flow back to Ideas; replies and owner cancels never do", () => {
+  const db = new DashDB(":memory:");
+  try {
+    const key = "host|claude|a";
+    const msg = (text: string, ideaId?: number) => db.enqueueReply(key,text,"telegram","telegram:7",undefined,1,10,undefined,"message",ideaId);
+    const expired = msg("synthetic lost");
+    db.enqueueReply(key,"synthetic plain reply","web","web:loopback",undefined,1,10);
+    const out = db.expireReplies(20);
+    expect(out.map(r => r.savedIdeaId === undefined)).toEqual([false, true]);
+    expect(db.getIdea(out[0]!.savedIdeaId!)).toMatchObject({ text:"synthetic lost", origin:"undelivered", source:"telegram", actor:"telegram:7", state:"open" });
+    expect(db.getReply(expired.id)!.text).toBe("");
+
+    const owner = msg("synthetic owner cancel");
+    expect(db.cancelReplies({ key, id: owner.id, reason:"owner_cancelled" }, 30)[0]!.savedIdeaId).toBeUndefined();
+    const ended = msg("synthetic ended");
+    expect(db.getIdea(db.cancelReplies({ key, reason:"ended" }, 31)[0]!.savedIdeaId!)!.origin).toBe("undelivered");
+
+    const idea = db.createIdea({ text:"synthetic from idea", source:"web", actor:"web:loopback", origin:"owner" }, 32);
+    const sent = msg(idea.text, idea.id);
+    db.markIdeaSent(idea.id, key, sent.id, 33);
+    const before = db.listIdeas("all").length;
+    expect(db.expireReplies(1_000)[0]!.savedIdeaId).toBe(idea.id);
+    expect([db.getIdea(idea.id)!.state, db.listIdeas("all").length]).toEqual(["open", before]);
+    expect(ended.kind).toBe("message");
+  } finally { db.close(); }
+});
+
 test("OMP pending ask identity and choices survive storage and answer only their own completion", () => {
   const dir = mkdtempSync(join(tmpdir(), "dash-omp-question-"));
   const path = join(dir, "db.sqlite");

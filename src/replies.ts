@@ -1,24 +1,29 @@
-import type { DashDB, Reply, SessionDTO, ReplySource } from "./db.ts";
+import type { DashDB, Reply, ReplyKind, SessionDTO, ReplySource } from "./db.ts";
 import { createAudit } from "./audit.ts";
 import { GO_REC_AUTH_TEXT } from "./actions.ts";
+import { isReplyKey, messageRefusalReason, type DeliveryObservation } from "./capabilities.ts";
 import type { EventKind, NormalizedEvent } from "./normalize.ts";
 import { normalizeQuestionSelections } from "./normalize.ts";
+
 export type { ReplySource } from "./db.ts";
 type Harness = "claude" | "omp";
 type Outcome = "delivered" | "expired" | "cancelled";
 type Listener = "loopback" | "tailnet" | "telegram" | "internal";
 type WaitResult = { status: 200; reply: string | { id: number; text: string; source: ReplySource } } | { status: 204 | 409 | 410 };
-type Pending = { resolve: (result: WaitResult) => void; timer: ReturnType<typeof setTimeout>; signal?: AbortSignal; abort?: () => void };
-type Waiter = { harness: Harness; waiterId: string; started: number; commitCapable: boolean; peer: string; pending?: Pending };
+type Pending = { resolve: (result: WaitResult) => void; timer: ReturnType<typeof setTimeout>; observedAt: number; expiresAt: number; signal?: AbortSignal; abort?: () => void };
+type Waiter = { key: string; harness: Harness; waiterId: string; started: number; commitCapable: boolean; peer: string; pending?: Pending };
 type Lease = { waiterId: string; peer: string };
 export type QuestionWaitResult = { status: 200; answers: Record<string, string> } | { status: 204 | 409 | 410 };
 type QuestionPending = { resolve: (result: QuestionWaitResult) => void; timer: ReturnType<typeof setTimeout>; signal?: AbortSignal; abort?: () => void };
 type QuestionWaiter = { key: string; toolUseId: string; pending?: QuestionPending };
 
-export type SubmitArgs = { key: string; text: string; source: ReplySource; actor: string; answersTurn?: number; answersQuestion?: string; listener?: Listener };
+export type SubmitArgs = { key: string; text: string; source: ReplySource; actor: string; answersTurn?: number; expectedTurn?: number;
+  answersQuestion?: string; listener?: Listener;
+  /** "message" is a new owner message, not an answer: no answersTurn, messageTtlMs, refused over 4000 chars. */
+  kind?: ReplyKind; /** The idea this message sends; it must be open and is marked sent with the queued reply. */ ideaId?: number };
 export type RefusalReason = "disabled" | "invalid_key" | "invalid_source" | "invalid_actor" |
   "invalid_text" | "empty_text" | "invalid_turn" | "invalid_question" | "stale_turn" | "stale_question" | "session_not_found" |
-  "session_ended" | "claude_dialog" | "omp_approval" | "not_deliverable";
+  "session_ended" | "claude_dialog" | "omp_approval" | "not_deliverable" | "too_long" | "idea_not_open";
 export type SubmitResult = { ok: true; replyId: number } | { refused: true; reason: RefusalReason };
 export type RegisterQuestionArgs = { event: NormalizedEvent; id: string; toolUseId: string; timeoutMs: number };
 export type QuestionSubmitArgs = { key: string; questionId: string; answers: unknown; source: "web" | "telegram"; actor: string; listener?: Listener };
@@ -32,13 +37,15 @@ export interface RepliesOptions {
   enabled?: boolean;
   now?: () => number;
   ttlMs?: number;
+  /** TTL for kind "message"; clamped to MESSAGE_TTL_MIN_MS..MESSAGE_TTL_MAX_MS (the Claude waiter hook times out at 6 h). */
+  messageTtlMs?: number;
   setTimer?: (fn: () => void, ms: number) => () => void;
   onQueued?: (reply: Reply) => void;
   onOutcome?: (reply: Reply, outcome: Outcome, dto?: SessionDTO) => void;
   send?: (dto: SessionDTO, eventKind?: EventKind) => void;
+  onWaiterChange?: (key: string) => void;
 }
 
-const keyPattern = /^[A-Za-z0-9_-]{1,64}\|(claude|omp)\|[A-Za-z0-9_-]{1,128}$/;
 const questionIdentityPattern = /^[A-Za-z0-9_-]{8,128}$/;
 const claudeQuestionIdentityPattern = /^[A-Za-z0-9_-]{43}$/;
 const toolUseIdPattern = /^[A-Za-z0-9_-]{1,256}$/;
@@ -47,7 +54,7 @@ const actorPattern: Record<ReplySource, RegExp> = {
   telegram: /^telegram:[1-9]\d*$/,
   autopilot: /^autopilot:goal:[1-9]\d*$/,
 };
-const claudeDialogs = new Set(["question", "permission", "permission_prompt", "elicitation_dialog", "elicitation_url_dialog"]);
+
 // Autopilot may not send the owner's authorization text, or any sentence of it, however it is cased or spaced.
 const fold = (text: string) => text.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").toLowerCase();
 const AUTH_SENTENCES = GO_REC_AUTH_TEXT.split(/(?<=\.) /).map(sentence => fold(sentence).replace(/\.$/, ""));
@@ -59,9 +66,17 @@ const exceedsReplyTextLimit = (text: string) => {
   for (const _ of text) if (++points > replyTextLimit) return true;
   return false;
 };
+export const MAX_MESSAGE_CHARS = 4000;
+/** Control characters removed and trimmed, never clipped; callers check length in code points against MAX_MESSAGE_CHARS. */
+export const cleanMessageText = (text: string) => text.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim();
+export const MESSAGE_TTL_MS = 4 * 3_600_000, MESSAGE_TTL_MIN_MS = 60_000, MESSAGE_TTL_MAX_MS = 6 * 3_600_000;
+const clampMessageTtl = (ms: number) => Number.isFinite(ms) ? Math.min(MESSAGE_TTL_MAX_MS, Math.max(MESSAGE_TTL_MIN_MS, Math.floor(ms))) : MESSAGE_TTL_MS;
+/** DASH_MESSAGE_TTL_MS: unset or non-numeric means the 4 h default; numbers are clamped to 60 s..6 h. */
+export const messageTtlFromEnv = (raw: string | undefined) => raw === undefined || raw.trim() === "" || !Number.isFinite(Number(raw)) ? MESSAGE_TTL_MS : clampMessageTtl(Number(raw));
 
-export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_000, setTimer, onQueued, onOutcome, send }: RepliesOptions) {
+export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_000, messageTtlMs = MESSAGE_TTL_MS, setTimer, onQueued, onOutcome, send, onWaiterChange }: RepliesOptions) {
   const audit = createAudit(db);
+  const messageTtl = clampMessageTtl(messageTtlMs);
   const waiters = new Map<string, Waiter>();
   const leases = new Map<number, Lease>();
   const acks = new Set<string>();
@@ -76,6 +91,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     clearTimeout(pending.timer);
     if (pending.abort) pending.signal?.removeEventListener("abort", pending.abort);
     pending.resolve(result);
+    onWaiterChange?.(waiter.key);
   };
   const outcome = (reply: Reply, state: Outcome, dto?: SessionDTO) => {
     counts[state]++;
@@ -90,6 +106,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     send?.(updated, "prompt");
   };
   const claudeBody = (reply: Reply) => reply.source === "autopilot" ? `[dash autopilot, not the owner]:\n${reply.text}` :
+    reply.kind === "message" ? `[dash] The owner sent a new message from ${reply.source === "web" ? "the dashboard" : "Telegram"} (not an answer to your last turn). Treat this as their next message:\n${reply.text}` :
     `[dash] The owner replied from ${reply.source === "web" ? "the dashboard" : "Telegram"}. Treat this as their next message:\n${reply.text}`;
 
   const tryDispatch = (key: string) => {
@@ -130,14 +147,17 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       if (current.started > started) return Promise.resolve({ status: 409 });
       finish(current, { status: 409 });
     } else if (current?.pending) finish(current, { status: 409 });
-    const waiter: Waiter = { harness, waiterId, started, commitCapable, peer };
+    const waiter: Waiter = { key, harness, waiterId, started, commitCapable, peer };
     waiters.set(key, waiter);
     return new Promise<WaitResult>(resolve => {
-      const pending: Pending = { resolve, signal, timer: setTimeout(() => finish(waiter, { status: 204 }), waitMs) };
+      const observedAt = now();
+      const pending: Pending = { resolve, signal, observedAt, expiresAt: observedAt + waitMs,
+        timer: setTimeout(() => finish(waiter, { status: 204 }), waitMs) };
       pending.abort = () => { finish(waiter, { status: 204 }); if (waiters.get(key) === waiter) waiters.delete(key); };
       signal?.addEventListener("abort", pending.abort, { once: true });
       waiter.pending = pending;
       tryDispatch(key);
+      if (waiter.pending) onWaiterChange?.(key);
     });
   };
   const questionWaiters = new Map<string, QuestionWaiter>();
@@ -226,7 +246,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
         !event.toolUseId || event.toolUseId !== toolUseId || !toolUseIdPattern.test(toolUseId) ||
         !claudeQuestionIdentityPattern.test(id) || token.byteLength !== 32 || token.toString("base64url") !== id ||
         !Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000 ||
-        !questions?.length || !keyPattern.test(`${event.host}|claude|${event.sessionId}`))
+        !questions?.length || !isReplyKey(`${event.host}|claude|${event.sessionId}`))
       return { refused:true,reason:"invalid_question" };
     const registeredAt = now();
     const result = db.registerQuestion(event,id,toolUseId,questions,registeredAt,timeoutMs);
@@ -344,45 +364,55 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
 
   return {
     submit(args: SubmitArgs): SubmitResult {
-      if (!enabled) return refuse("disabled", args);
-      if (typeof args.key !== "string" || !keyPattern.test(args.key)) return refuse("invalid_key", args);
+      const disabled = messageRefusalReason(undefined, enabled);
+      if (disabled) return refuse(disabled, args);
+      if (!isReplyKey(args.key)) return refuse("invalid_key", args);
       if (args.source !== "telegram" && args.source !== "web" && args.source !== "autopilot") return refuse("invalid_source", args);
       if (typeof args.actor !== "string" || !actorPattern[args.source].test(args.actor)) return refuse("invalid_actor", args);
       if (typeof args.text !== "string") return refuse("invalid_text", args);
+      const kind: ReplyKind = args.kind ?? "reply";
+      if (kind !== "reply" && kind !== "message") return refuse("invalid_text", args);
+      if (kind === "message" && [...cleanMessageText(args.text)].length > MAX_MESSAGE_CHARS) return refuse("too_long", args);
       if (args.answersQuestion !== undefined && exceedsReplyTextLimit(args.text)) return refuse("invalid_question", args);
       const text = cleanText(args.text);
       if (!text) return refuse("empty_text", args);
       if (args.source === "autopilot" && carriesAuth(text)) return refuse("invalid_source", args);
       if ((args.answersTurn !== undefined && (!Number.isSafeInteger(args.answersTurn) || args.answersTurn < 0)) ||
-        (args.source === "autopilot" && args.answersTurn === undefined)) return refuse("invalid_turn", args);
-      if (args.answersQuestion !== undefined && (typeof args.answersQuestion !== "string" ||
-          !questionIdentityPattern.test(args.answersQuestion) || (args.source !== "web" && args.source !== "telegram") || args.answersTurn !== undefined)) {
+        (args.expectedTurn !== undefined && (!Number.isSafeInteger(args.expectedTurn) || args.expectedTurn < 0)) ||
+        (args.source === "autopilot" && args.answersTurn === undefined) ||
+        (kind === "message" && args.answersTurn !== undefined)) return refuse("invalid_turn", args);
+      if (args.ideaId !== undefined && (kind !== "message" || !Number.isSafeInteger(args.ideaId) || db.getIdea(args.ideaId)?.state !== "open"))
+        return refuse("idea_not_open", args);
+              if (args.answersQuestion !== undefined && (typeof args.answersQuestion !== "string" ||
+          !questionIdentityPattern.test(args.answersQuestion) || (args.source !== "web" && args.source !== "telegram") || args.answersTurn !== undefined || kind === "message")) {
         return refuse("invalid_question", args);
       }
       const listener = args.listener ?? (args.source === "telegram" ? "telegram" : args.source === "web" ? "loopback" : "internal");
       const dto = db.getSession(args.key);
       if (!dto) return refuse("session_not_found", args, text, listener);
-      if (dto.status === "ended") return refuse("session_ended", args, text, listener);
-      if (dto.harness === "claude" && dto.status === "needs_input" && claudeDialogs.has(dto.needsReason ?? ""))
-        return refuse("claude_dialog", args, text, listener);
+      const refusal = messageRefusalReason(dto, enabled);
+      if (refusal && refusal !== "omp_approval") return refuse(refusal, args, text, listener);
       if (args.answersQuestion !== undefined && (dto.harness !== "omp" || dto.status !== "needs_input" ||
           dto.needsReason !== "question" || dto.pendingQuestionId !== args.answersQuestion))
         return refuse("stale_question", args, text, listener);
-      if (dto.harness === "omp" && dto.status === "needs_input" && dto.needsReason === "permission")
-        return refuse("omp_approval", args, text, listener);
+      if (refusal) return refuse(refusal, args, text, listener);
+      // Submission-only snapshot guard: ordinary queued text is not a turn-bound answer.
+      if (args.expectedTurn !== undefined && args.expectedTurn !== dto.turnSeq) return refuse("stale_turn", args, text, listener);
       if (args.answersTurn !== undefined && args.answersTurn !== dto.turnSeq) return refuse("stale_turn", args, text, listener);
       if (args.answersTurn !== undefined && dto.status !== "your_turn") return refuse("not_deliverable", args, text, listener);
       if (args.source !== "autopilot") cancelled(db.cancelReplies({ key: args.key, source: "autopilot", reason: "owner_replied" }, now()), dto);
       const ts = now();
       const prepared = audit.prepare({ ts, sessionKey: args.key, source: args.source, actor: args.actor, listener, text });
-      const reply = db.enqueueReply(args.key, text, args.source, args.actor, args.answersTurn, ts, ttlMs, prepared, args.answersQuestion);
+      const reply = db.enqueueReply(args.key, text, args.source, args.actor, args.answersTurn, ts, kind === "message" ? messageTtl : ttlMs, prepared, kind, args.ideaId,
+        args.answersQuestion);
+      if (args.ideaId !== undefined) db.markIdeaSent(args.ideaId, args.key, reply.id, ts);
       onQueued?.(reply);
       tryDispatch(args.key);
       return { ok: true, replyId: reply.id };
     },
     submitQuestion(args: QuestionSubmitArgs): QuestionSubmitResult {
       if (!enabled) return refuseQuestion("disabled",args);
-      if (typeof args.key !== "string" || !keyPattern.test(args.key)) return refuseQuestion("invalid_key",args);
+      if (!isReplyKey(args.key)) return refuseQuestion("invalid_key",args);
       if (args.source !== "web" && args.source !== "telegram") return refuseQuestion("invalid_source",args);
       if (typeof args.actor !== "string" || !actorPattern[args.source].test(args.actor))
         return refuseQuestion("invalid_actor",args);
@@ -430,6 +460,13 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     waitClaude: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal) => wait("claude", key, waiterId, started, waitMs, signal),
     waitOmp: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal, commitCapable = false, peer = "loopback") =>
       wait("omp", key, waiterId, started, waitMs, signal, commitCapable, peer),
+    deliveryObservation(key: string): DeliveryObservation | undefined {
+      const waiter = waiters.get(key);
+      const pending = waiter?.pending;
+      if (!waiter || !pending || pending.signal?.aborted || pending.expiresAt <= now()) return undefined;
+      return { observedAt: pending.observedAt, expiresAt: pending.expiresAt,
+        protocol: waiter.harness === "claude" ? "claude-waiter" : waiter.commitCapable ? "omp-commit" : "omp-legacy" };
+    },
     commitOmp(id: number, waiterId: string, peer = "loopback") {
       const lease = leases.get(id);
       if (!lease || lease.waiterId !== waiterId || lease.peer !== peer) return false;
@@ -468,7 +505,8 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     sweep,
     health() {
       const count = db.replyCounts();
-      const active = [...waiters.values()].filter(w => w.pending);
+      const at = now();
+      const active = [...waiters.values()].filter(w => w.pending && !w.pending.signal?.aborted && w.pending.expiresAt > at);
       return { enabled, queued: count.queued, leased: count.leased,
         waiters: { claude: active.filter(w => w.harness === "claude").length, omp: active.filter(w => w.harness === "omp").length }, ...counts };
     },
