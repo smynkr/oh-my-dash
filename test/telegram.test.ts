@@ -3689,6 +3689,36 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
     expect(f.db.queuedReplies()).toHaveLength(0);
   });
 
+  test("/to never routes past an exact name that is unavailable to a looser match", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    seedAt(f.db, "a", "ended", 3, "alpha");
+    seedAt(f.db, "b", "your_turn", 2, "alpha-2");
+    f.bot.enqueue(message("/to alpha hi"));
+    await apiSettled(() => f.bot.sent.length === 1);
+    expect(f.bot.sent[0]!.text).toBe("<b>alpha</b> has ended.");
+    expect(f.db.queuedReplies()).toHaveLength(0);
+    f.bot.enqueue(message("/to alpha-2 hi", { message_id: 11 }));
+    await eventually(() => f.db.queuedReplies().length === 1);
+    expect(f.db.getSession(f.db.queuedReplies()[0]!.sessionKey)!.displayName).toBe("alpha-2");
+  });
+
+  test("Save to Ideas on a picker opened from an idea keeps that idea instead of duplicating it", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    seedAt(f.db, "alpha", "your_turn", 2);
+    f.bot.enqueue(message("/idea only idea"));
+    f.bot.enqueue(message("/ideas", { message_id: 11 }));
+    await apiSettled(() => f.bot.sent.length === 2);
+    tap(f, "i:1:s", 2);
+    await apiSettled(() => f.bot.sent.length === 3);
+    expect(f.db.getDraft(1)).toMatchObject({ ideaId: 1 });
+    tap(f, "c:1:0:i", 3);
+    await apiSettled(() => answers(f.bot).length === 2);
+    expect(answers(f.bot)).toEqual(["Pick a session.", "Kept in Ideas (#1)"]);
+    expect(f.db.getDraft(1)!.state).toBe("cancelled");
+    expect(f.db.getIdea(1)!.state).toBe("open");
+    expect(f.db.getIdea(2)).toBeUndefined();
+  });
+
   test("/to@bot works in a bound group, /to@otherbot is ignored, and a non-owner is ignored in DM and group", async () => {
     const f = await topicFixture({ repliesEnabled: true });
     seedAt(f.db, "a", "your_turn", 3, "alpha");

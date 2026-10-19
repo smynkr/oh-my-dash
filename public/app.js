@@ -2441,7 +2441,7 @@
     const filtered = visibleSessions();
     const activeCard = document.activeElement?.closest?.('.session-card'), focus = focusSnapshot(activeCard), oldScroll=window.scrollY;
     cardSizes.disconnect();
-    sessionsNode.replaceChildren(...filtered.map(renderCard));
+    sessionsNode.replaceChildren(...filtered.map(session => renderCard(session)));
     sizeSessionCards([...sessionsNode.children]);
     $('#sessions-empty').hidden=filtered.length>0; window.scrollTo(0,oldScroll);
     if (focus) restoreCardFocus(focus, sessionsNode.querySelector(`[data-key="${CSS.escape(focus.key)}"]`));
@@ -3060,7 +3060,8 @@
   }
 
   function renderTimeline(append=false) {
-    const visible = state.timeline.filter(projectFilterMatches);
+    // Timeline is filtered by machine, harness and headless only (see #timeline-filter-note), never by project.
+    const visible = state.timeline;
     if (!append) timelineNode.replaceChildren();
     const existing = new Set([...timelineNode.children].map(item => item.dataset.responseId));
     for (const row of visible) {
@@ -3346,6 +3347,7 @@
   }
   $('#clear-filters').addEventListener('click', () => {
     for (const id of ['project', 'host', 'account', 'harness', 'status']) $(`#${id}-filter`).value = '';
+    persistProjectFilter();
     $('#session-search').value = '';
     $('#headless-filter').checked = false; $('#ended-filter').checked = false;
     invalidateOutputSearch('Output filters changed. Search again to apply them.');

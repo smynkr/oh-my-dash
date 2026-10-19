@@ -1226,7 +1226,7 @@ export class DashDB {
       ...(this.decisionsEnabled ? { recommendation: recommendationQuote(String(row.text)) } : {}) };
   }
   getResponse(id: number): ResponseDTO | undefined {
-    const row = this.sqlite.query(`SELECT r.*,s.cwd,s.display_name,s.title,s.host,s.harness,s.session_id
+    const row = this.sqlite.query(`SELECT r.*,s.cwd,s.display_name,s.display_name_override,s.account_alias,s.account_alias_override,s.title,s.host,s.harness,s.session_id
       FROM responses r JOIN sessions s ON s.key=r.session_key WHERE r.id=?`).get(id) as Row | null;
     return row ? this.response(row) : undefined;
   }
@@ -1272,7 +1272,7 @@ export class DashDB {
     })();
   }
   responseForTurn(key: string, turnSeq: number): ResponseDTO | undefined {
-    const row = this.sqlite.query(`SELECT r.*,s.cwd,s.display_name,s.title,s.host,s.harness,s.session_id
+    const row = this.sqlite.query(`SELECT r.*,s.cwd,s.display_name,s.display_name_override,s.account_alias,s.account_alias_override,s.title,s.host,s.harness,s.session_id
       FROM responses r JOIN sessions s ON s.key=r.session_key
       WHERE r.session_key=? AND r.turn_seq=? ORDER BY r.ts DESC,r.id DESC LIMIT 1`).get(key, turnSeq) as Row | null;
     return row ? this.response(row) : undefined;

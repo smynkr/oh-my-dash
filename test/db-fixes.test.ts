@@ -310,3 +310,14 @@ test("R3 legacy responses gain inert decision columns and malformed stored decis
     expect(db.timeline()[0].decisions).toEqual({ decisions:[], source:"luna" });
   } finally { db.close(); rmSync(dir,{recursive:true,force:true}); }
 });
+
+test("responseForTurn and getResponse carry the session's display-name override and account alias", () => {
+  const db = new DashDB(":memory:");
+  try {
+    db.applyEvent(event("hook","response",1000,"synthetic response"));
+    db.sqlite.query("UPDATE sessions SET display_name_override=?,account_alias_override=? WHERE key=?").run("renamed-session","work","synthetic-host|claude|hook");
+    const byTurn = db.responseForTurn("synthetic-host|claude|hook",1)!;
+    expect([byTurn.displayName, byTurn.accountAlias]).toEqual(["renamed-session","work"]);
+    expect([db.getResponse(byTurn.id)!.displayName, db.getResponse(byTurn.id)!.accountAlias]).toEqual(["renamed-session","work"]);
+  } finally { db.close(); }
+});

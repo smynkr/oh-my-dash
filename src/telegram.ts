@@ -1175,14 +1175,16 @@ export function createTelegram(opts: TelegramOptions) {
     if (!match) { await retrySendAt(destination, "Use /to &lt;session-name&gt; your text"); return; }
     const [, name, text] = match;
     if (tooLong(text!)) { await retrySendAt(destination, replyRefusal("too_long"), undefined, toMessageId); return; }
-    const found = matchSessions(name!, deliverable());
+    // The most specific tier that names any session wins, so a name that exactly names an unavailable session is
+    // refused instead of reaching a different, deliverable session through a looser prefix or substring match.
+    const named = matchSessions(name!, db.listSessions(false, true).filter(isHarness)), tier = new Set(named.map(dto => dto.key));
+    const found = deliverable().filter(dto => tier.has(dto.key));
     if (found.length === 1) { await routeReply(found[0]!.key, text!, destination, toMessageId, "message"); return; }
     if (found.length > 1) {
       await openPicker(destination, text!, toMessageId, `"${name}" matches ${found.length} sessions:`, found); return;
     }
-    const blocked = matchSessions(name!, db.listSessions(false, true).filter(isHarness));
-    if (blocked.length) {
-      const dto = blocked[0]!, reason = dto.status === "ended" ? "session_ended" : messageRefusalReason(dto, true) ?? "not_deliverable";
+    if (named.length) {
+      const dto = named[0]!, reason = dto.status === "ended" ? "session_ended" : messageRefusalReason(dto, true) ?? "not_deliverable";
       await retrySendAt(destination, reason === "session_ended" ? `<b>${escapeHtml(clipped(dto.displayName, 256))}</b> has ended.` : replyRefusal(reason),
         undefined, toMessageId);
       return;
@@ -1606,6 +1608,12 @@ export function createTelegram(opts: TelegramOptions) {
       await answerCallback(callback, "Cancelled"); return;
     }
     if (action === "i") {
+      // A picker opened from an idea is already in Ideas: keep that idea instead of saving a duplicate.
+      if (draft.ideaId !== null) {
+        if (!db.transitionDraft(draft.id, "pending", "cancelled")) { await answerCallback(callback, "Already handled"); return; }
+        void editWith(destination, messageId, `💡 Kept in Ideas (#${draft.ideaId}).`);
+        await answerCallback(callback, `Kept in Ideas (#${draft.ideaId})`); return;
+      }
       const idea = db.draftToIdea(draft.id, "pending", ideaFields(draft.text, "owner"), now());
       if (!idea) { await answerCallback(callback, "Already handled"); return; }
       void editWith(destination, messageId, `💡 Saved to Ideas (#${idea.id}).`);
