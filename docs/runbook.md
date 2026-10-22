@@ -111,9 +111,9 @@ For an application rollback, keep the known-good Git commit and database backup.
 
 ## Dashboard console
 
-The default view is **Console**: a table of sessions with state, project, session name, machine, account, harness and activity age, plus a reading and reply pane for the selected session. **Feed** and **Timeline** remain alternate views. Headless and ended sessions stay hidden until you enable **Show headless** or **Show ended**.
+The default view is **Console**: a table of sessions with state, project, session name, machine, account, harness and activity age, plus a reading and reply pane that switches between **Selected session** and a consolidated chronological **Timeline (all clients)** across all connected clients, alongside the open-by-default **Client output timeline** section below the console table. **Feed** (`#view=sessions`) and full-page **Timeline** (`#view=timeline`) remain alternate views and persist in the URL hash across reloads. Headless and ended sessions stay hidden until you enable **Show headless** or **Show ended**.
 
-Selecting a session opens its first unread retained response, or the latest output when nothing is unread. The reply composer is locked to that session. Filters, row changes and live events never retarget it or replace a draft. **Show latest** returns from history to current output.
+Selecting a session (either from the table or by clicking a session name in any timeline item) switches the Console reading pane to **Selected session** and opens its first unread retained response, or the latest output when nothing is unread. The reply composer is locked to that session. Filters, row changes and live events never retarget it or replace a draft. **Show latest** returns from history to current output.
 
 ### Reading and unread state
 
@@ -121,6 +121,7 @@ Selecting a session opens its first unread retained response, or the latest outp
 - Opening, scrolling, searching, following live and receiving events never mark output read. Read state is stored with the responses in the collector database, so it survives restarts and syncs across the owner's browsers.
 - A repeated live response becomes unread again at its new timestamp. Pruned or deleted output shows as unavailable rather than being replaced by other output.
 - **Load older responses** pages through retained history without changing read state.
+- **Client output timeline** consolidates retained and live SSE assistant responses from all connected clients in chronological order (filtered by **Machine**, **Harness** and **Show headless**). Each item shows the session name, project, machine, account alias, harness and relative/ISO timestamp; **Load older responses** pages through older entries across all timeline surfaces.
 
 ### Compare, batch prompts and drafts
 
@@ -135,7 +136,7 @@ Selecting a session opens its first unread retained response, or the latest outp
 - **Search outputs** searches retained response text and identity metadata as a literal, case-insensitive phrase, 25 results per page. Its project, machine, account and harness filters apply to output results; session-list search does not.
 - Pins hold immutable session keys in a shared working set. A pin for a session that no longer exists stays visible as missing and never resolves to another session with a similar name.
 - Named views save search, filters, visibility, grouping, density and columns. Applying a view does not change the selected session or its draft. The collector stores up to 100 views and 1,000 pins; attempts beyond those limits show an error rather than truncating silently.
-- Keyboard shortcuts: `/` focuses session search; `j` and `k`, or the arrow keys while a row is focused, move through visible rows; `r` focuses the reply composer without sending; `?` opens shortcut help; Ctrl or Cmd+K opens **Commands**. Shortcuts do not fire while typing in a field. No command sends a reply, chooses a decision option or grants authorization.
+- Keyboard shortcuts: `/` focuses session search; `j` and `k`, or the arrow keys while a row is focused, move through visible rows; `r` focuses the reply composer without sending; `?` opens shortcut help; Ctrl or Cmd+K opens **Commands** (including **Show all client outputs in Console pane** and **Show selected session in Console pane**). Shortcuts do not fire while typing in a field. No command sends a reply, chooses a decision option or grants authorization.
 
 ### Sources and session controls
 
@@ -148,6 +149,7 @@ Selecting a session opens its first unread retained response, or the latest outp
 Console read routes follow the same loopback and tailnet access rules as the rest of the dashboard; see [Security](../SECURITY.md). Every `POST /api/*` also needs the same-origin JSON headers described under [Replies and receipts](#replies-and-receipts). URL-encode a session key as one path segment. Malformed input returns 400, and unknown sessions or responses return 404.
 
 - `GET /api/sessions/:key/responses?limit=50&before=<timestamp>` returns `{ responses, hasMore }`, newest first. `limit` is 1 to 100, and the timestamp cursor is exclusive. History reads never change read state.
+- `GET /api/timeline?limit=50&before=<timestamp>&headless=0&ended=1&host=...&harness=...` returns `{ responses, hasMore }` in reverse chronological order across all clients matching the machine, harness and headless filters.
 - `GET /api/sessions/:key/responses/:responseId` returns `{ response }`.
 - `GET /api/sessions/:key/read-position` returns `{ firstUnread, unreadCount, retainedCount }` without changing read state.
 - `POST /api/sessions/:key/responses/:responseId/seen` with body `{ "ts": <displayed timestamp> }` acknowledges that exact version. It is idempotent for that version; a changed timestamp returns 409 `stale_response`. `POST /api/sessions/:key/seen` acknowledges one session's retained output, and `POST /api/seen-all` acknowledges every session.
