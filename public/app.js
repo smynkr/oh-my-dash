@@ -1166,7 +1166,12 @@
 
   function readConsoleLocation() {
     const params = new URLSearchParams(location.hash.slice(1));
-    return { key: params.get('session') || '', response: params.get('response') };
+    const view = params.get('view');
+    return {
+      key: params.get('session') || '',
+      response: params.get('response'),
+      view: view === 'timeline' || view === 'sessions' ? view : 'console',
+    };
   }
   function historicalTargetFromLocation(locationState) {
     if (locationState.response === null) return null;
@@ -1187,6 +1192,7 @@
     selectionVersion: 0, selectionInitialized: false, readResume: null, readNavigation: null, readPositions: new Map(), readPositionRequests: new Map(),
     readActionNotice: null, markingResponse: null,
     historicalTarget: historicalTargetFromLocation(initialConsoleLocation),
+    paneMode: 'session',
   };
   const comparisonSlots = { a: null, b: null };
   const selectiveSendState = { phase: 'draft', targets: new Map(), text: '', submitted: 0 };
@@ -1200,13 +1206,53 @@
     responsesOf(s).map(r => [byId(r, 'id'), byId(r, 'ts'), byId(r, 'turnSeq', 'turn_seq'), byId(r, 'decisionState', 'decision_state')])]);
   const statusLabel = s => ({ needs_input: 'Needs you', your_turn: 'Your turn', working: 'Working', ended: 'Ended' })[statusOf(s)] || 'Unknown';
   function setSessionUrl(key, push = false, responseId = null) {
+    if (state.view !== 'console' && !push) return;
     const url = new URL(location.href), hash = new URLSearchParams(url.hash.slice(1));
+    hash.delete('view');
     if (key) hash.set('session', key); else hash.delete('session');
     if (responseId !== null && responseId !== undefined) hash.set('response', String(responseId)); else hash.delete('response');
     url.hash = hash.toString();
     history[push ? 'pushState' : 'replaceState'](null, '', url);
   }
+  function setViewUrl(view, push = false) {
+    const url = new URL(location.href), hash = new URLSearchParams(url.hash.slice(1));
+    if (view === 'timeline' || view === 'sessions') {
+      if (hash.get('view') === view && !hash.has('session') && !hash.has('response')) return;
+      url.hash = new URLSearchParams({ view }).toString();
+    } else if (hash.has('view')) {
+      hash.delete('view');
+      if (consoleState.selectedKey && !hash.get('session')) hash.set('session', consoleState.selectedKey);
+      url.hash = hash.toString();
+    } else return;
+    history[push ? 'pushState' : 'replaceState'](null, '', url);
+  }
+  function setConsolePaneMode(mode, render = true) {
+    const isTimeline = mode === 'timeline';
+    consoleState.paneMode = isTimeline ? 'timeline' : 'session';
+    const sessionBtn = $('#console-pane-session'), timelineBtn = $('#console-pane-timeline');
+    sessionBtn.classList.toggle('active', !isTimeline);
+    sessionBtn.setAttribute('aria-pressed', String(!isTimeline));
+    timelineBtn.classList.toggle('active', isTimeline);
+    timelineBtn.setAttribute('aria-pressed', String(isTimeline));
+    $('#console-detail').hidden = isTimeline;
+    $('.console-history-section').hidden = isTimeline;
+    $('#console-read-boundary').hidden = isTimeline;
+    $('#console-pin-selected').hidden = isTimeline;
+    $('#console-follow-wrap').hidden = isTimeline;
+    $('#console-copy-link').hidden = isTimeline;
+    $('#console-pane-timeline-view').hidden = !isTimeline;
+    if (isTimeline) {
+      $('#console-update').hidden = true;
+      $('#console-selection-status').textContent = 'All client outputs in chronological order.';
+      if (!state.timeline.length) loadTimeline(false).catch(() => {});
+      else renderTimeline();
+    } else if (render) {
+      renderConsole();
+      renderConsoleHistory();
+    }
+  }
   function selectConsoleSession(key, push = true, responseId = null, searchResult = null, selectionOptions = {}) {
+    if (consoleState.paneMode === 'timeline') setConsolePaneMode('session', false);
     const pane = $('.console-pane');
     if (consoleState.historicalTarget) {
       consoleState.reading.delete(consoleState.historicalTarget.key);
@@ -2097,6 +2143,7 @@
     renderSessions();
     refreshVisibleReplyLists();
     renderConsolePreferences();
+    loadTimeline(false).catch(() => {});
     loadSessions({ includeAll: Boolean(consoleState.selectedKey) }).catch(error => {
       consolePreferences.notice = `View applied, but sessions could not be refreshed: ${error.message || 'request failed'}.`;
       renderConsolePreferences();
@@ -2235,7 +2282,7 @@
     for (const s of rows) if (!known.has(responseKey(s))) consoleState.order.push(responseKey(s));
     const positions = new Map(consoleState.order.map((key, i) => [key, i]));
     rows.sort((a, b) => positions.get(responseKey(a)) - positions.get(responseKey(b)));
-    if (!consoleState.selectedKey && rows.length && !consoleState.preserveEmptySelection) { consoleState.selectedKey = responseKey(rows[0]); setSessionUrl(consoleState.selectedKey); }
+    if (!consoleState.selectedKey && rows.length && !consoleState.preserveEmptySelection) { consoleState.selectedKey = responseKey(rows[0]); if (state.view === 'console') setSessionUrl(consoleState.selectedKey); }
     if (!consoleState.selectionInitialized && consoleState.selectedKey) {
       const explicitTarget = consoleState.historicalTarget?.key === consoleState.selectedKey;
       beginConsoleSelection(consoleState.selectedKey, !explicitTarget);
@@ -2306,6 +2353,11 @@
     $('#console-copy-link').disabled = !current && !target;
     $('#console-follow').disabled = !current || Boolean(target);
     $('#console-update').disabled = !current;
+    if (consoleState.paneMode === 'timeline') {
+      $('#console-update').hidden = true;
+      $('#console-selection-status').textContent = 'All client outputs in chronological order.';
+      return;
+    }
     if (target) {
       $('#console-follow').checked = false;
       $('#console-update').hidden = !current;
@@ -2518,7 +2570,7 @@
         row.displayName = nameOf(dto); row.accountAlias = dto.accountAlias; identityChanged = true;
       }
     }
-    if (identityChanged && state.view === 'timeline') renderTimeline();
+    if (identityChanged) renderTimeline();
     if (state.view === 'console') { renderConsole(key); updateCounts(); return; }
     if (state.view !== 'sessions') { updateCounts(); return; }
     if (old) cardSizes.unobserve(old);
@@ -2619,9 +2671,11 @@
     return [
       { id: 'search', label: 'Search sessions', hint: '/', enabled: true, run: focusSessionSearch },
       { id: 'reply', label: 'Focus selected reply composer', hint: 'r', enabled: Boolean(selectedComposer()), run: () => selectedComposer()?.focus() },
-      { id: 'console', label: 'Show Console', enabled: true, run: () => { setFeedView('console'); $('#console-tab').focus(); } },
-      { id: 'feed', label: 'Show Feed', enabled: true, run: () => { setFeedView('sessions'); $('#sessions-tab').focus(); } },
-      { id: 'timeline', label: 'Show Timeline', enabled: true, run: () => { setFeedView('timeline'); $('#timeline-tab').focus(); } },
+      { id: 'console', label: 'Show Console', enabled: true, run: () => { setFeedView('console', true); $('#console-tab').focus(); } },
+      { id: 'feed', label: 'Show Feed', enabled: true, run: () => { setFeedView('sessions', true); $('#sessions-tab').focus(); } },
+      { id: 'timeline', label: 'Show Timeline', enabled: true, run: () => { setFeedView('timeline', true); $('#timeline-tab').focus(); } },
+      { id: 'consolePaneTimeline', label: 'Show all client outputs in Console pane', enabled: state.view === 'console', run: () => { setConsolePaneMode('timeline'); $('#console-pane-timeline').focus(); } },
+      { id: 'consolePaneSession', label: 'Show selected session in Console pane', enabled: state.view === 'console', run: () => { setConsolePaneMode('session'); $('#console-pane-session').focus(); } },
       control('next', 'Next unresolved session', '#next-unresolved'),
       control('nextUnread', 'Next unread response', '#console-next-unread'),
       control('markResponseRead', 'Mark displayed response read', '#console-mark-response-read'),
@@ -3059,50 +3113,95 @@
     if (consoleState.selectedKey) fetchReadPosition(consoleState.selectedKey, consoleState.selectionVersion);
   }
 
+  const timelineTargets = () => [
+    { list: timelineNode, empty: $('#timeline-empty'), more: $('#timeline-more') },
+    { list: $('#console-timeline'), empty: $('#console-timeline-empty'), more: $('#console-timeline-more') },
+    { list: $('#console-pane-timeline-list'), empty: $('#console-pane-timeline-empty'), more: $('#console-pane-timeline-more') },
+  ].filter(target => target.list && target.empty && target.more);
+  function updateTimelineSummary() {
+    const summary = $('#console-timeline-summary-help');
+    if (!summary) return;
+    const count = state.timeline.length;
+    const clients = new Set(state.timeline.map(row => `${byId(row, 'host') || 'local'}|${byId(row, 'harness') || 'claude'}`)).size;
+    summary.textContent = count
+      ? `${count}${state.timelineDone ? '' : '+'} output${count === 1 ? '' : 's'} · ${clients} client${clients === 1 ? '' : 's'} · chronological order`
+      : 'All clients · chronological order';
+  }
   function renderTimeline(append=false) {
     // Timeline is filtered by machine, harness and headless only (see #timeline-filter-note), never by project.
     const visible = state.timeline;
-    if (!append) timelineNode.replaceChildren();
-    const existing = new Set([...timelineNode.children].map(item => item.dataset.responseId));
-    for (const row of visible) {
-      const id = String(byId(row, 'id') ?? '');
-      if (append && existing.has(id)) continue;
-      timelineNode.append(timelineItem(row));
-      existing.add(id);
+    for (const { list, empty, more } of timelineTargets()) {
+      if (!append) list.replaceChildren();
+      const existing = new Set([...list.children].map(item => item.dataset.responseId));
+      for (const row of visible) {
+        const id = String(byId(row, 'id') ?? '');
+        if (append && existing.has(id)) continue;
+        list.append(timelineItem(row));
+        existing.add(id);
+      }
+      empty.textContent = state.timeline.length && !visible.length
+        ? 'No responses in the loaded timeline match these filters.' : 'No responses yet.';
+      empty.hidden = visible.length > 0;
+      more.hidden = state.timelineDone || state.timeline.length === 0;
     }
-    $('#timeline-empty').textContent = state.timeline.length && !visible.length
-      ? 'No responses in the loaded timeline match these filters.' : 'No responses yet.';
-    $('#timeline-empty').hidden = visible.length > 0;
-    $('#timeline-more').hidden = state.timelineDone || state.timeline.length === 0;
+    updateTimelineSummary();
   }
   function timelineItem(row) {
     const item=el('article','timeline-item'), header=el('div','timeline-header');
+    const key = String(byId(row, 'sessionKey', 'session_key') ?? '');
+    const name = row.displayName||row.display_name||row.title||row.cwd?.split('/').filter(Boolean).pop()||'Session';
     item.dataset.responseId = String(byId(row, 'id') ?? '');
-    header.append(el('strong','',row.displayName||row.display_name||row.title||row.cwd?.split('/').filter(Boolean).pop()||'Session'));
-    header.append(el('span','',`${row.host||''} · ${row.accountAlias || 'Unassigned account'} · ${row.harness==='omp'?'OMP':'Claude'} · ${relative(row.ts)}`)); item.append(header);
+    if (key) item.dataset.sessionKey = key;
+    if (key) {
+      const button = el('button', 'timeline-session-button');
+      button.type = 'button';
+      button.title = `Open ${name} in Console`;
+      button.append(el('strong', '', name));
+      button.addEventListener('click', () => {
+        setConsolePaneMode('session', false);
+        setFeedView('console', true);
+        selectConsoleSession(key);
+      });
+      header.append(button);
+    } else {
+      header.append(el('strong', '', name));
+    }
+    const meta = el('span', 'timeline-meta');
+    const parts = [row.project || '', row.host || '', row.accountAlias || 'Unassigned account', row.harness === 'omp' ? 'OMP' : 'Claude'].filter(Boolean);
+    meta.textContent = `${parts.join(' · ')} · `;
+    const ts = Number(byId(row, 'ts')), date = new Date(ts);
+    const time = el('time', 'timeline-time', relative(ts));
+    if (Number.isFinite(date.getTime())) {
+      time.dateTime = date.toISOString();
+      time.title = date.toLocaleString();
+    }
+    meta.append(time);
+    header.append(meta);
+    item.append(header);
     item.append(responseBlock(row,row)); return item;
   }
   function prependTimelineResponses(dto, previous) {
-    if (!state.timeline.length || (!$('#headless-filter').checked && (byId(dto,'interactive') === false || byId(dto,'interactive') === 0)) ||
+    if ((!$('#headless-filter').checked && (byId(dto,'interactive') === false || byId(dto,'interactive') === 0)) ||
         ($('#host-filter').value && byId(dto,'host') !== $('#host-filter').value) ||
         ($('#harness-filter').value && byId(dto,'harness') !== $('#harness-filter').value)) return;
     const known=new Set(state.timeline.map(r=>String(byId(r,'id'))));
     const previousIds=new Set(responsesOf(previous||{}).map(r=>String(byId(r,'id'))));
-    const newest=Number(byId(state.timeline[0],'ts'));
+    const newest=state.timeline.length ? Number(byId(state.timeline[0],'ts')) : -Infinity;
     const fresh=responsesOf(dto).filter(r=>byId(r,'id') != null && !known.has(String(byId(r,'id'))) &&
       !previousIds.has(String(byId(r,'id'))) && Number(byId(r,'ts'))>=newest);
     if (!fresh.length) return;
-    const rows=fresh.map(r=>({...r, host:byId(dto,'host'), harness:byId(dto,'harness'), accountAlias:byId(dto,'accountAlias'), displayName:nameOf(dto), title:byId(dto,'title'), cwd:byId(dto,'cwd'), project:byId(dto,'project')})).sort((a,b)=>Number(byId(b,'ts'))-Number(byId(a,'ts')));
+    const rows=fresh.map(r=>({...r, sessionKey:responseKey(dto), host:byId(dto,'host'), harness:byId(dto,'harness'), accountAlias:byId(dto,'accountAlias'), displayName:nameOf(dto), title:byId(dto,'title'), cwd:byId(dto,'cwd'), project:byId(dto,'project')})).sort((a,b)=>Number(byId(b,'ts'))-Number(byId(a,'ts')));
     state.timeline.unshift(...rows);
-    if (state.view==='timeline') {
-      const oldY=window.scrollY, visible = rows.filter(projectFilterMatches);
-      if (visible.length) timelineNode.prepend(...visible.map(timelineItem));
-      $('#timeline-empty').textContent = state.timeline.length && !timelineNode.childElementCount
+    const oldY=window.scrollY;
+    for (const { list, empty, more } of timelineTargets()) {
+      list.prepend(...rows.map(timelineItem));
+      empty.textContent = state.timeline.length && !list.childElementCount
         ? 'No responses in the loaded timeline match these filters.' : 'No responses yet.';
-      $('#timeline-empty').hidden = timelineNode.childElementCount > 0;
-      $('#timeline-more').hidden = state.timelineDone===true;
-      window.scrollTo(0,oldY);
+      empty.hidden = list.childElementCount > 0;
+      more.hidden = state.timelineDone===true;
     }
+    updateTimelineSummary();
+    if (state.view==='timeline') window.scrollTo(0,oldY);
   }
   async function loadTimeline(append=false, preserveLoadedPages=false) {
     if(state.timelineLoading || (append && state.timelineDone)) return;
@@ -3243,7 +3342,7 @@
 
   function connect() {
     state.source?.close(); const source=new EventSource('/api/stream'); state.source=source;
-    source.onopen=()=>{ setConnection('Live',true); loadConsolePreferencesRemote(); scheduleSourcesRefresh(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions().catch(()=>{})).then(()=>{ if(consoleState.selectedKey) fetchReadPosition(consoleState.selectedKey,consoleState.selectionVersion); }); refreshTelegram().catch(()=>{}); refreshIdeas(); if(state.view==='timeline') loadTimeline(false,true).catch(()=>{}); }; source.onerror=()=>setConnection('Reconnecting',false);
+    source.onopen=()=>{ setConnection('Live',true); loadConsolePreferencesRemote(); scheduleSourcesRefresh(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions().catch(()=>{})).then(()=>{ if(consoleState.selectedKey) fetchReadPosition(consoleState.selectedKey,consoleState.selectionVersion); }); refreshTelegram().catch(()=>{}); refreshIdeas(); loadTimeline(false,true).catch(()=>{}); }; source.onerror=()=>setConnection('Reconnecting',false);
     source.addEventListener('console-preferences', event => {
       try {
         if (acceptConsolePreferences(JSON.parse(event.data), 'remote')) updateConsolePinButtons();
@@ -3283,8 +3382,9 @@
   function notify(title,body) { try { if('Notification' in window && Notification.permission==='granted') new Notification(title,{body}); } catch {} }
   function loadNotificationPrefs() { try { $('#notify-needs').checked=localStorage.getItem('dash.notify.needs')==='1'; $('#notify-response').checked=localStorage.getItem('dash.notify.response')==='1'; } catch {} }
 
-  function setFeedView(view) {
+  function setFeedView(view, pushUrl = false) {
     state.view = ['console', 'sessions', 'timeline'].includes(view) ? view : 'console';
+    setViewUrl(state.view, pushUrl);
     const isTimeline = state.view === 'timeline';
     ['console', 'sessions', 'timeline'].forEach(name => {
       const id = `${name}-tab`, selected = state.view === name;
@@ -3302,9 +3402,11 @@
     refreshVisibleReplyLists();
     if (isTimeline) loadTimeline(false).catch(()=>{});
   }
-  $('#console-tab').addEventListener('click',()=>setFeedView('console'));
-  $('#sessions-tab').addEventListener('click',()=>setFeedView('sessions'));
-  $('#timeline-tab').addEventListener('click',()=>setFeedView('timeline'));
+  $('#console-tab').addEventListener('click',()=>setFeedView('console',true));
+  $('#sessions-tab').addEventListener('click',()=>setFeedView('sessions',true));
+  $('#timeline-tab').addEventListener('click',()=>setFeedView('timeline',true));
+  $('#console-pane-session').addEventListener('click',()=>setConsolePaneMode('session'));
+  $('#console-pane-timeline').addEventListener('click',()=>setConsolePaneMode('timeline'));
   $('#feed-tabs').addEventListener('keydown',event=>{
     const tabs = [$('#console-tab'), $('#sessions-tab'), $('#timeline-tab')], current = tabs.indexOf(event.target?.closest?.('[role="tab"]'));
     if (current < 0) return;
@@ -3324,7 +3426,7 @@
   $('#output-search-more').addEventListener('click', () => runOutputSearch(true));
   ['host-filter','harness-filter'].forEach(id=>$('#'+id).addEventListener('change',()=>{
     invalidateOutputSearch('Output filters changed. Search again to apply them.');
-    renderSessions();refreshVisibleReplyLists();if(state.view==='timeline')loadTimeline(false).catch(()=>{});
+    renderSessions();refreshVisibleReplyLists();loadTimeline(false).catch(()=>{});
   }));
   ['project-filter', 'account-filter', 'status-filter'].forEach(id => $('#'+id).addEventListener('change', () => {
     if ($('#status-filter').value === 'ended' && !$('#ended-filter').checked) {
@@ -3353,11 +3455,12 @@
     invalidateOutputSearch('Output filters changed. Search again to apply them.');
     renderSessions(); refreshVisibleReplyLists(); loadSessions().catch(()=>{});
     renderConsolePreferences();
-    if (state.view === 'timeline') loadTimeline(false).catch(()=>{});
+    loadTimeline(false).catch(()=>{});
   });
-  $('#headless-filter').addEventListener('change',()=>{invalidateOutputSearch('Output filters changed. Search again to apply them.');loadSessions().catch(()=>{});if(state.view==='timeline')loadTimeline(false).catch(()=>{});});
+  $('#headless-filter').addEventListener('change',()=>{invalidateOutputSearch('Output filters changed. Search again to apply them.');loadSessions().catch(()=>{});loadTimeline(false).catch(()=>{});});
   $('#ended-filter').addEventListener('change',()=>{invalidateOutputSearch('Output filters changed. Search again to apply them.');loadSessions().catch(()=>{});});
-  $('#mark-all').addEventListener('click',markAll); $('#timeline-more').addEventListener('click',()=>loadTimeline(true).catch(()=>{}));
+  $('#mark-all').addEventListener('click',markAll);
+  ['timeline-more','console-timeline-more','console-pane-timeline-more'].forEach(id=>$('#'+id).addEventListener('click',()=>loadTimeline(true).catch(()=>{})));
   window.addEventListener('scroll',()=>{if(state.view==='timeline'&&!state.timelineDone&&!state.timelineLoading&&window.scrollY+window.innerHeight>=document.documentElement.scrollHeight-600) loadTimeline(true).catch(()=>{});},{passive:true});
   $('#notification-settings').addEventListener('click',()=>$('#notifications-dialog').showModal());
   $('#notification-enable').addEventListener('click',()=>$('#notifications-dialog').showModal());
@@ -3516,7 +3619,7 @@
       $('#console-follow').checked = false;
     }
     beginConsoleSelection(locationState.key, Boolean(locationState.key) && !target, Boolean(locationState.key));
-    setFeedView('console');
+    setFeedView(locationState.view);
     renderConsoleHistory();
     if (target?.status === 'loading') startHistoricalResponse(target);
     else if (locationState.key && !state.sessions.some(session => responseKey(session) === locationState.key)) {
@@ -3538,5 +3641,6 @@
   restoreProjectFilter();
   loadConsolePreferences();
   loadConsolePreferencesRemote();
-  loadNotificationPrefs(); refreshSourceSnapshot(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions({includeAll:Boolean(consoleState.selectedKey)}).catch(()=>setConnection('Offline',false))); refreshTelegram().catch(()=>{}); loadProjectRules().catch(()=>{}); window.setInterval(refreshTelegram, 30000); connect();
+  if (initialConsoleLocation.view !== 'console') setFeedView(initialConsoleLocation.view);
+  loadNotificationPrefs(); refreshSourceSnapshot(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions({includeAll:Boolean(consoleState.selectedKey)}).catch(()=>setConnection('Offline',false))); loadTimeline(false).catch(()=>{}); refreshTelegram().catch(()=>{}); loadProjectRules().catch(()=>{}); window.setInterval(refreshTelegram, 30000); connect();
 })();

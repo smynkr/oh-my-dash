@@ -194,9 +194,13 @@
         </div>
         <section class="console-pane" aria-label="Selected session">
           <div class="console-pane-toolbar">
+            <div class="console-pane-modes" role="group" aria-label="Reading pane view">
+              <button id="console-pane-session" class="button button-secondary console-pane-mode active" type="button" aria-pressed="true">Selected session</button>
+              <button id="console-pane-timeline" class="button button-secondary console-pane-mode" type="button" aria-pressed="false">Timeline (all clients)</button>
+            </div>
             <span id="console-selection-status" aria-live="polite">Select a session</span>
             <button id="console-pin-selected" class="button button-secondary" type="button" aria-pressed="false" disabled>Pin session</button>
-            <label class="console-follow-label"><input id="console-follow" type="checkbox"> Follow live</label>
+            <label id="console-follow-wrap" class="console-follow-label"><input id="console-follow" type="checkbox"> Follow live</label>
             <button id="console-update" class="button button-secondary" type="button" hidden>Show latest</button>
             <button id="console-copy-link" class="button button-secondary" type="button">Copy session link</button>
             <div id="console-read-boundary" class="console-read-boundary" role="group" aria-label="Unread response controls">
@@ -215,8 +219,20 @@
             <button id="console-history-more" class="button button-secondary" type="button">Load older responses</button>
             <p id="console-history-status" class="console-history-status" role="status" aria-live="polite"></p>
           </div>
+          <div id="console-pane-timeline-view" class="console-pane-timeline-view" hidden>
+            <div id="console-pane-timeline-list" class="timeline console-timeline" aria-live="polite"></div>
+            <p id="console-pane-timeline-empty" class="empty-state" hidden>No responses yet.</p>
+            <button id="console-pane-timeline-more" class="button button-secondary timeline-more" type="button" hidden>Load older responses</button>
+          </div>
         </section>
       </div>
+      <details id="console-timeline-disclosure" class="output-comparison console-timeline-disclosure" open>
+        <summary>Client output timeline <span id="console-timeline-summary-help" class="comparison-hint">All clients · chronological order</span></summary>
+        <p class="comparison-guidance">Consolidated chronological feed of outputs across all connected machines, accounts and harnesses (filtered by Machine, Harness and Show headless above). Select any session name to inspect or reply in the console.</p>
+        <div id="console-timeline" class="timeline console-timeline" aria-live="polite"></div>
+        <p id="console-timeline-empty" class="empty-state" hidden>No responses yet.</p>
+        <button id="console-timeline-more" class="button button-secondary timeline-more" type="button" hidden>Load older responses</button>
+      </details>
       <details id="output-comparison" class="output-comparison">
         <summary>Compare outputs <span class="comparison-hint">Two frozen responses · read-only</span></summary>
         <p id="comparison-selection" class="comparison-selection" role="status">Select a session or open an exact response from Search outputs, then set either side.</p>
