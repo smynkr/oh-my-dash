@@ -407,3 +407,14 @@
 @media(max-width:650px){.filters #project-filter{max-width:100%}}
 .omp-question{display:grid;gap:7px;min-width:0}.omp-question .decision-option{display:block;flex:1 1 100%}.omp-option-description{display:block;margin-top:4px;color:var(--muted);font-size:11px;line-height:1.4}
 .omp-option{flex:1 1 100%;min-width:0}.omp-option .decision-option{width:100%}.omp-option-preview{margin:4px 0;color:var(--muted);font-size:11px}.omp-option-preview summary{cursor:pointer}.omp-option-preview pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.console-pane-modes{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.console-pane-mode{min-height:28px;padding:4px 8px;font-size:10px}
+.console-pane-mode.active{border-color:var(--accent);background:#202c3d;color:#edf3ff}
+.console-pane-timeline-view{min-width:0;padding:10px}
+.console-timeline{max-width:none;margin:8px 0 0}
+.console-timeline-disclosure .console-timeline{max-height:min(62vh,640px);overflow:auto;padding-right:4px;overscroll-behavior:contain;scrollbar-gutter:stable}
+.timeline-session-button{padding:0;border:0;background:transparent;color:inherit;text-align:left;font:inherit}
+.timeline-session-button:hover strong,.timeline-session-button:focus-visible strong{color:#b9d2ff;text-decoration:underline;text-underline-offset:2px}
+.timeline-meta{color:var(--muted);font-size:10px;overflow-wrap:anywhere}
+.timeline-time{color:var(--muted)}
+@media(max-width:650px){.console-pane-modes{flex:1 1 100%}.console-pane-mode{flex:1 1 140px;min-height:44px}}
