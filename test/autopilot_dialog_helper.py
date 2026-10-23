@@ -87,7 +87,7 @@ class RegistrationParserTests(unittest.TestCase):
         request = calls[0][2]
         self.assertEqual(request["toolName"], "AskUserQuestion")
         self.assertEqual(request["questions"], [{
-            "id": "0", "question": "Which database?", "multi": True, "recommended": 1,
+            "id": "0", "question": "Which database?", "multiSelect": True, "recommended": 1,
             "options": [
                 {"label": "Postgres", "description": "stable", "preview": "safe"},
                 {"label": "SQLite"},

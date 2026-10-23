@@ -86,7 +86,7 @@ def read_payload():
         if "multiSelect" in question:
             if not isinstance(question["multiSelect"], bool):
                 return None
-            clean["multi"] = multi_select
+            clean["multiSelect"] = multi_select
         labels = []
         normalized_options = []
         for option in options:

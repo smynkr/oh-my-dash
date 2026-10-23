@@ -161,7 +161,7 @@ try {
             options = [object[]]$normalizedOptions.ToArray()
         }
         if ($question.Contains('header')) { $normalizedQuestion.header = [string]$question['header'] }
-        if ($question.Contains('multiSelect')) { $normalizedQuestion.multi = [bool]$question['multiSelect'] }
+        if ($question.Contains('multiSelect')) { $normalizedQuestion.multiSelect = [bool]$question['multiSelect'] }
         if ($question.Contains('recommended') -and $question['recommended'] -ge 0 -and
             $question['recommended'] -lt $normalizedOptions.Count) {
             $normalizedQuestion.recommended = [int]$question['recommended']

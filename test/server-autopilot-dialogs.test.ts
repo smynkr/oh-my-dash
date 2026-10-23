@@ -46,6 +46,18 @@ const askBody = (deadline = now + 60_000) => ({
   questions: [{ question: "Which database?", options: [{ label: "Postgres" }, { label: "SQLite" }], recommended: 1 }],
 });
 
+test("dialog hook registration preserves multi-select semantics", async () => {
+  process.env.DASH_REPLIES = "1";
+  const { base, session } = start();
+  const response = await cliJson(base, { ...askBody(), questions: [
+    { question: "Which checks?", multiSelect: true, options: [{ label: "Build" }, { label: "Review" }] },
+  ] });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ action: "release" });
+  expect(app!.db.getQuestionInvocation(invocationId, session.key, toolUseId)?.questions)
+    .toMatchObject([{ question: "Which checks?", multi: true }]);
+});
+
 test("autopilot and dialog flags default off and the hook releases to native Claude", async () => {
   process.env.DASH_REPLIES = "1";
   const { base, session } = start();
