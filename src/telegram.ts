@@ -1156,7 +1156,7 @@ export function createTelegram(opts: TelegramOptions) {
     if (!cleanMessageText(text)) { await retrySendAt(destination, "Only text can be sent to a session.", undefined, replyTo); return; }
     const all = candidates ?? deliverable(), keys = all.slice(0, PICKER_ROWS).map(dto => dto.key);
     const draft = db.createDraft({ chatId: destination.chatId, threadId: destination.threadId, sourceMessageId: replyTo ?? null, text, targets: keys,
-      ideaId: ideaId ?? null }, now());
+      pickerHeader: header, ideaId: ideaId ?? null }, now());
     const view = pickerView(draft.id, draft.rev, header, keys, all.length - keys.length);
     const sentAt = await retrySendAt(destination, view.html, view.keyboard, replyTo);
     if (sentAt) db.setDraftPicker(draft.id, sentAt.messageId);
@@ -1634,7 +1634,9 @@ export function createTelegram(opts: TelegramOptions) {
       db.transitionDraft(draft.id, "sent", "pending");
       const fresh = deliverable(), keys = fresh.slice(0, PICKER_ROWS).map(dto => dto.key);
       db.setDraftTargets(draft.id, keys);
-      const view = pickerView(draft.id, db.getDraft(draft.id)?.rev ?? draft.rev + 1, "Send to which session?", keys, fresh.length - keys.length);
+      const refreshed = db.getDraft(draft.id);
+      const view = pickerView(draft.id, refreshed?.rev ?? draft.rev + 1, refreshed?.pickerHeader ?? draft.pickerHeader,
+        keys, fresh.length - keys.length);
       void editWith(destination, messageId, view.html, view.keyboard);
       await answerCallback(callback, replyRefusal(submitted.reason)); return;
     }

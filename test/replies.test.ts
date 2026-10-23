@@ -639,6 +639,25 @@ describe("new messages (kind message)", () => {
     } finally { f.close(); }
   });
 
+  test("an idea closed before enqueue refuses without cancelling queued autopilot", () => {
+    const f = fixture();
+    try {
+      const idea = f.db.createIdea({ text: "synthetic raced idea", source: "web", actor: "web:loopback", origin: "owner" }, 1);
+      const autopilot = f.submit("synthetic queued autopilot", "autopilot", f.dto.turnSeq);
+      const enqueueReply = f.db.enqueueReply.bind(f.db);
+      f.db.enqueueReply = ((...args: Parameters<typeof f.db.enqueueReply>) => {
+        if (args[9] === idea.id) f.db.archiveIdea(idea.id, f.clock.now++);
+        return enqueueReply(...args);
+      }) as typeof f.db.enqueueReply;
+
+      expect(f.broker.submit({ key: f.key, text: idea.text, source: "web", actor: "web:loopback", kind: "message", ideaId: idea.id }))
+        .toEqual({ refused: true, reason: "idea_not_open" });
+      expect(f.db.getIdea(idea.id)).toMatchObject({ state: "archived", sentReplyId: null });
+      expect(f.db.getReply(autopilot.id)).toMatchObject({ state: "queued", text: "synthetic queued autopilot" });
+      expect(f.db.queuedReplies().map(reply => reply.id)).toEqual([autopilot.id]);
+    } finally { f.close(); }
+  });
+
   test("a message cancelled because its session ended becomes an undelivered idea and onOutcome learns its id", () => {
     const db = new DashDB(":memory:");
     const key = "synthetic-host|claude|synthetic-session";

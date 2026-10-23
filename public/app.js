@@ -15,7 +15,8 @@
   const esc = (value) => String(value ?? '');
   const responseKey = (s) => String(byId(s, 'key', 'key') ?? `${byId(s,'host')}|${byId(s,'harness')}|${byId(s,'sessionId','session_id')}`);
   const responsesOf = (s) => byId(s, 'lastResponses', 'responses') ?? [];
-  const projectRulesState = { rows: [], storedIssue: '', version: 0, previewTimer: 0, previewRequest: 0 };
+  const projectRulesState = { rows: [], storedIssue: '', version: 0, previewTimer: 0, previewRequest: 0,
+    topicsEnabled: false, loaded: false, loading: false };
   const questionPicks = new Map();
   const setConnection = (text, ok) => { const el = $('#connection'); el.classList.toggle('connected', Boolean(ok)); el.innerHTML = `<i></i> ${text}`; };
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
@@ -54,6 +55,14 @@
       const response = await fetch('/api/telegram');
       if (!response.ok) throw new Error('Telegram status unavailable');
       const telegram = await response.json();
+      projectRulesState.topicsEnabled = telegram.topicsEnabled === true;
+      if (!projectRulesState.topicsEnabled) {
+        projectRulesState.loaded = false;
+        $('#project-rules-panel').hidden = true;
+        $('#project-rules-disclosure').hidden = true;
+      } else {
+        loadProjectRules().catch(() => {});
+      }
       panel.replaceChildren(el('strong', '', 'Telegram'), el('span', 'telegram-state', telegram.state || 'unknown'), el('span', 'telegram-mode', telegram.mode || 'input'));
       if (telegram.botUsername) panel.append(el('span', 'telegram-bot', `@${telegram.botUsername}`));
       if (isLoopback() && !telegram.paired && telegram.pairingCode && telegram.botUsername) {
@@ -192,17 +201,25 @@
     }
   }
   async function loadProjectRules() {
-    const response = await fetch('/api/projects/rules');
-    if (!response.ok) throw new Error('Project rules unavailable');
-    const payload = await response.json();
-    projectRulesState.rows = (Array.isArray(payload.rules) ? payload.rules : []).map((rule) => ({ pattern: String(rule?.pattern ?? ''), project: String(rule?.project ?? '') }));
-    projectRulesState.storedIssue = (payload.errors || []).some((item) => item?.index === -1)
-      ? 'Stored project rules are malformed. Defaults are shown; saving will replace the stored value.' : '';
-    $('#project-rules-notice').textContent = projectRulesState.storedIssue;
-    $('#project-rules-panel').hidden = false;
-    $('#project-rules-disclosure').hidden = false;
-    $('#project-rules-status').textContent = '';
-    renderProjectRuleRows(payload.errors || []);
+    if (!projectRulesState.topicsEnabled || projectRulesState.loaded || projectRulesState.loading) return;
+    projectRulesState.loading = true;
+    try {
+      const response = await fetch('/api/projects/rules');
+      if (!response.ok) throw new Error('Project rules unavailable');
+      const payload = await response.json();
+      if (!projectRulesState.topicsEnabled) return;
+      projectRulesState.rows = (Array.isArray(payload.rules) ? payload.rules : []).map((rule) => ({ pattern: String(rule?.pattern ?? ''), project: String(rule?.project ?? '') }));
+      projectRulesState.storedIssue = (payload.errors || []).some((item) => item?.index === -1)
+        ? 'Stored project rules are malformed. Defaults are shown; saving will replace the stored value.' : '';
+      $('#project-rules-notice').textContent = projectRulesState.storedIssue;
+      $('#project-rules-panel').hidden = false;
+      $('#project-rules-disclosure').hidden = false;
+      $('#project-rules-status').textContent = '';
+      renderProjectRuleRows(payload.errors || []);
+      projectRulesState.loaded = true;
+    } finally {
+      projectRulesState.loading = false;
+    }
   }
   async function saveProjectRules() {
     const button = $('#project-rule-save'), status = $('#project-rules-status');
@@ -502,7 +519,7 @@
     const payload = await response.json(), enabled = payload?.replies?.enabled === true;
     if (enabled === state.repliesEnabled) return enabled;
     state.repliesEnabled = enabled;
-    $('#ideas-open').hidden = !enabled; if (enabled) refreshIdeas();
+    $('#ideas-open').hidden = !enabled; if (enabled) refreshIdeas(true);
     renderSessions();
     if (enabled) refreshVisibleReplyLists();
     else stopAllReplyRefreshes();
@@ -1729,12 +1746,8 @@
   function outputSearchFilterParams() {
     const params = new URLSearchParams();
     const project = $('#project-filter').value, account = $('#account-filter').value;
-    const legacy = project ? legacyProjectName(project) : null;
-    if (legacy !== null) params.set('project', legacy);
-    else if (project) { // server search is label-keyed: send the identity's label and host; folder precision is not server-side.
-      const match = state.sessions.find(s => projectFilterIdentity(s) === project);
-      if (match) { params.set('project', String(byId(match, 'project') || '')); if (!$('#host-filter').value) params.set('host', String(byId(match, 'host') || '')); }
-    }
+    const repositoryFilter = project ? repositorySearchFilter(project) : null;
+    if (repositoryFilter) for (const [key, value] of Object.entries(repositoryFilter)) params.set(key, value);
     if ($('#host-filter').value) params.set('host', $('#host-filter').value);
     if (account) params.set('account', JSON.parse(account));
     if ($('#harness-filter').value) params.set('harness', $('#harness-filter').value);
@@ -2465,19 +2478,26 @@
     let page = consoleState.history.get(key);
     if (!page) {
       const responses = responsesOf(reading); if (!responses.length) return;
-      page = { rows: [], before: Math.min(...responses.map(r => Number(byId(r, 'ts')))), done: false, loading: false, error: '' };
+      const first = responses.reduce((oldest, response) => {
+        const candidate = { ts: Number(byId(response, 'ts')), id: Number(byId(response, 'id')) };
+        return candidate.ts < oldest.ts || candidate.ts === oldest.ts && candidate.id < oldest.id ? candidate : oldest;
+      }, { ts: Number(byId(responses[0], 'ts')), id: Number(byId(responses[0], 'id')) });
+      page = { rows: [], before: first, done: false, loading: false, error: '' };
       consoleState.history.set(key, page);
     }
     if (page.loading || page.done) return;
     page.loading = true; page.error = ''; renderConsoleHistory();
     try {
-      const response = await fetch(`/api/sessions/${encodeURIComponent(key)}/responses?limit=50&before=${page.before}`);
+      const response = await fetch(`/api/sessions/${encodeURIComponent(key)}/responses?limit=50&before=${page.before.ts}&beforeId=${page.before.id}`);
       if (!response.ok) throw new Error(`History unavailable (${response.status}).`);
       const payload = await response.json();
       if (consoleState.history.get(key) !== page) return;
       const ids = new Set(page.rows.map(r => byId(r, 'id')));
       page.rows.push(...payload.responses.filter(r => !ids.has(byId(r, 'id'))));
-      if (payload.responses.length) page.before = Number(byId(payload.responses.at(-1), 'ts'));
+      if (payload.responses.length) {
+        const last = payload.responses.at(-1);
+        page.before = { ts: Number(byId(last, 'ts')), id: Number(byId(last, 'id')) };
+      }
       page.done = !payload.hasMore;
     } catch (error) { page.error = error.message || 'History unavailable.'; }
     finally { page.loading = false; if (consoleState.selectedKey === key && consoleState.history.get(key) === page) renderConsoleHistory(); }
@@ -2520,6 +2540,20 @@
   // Legacy values (a JSON string = plain project name, from older saved views/localStorage) match every repository with that label.
   function legacyProjectName(selected) {
     try { const parsed = JSON.parse(selected); return typeof parsed === 'string' ? parsed : null; } catch { return null; }
+  }
+  function repositorySearchFilter(selected) {
+    const legacy = legacyProjectName(selected);
+    if (legacy !== null) return { project: legacy };
+    try {
+      const identity = JSON.parse(selected);
+      if (!Array.isArray(identity) || typeof identity[0] !== 'string') return null;
+      const [repositoryHost, kind, value] = identity;
+      if (kind === 'unknown' && identity.length === 2) return { repositoryHost, cwd: '' };
+      if (identity.length !== 3) return null;
+      if (kind === 'cwd' && typeof value === 'string') return { repositoryHost, cwd: value };
+      if (kind === 'project' && typeof value === 'string') return { repositoryHost, project: value };
+    } catch {}
+    return null;
   }
   function repositoryFilterMatches(session, selected) {
     if (!selected) return true;
@@ -3280,7 +3314,7 @@
   function syncIdeaSessions() {
     if ($('#ideas-list').dataset.sessions !== ideaSignature(ideaSessions())) renderIdeas();
   }
-  async function refreshIdeas() {
+  async function refreshIdeas(clearStatus = false) {
     if (!state.repliesEnabled) return;
     const version = ++ideasState.version, filter = ideasState.showAll ? 'all' : 'open';
     try {
@@ -3288,7 +3322,7 @@
       const payload = await response.json().catch(() => ({}));
       if (version !== ideasState.version) return;
       if (!response.ok) throw new Error(ideaErrorText(response, payload));
-      if (ideasState.failed) ideaNotice('');
+      if (clearStatus || ideasState.failed) ideaNotice('');
       ideasState.failed = false; ideasState.items = Array.isArray(payload.ideas) ? payload.ideas : [];
       if (Number.isInteger(payload.open) && payload.open >= 0) ideasState.open = payload.open;
       paintIdeasBadge(); renderIdeas();
@@ -3336,13 +3370,13 @@
     } catch (error) { ideaNotice(`Could not add the idea: ${error.message || 'network error'}`, true); }
     finally { ideasState.adding = false; $('#idea-add').disabled = false; await refreshIdeas(); }
   }
-  $('#ideas-open').addEventListener('click', () => { showNavigationDialog('ideas-dialog'); refreshIdeas(); });
-  $('#ideas-show-all').addEventListener('click', () => { ideasState.showAll = !ideasState.showAll; refreshIdeas(); });
+  $('#ideas-open').addEventListener('click', () => { showNavigationDialog('ideas-dialog'); refreshIdeas(true); });
+  $('#ideas-show-all').addEventListener('click', () => { ideasState.showAll = !ideasState.showAll; refreshIdeas(true); });
   $('#idea-form').addEventListener('submit', addIdea);
 
   function connect() {
     state.source?.close(); const source=new EventSource('/api/stream'); state.source=source;
-    source.onopen=()=>{ setConnection('Live',true); loadConsolePreferencesRemote(); scheduleSourcesRefresh(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions().catch(()=>{})).then(()=>{ if(consoleState.selectedKey) fetchReadPosition(consoleState.selectedKey,consoleState.selectionVersion); }); refreshTelegram().catch(()=>{}); refreshIdeas(); loadTimeline(false,true).catch(()=>{}); }; source.onerror=()=>setConnection('Reconnecting',false);
+    source.onopen=()=>{ setConnection('Live',true); loadConsolePreferencesRemote(); scheduleSourcesRefresh(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions().catch(()=>{})).then(()=>{ if(consoleState.selectedKey) fetchReadPosition(consoleState.selectedKey,consoleState.selectionVersion); }); refreshTelegram().catch(()=>{}); refreshIdeas(true); loadTimeline(false,true).catch(()=>{}); }; source.onerror=()=>setConnection('Reconnecting',false);
     source.addEventListener('console-preferences', event => {
       try {
         if (acceptConsolePreferences(JSON.parse(event.data), 'remote')) updateConsolePinButtons();
@@ -3642,5 +3676,5 @@
   loadConsolePreferences();
   loadConsolePreferencesRemote();
   if (initialConsoleLocation.view !== 'console') setFeedView(initialConsoleLocation.view);
-  loadNotificationPrefs(); refreshSourceSnapshot(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions({includeAll:Boolean(consoleState.selectedKey)}).catch(()=>setConnection('Offline',false))); loadTimeline(false).catch(()=>{}); refreshTelegram().catch(()=>{}); loadProjectRules().catch(()=>{}); window.setInterval(refreshTelegram, 30000); connect();
+  loadNotificationPrefs(); refreshSourceSnapshot(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions({includeAll:Boolean(consoleState.selectedKey)}).catch(()=>setConnection('Offline',false))); loadTimeline(false).catch(()=>{}); refreshTelegram().catch(()=>{}); window.setInterval(refreshTelegram, 30000); connect();
 })();

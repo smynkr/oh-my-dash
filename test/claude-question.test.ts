@@ -3,19 +3,26 @@ import { join } from "node:path";
 
 const script = join(process.cwd(), "scripts/claude-question.py");
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
-type FakeOptions = { answers?: Record<string, string>; waitStatus?: number; registerStatus?: number; slowBody?: boolean };
-type HookRequest = { path: string; method: string; host: string | null; entrypoint: string | null; body?: unknown };
+type FakeOptions = { answers?: Record<string, string>; waitStatus?: number; registerStatus?: number; slowBody?: boolean;
+  acceptRegistrationBeforeFailure?: boolean };
+type HookRequest = { path: string; method: string; host: string | null; entrypoint: string | null; body?: unknown; question?: string };
 
 function fakeHub(options: FakeOptions = {}) {
   const requests: HookRequest[] = [];
+  const registrations = new Set<string>();
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       const url = new URL(request.url), item: HookRequest = {
         path: url.pathname, method: request.method, host: request.headers.get("x-dash-host"),
         entrypoint: request.headers.get("x-dash-entrypoint"),
+        ...(url.pathname === "/question/cancel" ? { question: url.searchParams.get("question") ?? undefined } : {}),
       };
-      if (request.method === "POST" && url.pathname === "/question/register") item.body = await request.json();
+      if (request.method === "POST" && url.pathname === "/question/register") {
+        item.body = await request.json();
+        if (options.acceptRegistrationBeforeFailure && item.body && typeof item.body === "object" &&
+            "invocationId" in item.body && typeof item.body.invocationId === "string") registrations.add(item.body.invocationId);
+      }
       requests.push(item);
       if (url.pathname === "/question/register") return Response.json({}, { status: options.registerStatus ?? 201 });
       if (url.pathname === "/question/wait") {
@@ -41,12 +48,16 @@ function fakeHub(options: FakeOptions = {}) {
         if (options.waitStatus === 204) { await Bun.sleep(200); return new Response(null, { status: 204 }); }
         return Response.json({ answers: options.answers }, { status: options.waitStatus ?? 200 });
       }
-      if (url.pathname === "/question/cancel") return Response.json({ ok: true });
+      if (url.pathname === "/question/cancel") {
+        const question = url.searchParams.get("question");
+        if (question) registrations.delete(question);
+        return Response.json({ ok: true });
+      }
       return Response.json({ error: "not found" }, { status: 404 });
     },
   });
   servers.push(server);
-  return { base: `http://127.0.0.1:${server.port}`, requests };
+  return { base: `http://127.0.0.1:${server.port}`, requests, registrations };
 }
 
 async function runHook(base: string, payload: unknown, timeoutMs: number) {
@@ -141,8 +152,8 @@ describe("Claude synchronous AskUserQuestion hook", () => {
     expect(hub.requests.some(request => request.path === "/question/cancel" && request.method === "DELETE")).toBe(true);
   });
 
-  test("an unavailable hub emits no hook decision", async () => {
-    const hub = fakeHub({ registerStatus: 503 });
+  test("a registration accepted before its unavailable response is cancelled", async () => {
+    const hub = fakeHub({ registerStatus: 503, acceptRegistrationBeforeFailure: true });
     const result = await runHook(hub.base, {
       hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", session_id: "synthetic-session",
       tool_use_id: "toolu_synthetic_question", tool_input: { questions: [
@@ -150,7 +161,13 @@ describe("Claude synchronous AskUserQuestion hook", () => {
       ] },
     }, 5000);
     expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-    expect(hub.requests).toHaveLength(1);
-    expect(hub.requests[0].path).toBe("/question/register");
+    expect(hub.requests.map(({ path, method }) => [path, method])).toEqual([
+      ["/question/register", "POST"], ["/question/cancel", "DELETE"],
+    ]);
+    const registrationBody = hub.requests[0]!.body;
+    const question = registrationBody && typeof registrationBody === "object" && "invocationId" in registrationBody
+      ? registrationBody.invocationId : undefined;
+    expect(hub.requests[1]).toMatchObject({ question });
+    expect(hub.registrations.size).toBe(0);
   });
 });

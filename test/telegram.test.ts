@@ -3689,6 +3689,26 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
     expect(f.db.queuedReplies()).toHaveLength(0);
   });
 
+  test("/to keeps its match header when a stale target rebuilds the picker", async () => {
+    const f = await pairedFixture({ repliesEnabled: true });
+    const first = seedAt(f.db, "invest-one", "your_turn", 3);
+    seedAt(f.db, "invest-two", "your_turn", 2);
+    f.bot.enqueue(message("/to invest synthetic text"));
+    await apiSettled(() => f.bot.sent.length === 1);
+    expect(f.bot.sent[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
+
+    f.db.applyEvent({ host: first.host, harness: first.harness, sessionId: first.sessionId,
+      kind: "session_end", ts: f.clock.now, interactive: true });
+    tap(f, "c:1:0:0", 1);
+    await apiSettled(() => answers(f.bot).length === 1 && edits(f.bot).length === 1);
+
+    expect(answers(f.bot)[0]).toBe("That session has ended.");
+    expect(edits(f.bot)[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
+    expect(buttons(edits(f.bot)[0]!).map(button => button.text)).toEqual([
+      "🟢 invest-two · synthetic-host", "💡 Save to Ideas", "✖️ Cancel",
+    ]);
+  });
+
   test("/to never routes past an exact name that is unavailable to a looser match", async () => {
     const f = await pairedFixture({ repliesEnabled: true });
     seedAt(f.db, "a", "ended", 3, "alpha");

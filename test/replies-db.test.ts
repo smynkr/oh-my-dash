@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DashDB } from "../src/db.ts";
+import { SEED_PROJECT_RULES } from "../src/projects.ts";
 import { createAudit } from "../src/audit.ts";
 import type { NormalizedEvent } from "../src/normalize.ts";
 
@@ -254,6 +255,24 @@ test("project rules are cached, malformed settings fall back safely, and flag-of
   }
 });
 
+test("fresh topic databases seed requested defaults without replacing stored rules on reopen", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dash-project-seed-"));
+  const path = join(dir, "db.sqlite");
+  const custom = [{ pattern: "^/custom/([^/]+)", project: "$1" }];
+  let db = new DashDB(path, { topicsEnabled: true });
+  try {
+    expect(db.getProjectRules()).toEqual({ rules: SEED_PROJECT_RULES, errors: [] });
+    db.applyEvent(event("seed", "/Volumes/ExampleData/tmp/example-123/task"));
+    expect(db.getSession("synthetic-host|claude|seed")?.project).toBe("example");
+    db.setSetting("projects.rules", JSON.stringify(custom));
+  } finally { db.close(); }
+
+  db = new DashDB(path, { topicsEnabled: true });
+  try {
+    expect(db.getProjectRules()).toEqual({ rules: custom, errors: [] });
+  } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("replies.kind migrates onto older databases and older rows read as reply", () => {
   const dir = mkdtempSync(join(tmpdir(), "dash-kind-"));
   const path = join(dir, "db.sqlite");
@@ -302,11 +321,14 @@ test("draft and idea transitions are single conditional updates that act once", 
     db.onIdeasChange = () => changes++;
     const idea = db.createIdea({ text:"synthetic idea", source:"telegram", actor:"telegram:1", origin:"owner" }, 5);
     expect([idea.state, idea.origin, db.openIdeaCount(), changes]).toEqual(["open", "owner", 1, 1]);
-    expect(db.markIdeaSent(idea.id, "h|claude|a", 11, 6)).toBe(true);
-    expect(db.markIdeaSent(idea.id, "h|claude|a", 12, 6)).toBe(false);
+    const sent = db.enqueueReply("h|claude|a", idea.text, "web", "web:loopback", undefined, 6, 1_000, undefined, "message", idea.id);
+    expect(sent).toMatchObject({ state:"queued", sessionKey:"h|claude|a", ideaId:idea.id });
+    expect(db.getIdea(idea.id)).toMatchObject({ state:"sent", sentReplyId:sent!.id, sentSessionKey:"h|claude|a" });
+    expect(db.enqueueReply("h|claude|a", idea.text, "web", "web:loopback", undefined, 6, 1_000, undefined, "message", idea.id)).toBeUndefined();
+    expect(db.queuedReplies()).toHaveLength(1);
     expect(db.archiveIdea(idea.id, 7)).toBe(false);
-    expect(db.reopenIdea(idea.id, 12)).toBe(false);
-    expect(db.reopenIdea(idea.id, 11)).toBe(true);
+    expect(db.reopenIdea(idea.id, sent!.id + 1)).toBe(false);
+    expect(db.reopenIdea(idea.id, sent!.id)).toBe(true);
     expect(db.getIdea(idea.id)).toMatchObject({ state:"open", sentReplyId:null, sentSessionKey:null, doneAt:null });
     expect(db.archiveIdea(idea.id, 8)).toBe(true);
     expect(db.archiveIdea(idea.id, 9)).toBe(false);
@@ -346,7 +368,7 @@ test("undelivered messages flow back to Ideas; replies and owner cancels never d
   const db = new DashDB(":memory:");
   try {
     const key = "host|claude|a";
-    const msg = (text: string, ideaId?: number) => db.enqueueReply(key,text,"telegram","telegram:7",undefined,1,10,undefined,"message",ideaId);
+    const msg = (text: string) => db.enqueueReply(key,text,"telegram","telegram:7",undefined,1,10,undefined,"message");
     const expired = msg("synthetic lost");
     db.enqueueReply(key,"synthetic plain reply","web","web:loopback",undefined,1,10);
     const out = db.expireReplies(20);
@@ -360,8 +382,7 @@ test("undelivered messages flow back to Ideas; replies and owner cancels never d
     expect(db.getIdea(db.cancelReplies({ key, reason:"ended" }, 31)[0]!.savedIdeaId!)!.origin).toBe("undelivered");
 
     const idea = db.createIdea({ text:"synthetic from idea", source:"web", actor:"web:loopback", origin:"owner" }, 32);
-    const sent = msg(idea.text, idea.id);
-    db.markIdeaSent(idea.id, key, sent.id, 33);
+    const sent = db.enqueueReply(key,idea.text,"telegram","telegram:7",undefined,1,10,undefined,"message",idea.id)!;
     const before = db.listIdeas("all").length;
     expect(db.expireReplies(1_000)[0]!.savedIdeaId).toBe(idea.id);
     expect([db.getIdea(idea.id)!.state, db.listIdeas("all").length]).toEqual(["open", before]);
@@ -397,6 +418,10 @@ test("OMP pending ask identity and choices survive storage and answer only their
     db = new DashDB(path);
     expect(db.getSession(key)?.pendingQuestion).toEqual({ id: "question_identity_one", questions: questionData });
     event("question", now + 2, { questionIdentity: "question_identity_two", questionData, text: "Choose another synthetic route?" });
+    const stale = JSON.stringify({ questionIdentity: "stale_question_identity", questionData, text: "synthetic stale question" });
+    db.sqlite.query("INSERT INTO events(session_key,ts,kind,detail) VALUES(?,?,?,?)").run(key, now + 1, "question", stale);
+    expect(db.getSession(key)?.pendingQuestion).toEqual({ id: "question_identity_two", questions: questionData });
+    db.sqlite.query("DELETE FROM events WHERE session_key=? AND kind='question' AND detail=?").run(key, stale);
     event("question_answered", now + 3, { questionIdentity: "question_identity_one" });
     expect(db.getSession(key)).toMatchObject({ status: "needs_input", pendingQuestion: { id: "question_identity_two" } });
     event("question_answered", now + 4, { questionIdentity: "question_identity_two" });

@@ -1,12 +1,16 @@
 import { expect, test } from "bun:test";
 import { resolveProject, ruleErrors, SEED_PROJECT_RULES, topicFor, type TopicBindings } from "../src/projects.ts";
 
-test("generic workspace roots map to their project and preserve fallback basenames", () => {
+test("the four seed path rules resolve their intended projects and preserve fallback basenames", () => {
+  expect(resolveProject("/Users/agent/Developer/example-api/task", SEED_PROJECT_RULES)).toBe("example");
+  expect(resolveProject("/Users/agent/.example-triage/task", SEED_PROJECT_RULES)).toBe("example");
+  expect(resolveProject("/Volumes/ExampleData/tmp/example-123/task", SEED_PROJECT_RULES)).toBe("example");
+  expect(resolveProject("/Users/agent/Documents/example-doc", SEED_PROJECT_RULES)).toBe("example-doc");
+  expect(resolveProject("/Users/agent/checkouts/unmatched/repo", SEED_PROJECT_RULES)).toBe("repo");
   expect(resolveProject("/Users/agent/projects/alpha/task", SEED_PROJECT_RULES)).toBe("alpha");
   expect(resolveProject("/Users/agent/Documents/beta", SEED_PROJECT_RULES)).toBe("beta");
   expect(resolveProject("/Users/agent/Code/gamma/src", SEED_PROJECT_RULES)).toBe("gamma");
   expect(resolveProject("/Users/agent/workspaces/delta", SEED_PROJECT_RULES)).toBe("delta");
-  expect(resolveProject("/Users/agent/checkouts/unmatched/repo", SEED_PROJECT_RULES)).toBe("repo");
   expect(resolveProject("test-path", [
     { pattern: "test", project: "first" },
     { pattern: "test", project: "second" },

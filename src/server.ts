@@ -97,7 +97,8 @@ function projectRulesShapeError(value: unknown): number | undefined {
 }
 function parseSearchOptions(params: URLSearchParams): SearchOptions | null {
   const allowed: Record<string, true> = {
-    q: true, limit: true, cursor: true, host: true, project: true, account: true, harness: true, headless: true, ended: true,
+    q: true, limit: true, cursor: true, host: true, project: true, cwd: true, repositoryHost: true,
+    account: true, harness: true, headless: true, ended: true,
   };
   for (const key of params.keys()) if (!Object.hasOwn(allowed, key)) return null;
   for (const key of Object.keys(allowed)) if (params.getAll(key).length > 1) return null;
@@ -111,8 +112,10 @@ function parseSearchOptions(params: URLSearchParams): SearchOptions | null {
   if (rawCursor !== null && rawCursor.length === 0) return null;
   const host = params.get("host");
   const project = params.get("project");
-  const account = params.get("account");
+  const cwd = params.get("cwd");
+  const repositoryHost = params.get("repositoryHost");
   const rawHarness = params.get("harness");
+  const account = params.get("account");
   if (rawHarness !== null && rawHarness !== "" && rawHarness !== "claude" && rawHarness !== "omp") return null;
   const rawHeadless = params.get("headless");
   const rawEnded = params.get("ended");
@@ -122,6 +125,7 @@ function parseSearchOptions(params: URLSearchParams): SearchOptions | null {
   return {
     q, limit, ...(rawCursor === null ? {} : { cursor: rawCursor }),
     ...(host === null ? {} : { host }), ...(project === null ? {} : { project }),
+    ...(cwd === null ? {} : { cwd }), ...(repositoryHost === null ? {} : { repositoryHost }),
     ...(account === null ? {} : { account }),
     ...(rawHarness === null || rawHarness === "" ? {} : { harness: rawHarness as Harness }),
     headless: rawHeadless === "1", ended: rawEnded === "1",
@@ -488,8 +492,11 @@ export function createDashServer(options: ServerOptions = {}) {
       return json({ generatedAt, staleAfterMs: 120_000,
         unlabelledPeerEntries: [...peers.values()].filter(value => value === "*").length, sources });
     }
-    if (request.method === "GET" && path === "/api/telegram") return json(telegram?.info(listener === "loopback") ??
-      { state: "disabled", mode: "input", paired: false, botUsername: null, pairingCode: null });
+    if (request.method === "GET" && path === "/api/telegram") return json({
+      ...(telegram?.info(listener === "loopback") ??
+        { state: "disabled", mode: "input", paired: false, botUsername: null, pairingCode: null }),
+      topicsEnabled,
+    });
     if (request.method === "GET" && projectRulesRoute) {
       const { rules, errors } = db.getProjectRules();
       return json({ rules, errors });
@@ -661,14 +668,20 @@ export function createDashServer(options: ServerOptions = {}) {
       let key: string;
       try { key = decodeURIComponent(responsesMatch[1]); } catch { return json({ error: "invalid key" }, 400); }
       const rawLimit = url.searchParams.get("limit"), rawBefore = url.searchParams.get("before");
+      const rawBeforeId = url.searchParams.get("beforeId");
       const limit = rawLimit === null ? 50 : Number(rawLimit);
       const before = rawBefore === null ? undefined : Number(rawBefore);
+      const beforeId = rawBeforeId === null ? undefined : Number(rawBeforeId);
       if (url.searchParams.getAll("limit").length > 1 || url.searchParams.getAll("before").length > 1 ||
+        url.searchParams.getAll("beforeId").length > 1 ||
         (rawLimit !== null && (!/^\d+$/.test(rawLimit) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100)) ||
-        (rawBefore !== null && (!/^-?\d+$/.test(rawBefore) || !Number.isSafeInteger(before)))) {
+        (rawBefore !== null && (!/^-?\d+$/.test(rawBefore) || !Number.isSafeInteger(before))) ||
+        (rawBeforeId !== null && (!/^\d+$/.test(rawBeforeId) || !Number.isSafeInteger(beforeId) || beforeId! < 1)) ||
+        ((rawBefore === null) !== (rawBeforeId === null))) {
         return json({ error: "bad request" }, 400);
       }
-      const page = db.sessionResponses(key, limit, before);
+      const cursor = before === undefined || beforeId === undefined ? undefined : { ts: before, id: beforeId };
+      const page = db.sessionResponses(key, limit, cursor);
       return page ? json(page) : json({ error: "session not found" }, 404);
     }
     const exactResponseMatch = request.method === "GET" && path.match(/^\/api\/sessions\/([^/]+)\/responses\/([^/]+)$/);

@@ -8,10 +8,11 @@ const helpers = (() => {
   const at = (marker: string) => { const i = script.indexOf(marker); if (i < 0) throw new Error(`app.js marker missing: ${marker}`); return i; };
   const byId = script.slice(at("  const byId"), at("  const esc"));
   const block = script.slice(at("  // repository-filter helpers ("), at("  // repository-filter helpers end"));
-  return new Function(`${byId}${block}; return { projectFilterIdentity, repositoryFilterMatches, repositoryFilterChoices };`)() as {
+  return new Function(`${byId}${block}; return { projectFilterIdentity, repositoryFilterMatches, repositoryFilterChoices, repositorySearchFilter };`)() as {
     projectFilterIdentity(s: unknown): string;
     repositoryFilterMatches(s: unknown, selected: string): boolean;
     repositoryFilterChoices(rows: unknown[], selected: string): [string, string][];
+    repositorySearchFilter(selected: string): Record<string, string> | null;
   };
 })();
 
@@ -46,6 +47,20 @@ test("a legacy plain project-name value still filters every repository with that
   expect(helpers.repositoryFilterMatches(a, "")).toBe(true);
 });
 
+
+test("output search keeps repository identity for folders without a live matching session", () => {
+  const selectedFolder = helpers.projectFilterIdentity(a);
+  expect(helpers.repositorySearchFilter(selectedFolder)).toEqual({ repositoryHost: "mac", cwd: "/work/dash" });
+
+  const noLongerLive = JSON.stringify(["offline-host", "cwd", "/work/archived"]);
+  expect(helpers.repositorySearchFilter(noLongerLive)).toEqual({ repositoryHost: "offline-host", cwd: "/work/archived" });
+  expect(helpers.repositorySearchFilter(helpers.projectFilterIdentity(noCwd))).toEqual({
+    repositoryHost: "mac", project: "invest",
+  });
+  expect(helpers.repositorySearchFilter(helpers.projectFilterIdentity({ host: "mac" }))).toEqual({
+    repositoryHost: "mac", cwd: "",
+  });
+});
 test("choices are deterministic so unchanged options are not rebuilt on live updates", () => {
   const first = JSON.stringify(helpers.repositoryFilterChoices([a, b, noCwd], ""));
   // Reordered rows and a repeated session do not change the option signature the select compares.
