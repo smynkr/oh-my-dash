@@ -213,6 +213,14 @@ Feature flags live in `EnvironmentVariables` in the collector plist. Leave them 
 | `DASH_CODEX_BIN` | Path to the `codex` executable used by `DASH_JUDGE`; default `codex` from the LaunchAgent `PATH`. |
 | `DASH_TELEGRAM_SNIPPET_CHARS` | Optional Telegram text cap; unset sends full captured redacted text, a positive value caps it, and `0` sends labels only. |
 | `DASH_JUDGE=1` | Optional Codex-assisted decision extraction; has an effect only with `DASH_REPLIES=1`. Leave off unless the exact canary below proves tool isolation. |
+| `DASH_AUTOPILOT=1` | Runtime goals require this, `DASH_REPLIES=1`, and the stored `settings.autopilot.enabled` switch ON (it starts OFF); this environment flag is a hard veto. |
+| `DASH_AUTOPILOT_GRACE_S` | Wait before a goal evaluates a turn; default `45` seconds, accepted `0`–`120` (invalid values use the default). |
+| `DASH_AUTOPILOT_CONCURRENCY` | Concurrent goal evaluations; default `2`, accepted `1`–`2` (invalid values use the default). |
+| `DASH_DIALOGS=1` | Enables gated blocking Claude questions only with `DASH_AUTOPILOT=1`, `DASH_REPLIES=1`, and complete E3/E4/E5 owner evidence; otherwise questions release to Claude. |
+| `DASH_DIALOGS_E3_PASS=1` | Owner attestation after the E3 scratch test described below; unset by default. |
+| `DASH_DIALOGS_E4_PASS=1` | Owner attestation after the E4 scratch test described below; unset by default. |
+| `DASH_DIALOGS_E5_MAX_HOLD_MS` | Owner-measured E5 synchronous hold budget in milliseconds; required range `1000`–`600000`. |
+| `DASH_ASK_HOLD_MIN` | Maximum question hold in minutes; default `10`, accepted `1`–`10`. |
 
 ### Optional Telegram
 
@@ -278,6 +286,26 @@ Decision cards use the same `DASH_REPLIES=1` flag. With it unset, nothing is ext
 - **Authorization.** The dashboard's **Authorize recommendation** opens a preview of the exact current response, target and turn, with a destructive-action warning and the complete authorization text. Only **Authorize this scope** sends it, and **Do not authorize** closes the preview without sending anything. The text is: `Go with your recommendation(s) in your last message. You are authorized for the action(s) you asked about there, including any approval, additional review waves, or destructive steps they require. This authorization covers only what your last message asked about.` It is bound to that turn, and autopilot cannot send it. It does not answer permission, question or elicitation dialogs, or omp approvals; those still need the terminal or Remote Control.
 
 To roll back, clear `DASH_REPLIES` and reload the collector. The additive columns and the card table remain. Set `DASH_JUDGE=1` only after the canary in [Optional decision extraction](#optional-decision-extraction) passes.
+
+### Per-session autopilot and Claude dialogs (AXI-241)
+
+All autopilot actions are inert by default. Runtime automation requires `DASH_AUTOPILOT=1`, `DASH_REPLIES=1`, and the persisted `settings.autopilot.enabled` master switch; the stored switch starts OFF and the environment flag alone cannot turn it on. Owners create, edit, pause, resume and stop per-session goals in the dashboard or paired Telegram controls. Goals expire after 8 hours by default and cannot be extended beyond 24 hours from create/edit.
+
+The judge's verdict is only a hypothesis. A deterministic policy gate may send only fixed continue or verified-recommendation templates through the normal audited reply path; free-text suggestions and **Brief me** remain owner-only. Owner replies, stale turns, exhausted budgets, loop/rate guards and the master kill switch veto automation. `GET /healthz` exposes text-free autopilot state and metrics; installed hooks alone do not mean a goal is active.
+
+Install the synchronous Claude `PreToolUse` deny-fence only by adding `--autopilot` to the existing installer command (Windows: `-Autopilot`). The per-session cache preserves an active-goal denial, but an offline client cannot know whether a goal became active after its last response. While installed, any outage, non-200 response or invalid fence metadata blocks intercepted tools until a valid `/hook/fence` response confirms the current state—even with an empty or previously inactive cache. This may temporarily block tool use when no goal is active; it is intentional fail-closed behavior. Review the installer's dry run and preserve your existing connection and settings arguments. OMP autopilot is unsupported on Windows until durable cache-directory flushing is available; the extension fails closed on OMP tool calls when an active goal is cached or hub state is unconfirmed, and defers autopilot replies.
+
+Blocking Claude `AskUserQuestion` dialogs are a separate, explicit opt-in. They require `DASH_DIALOGS=1`, `DASH_AUTOPILOT=1`, `DASH_REPLIES=1`, `DASH_DIALOGS_E3_PASS=1`, `DASH_DIALOGS_E4_PASS=1`, and a measured `DASH_DIALOGS_E5_MAX_HOLD_MS`. Before setting the E3/E4 attestations or E5 value, perform the E3, E4 and E5 checks only in a scratch Claude session with temporary settings, then record their outcomes and the measured E5 bound:
+
+- **E3:** Verify the structured answer contract, Claude's terminal behavior while waiting, Esc and timeout fallback, and multi-select joining.
+- **E4:** Verify that a matching fence denial occurs under bypass mode and record the exact text Claude sees.
+- **E5:** Measure the safe synchronous hold budget; set `DASH_DIALOGS_E5_MAX_HOLD_MS` to the owner-measured value within `1000`–`600000`.
+
+Do not use production sessions to establish these results. `DASH_ASK_HOLD_MIN` bounds the hold to 1–10 minutes (default 10); the effective time is also capped by the E5 measurement and remaining hook deadline. Missing, malformed or incomplete gates release the question immediately to Claude's native UI. A completed gate permits only the bounded Step 5 policy: while the owner is away, a question can wait for the owner but is never auto-answered; otherwise, automatic answering requires a current active goal, a verified recommendation for every question, a passing deterministic gate and a delay within the measured hold. A `Never` delay, missing recommendation, stale invocation, policy refusal or over-budget delay releases to Claude. No free-text answer is generated.
+
+On macOS, add `--autopilot-dialogs` to the existing installer command; on Windows, use `-AutopilotDialogs`. These options install the deny-fence too and cannot be combined with the separate remote-question option (`--remote-questions` or `-Questions`). The dashboard can submit structured answers or **Release to terminal**, which cancels only the exact pending invocation; ordinary replies do not answer unrelated dialogs. Permission prompts and OMP approvals remain outside this feature.
+
+To roll back autopilot, clear `DASH_AUTOPILOT`, switch the stored master OFF, restart the collector, and rerun the installer with the same connection/settings arguments but without the autopilot option. For dialogs, also clear `DASH_DIALOGS`, both E3/E4 attestations and `DASH_DIALOGS_E5_MAX_HOLD_MS`; remove the dialog option from the installer. Keep the additive SQLite history.
 
 ### Optional Claude question answers on macOS
 

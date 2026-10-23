@@ -5,7 +5,7 @@ test("the four seed path rules resolve their intended projects and preserve fall
   expect(resolveProject("/Users/agent/Developer/example-api/task", SEED_PROJECT_RULES)).toBe("example");
   expect(resolveProject("/Users/agent/.example-triage/task", SEED_PROJECT_RULES)).toBe("example");
   expect(resolveProject("/Volumes/ExampleData/tmp/example-123/task", SEED_PROJECT_RULES)).toBe("example");
-  expect(resolveProject("/Users/agent/Documents/example-doc", SEED_PROJECT_RULES)).toBe("example-doc");
+  expect(resolveProject("/Users/agent/Documents/Defense", SEED_PROJECT_RULES)).toBe("Defense");
   expect(resolveProject("/Users/agent/checkouts/unmatched/repo", SEED_PROJECT_RULES)).toBe("repo");
   expect(resolveProject("/Users/agent/projects/alpha/task", SEED_PROJECT_RULES)).toBe("alpha");
   expect(resolveProject("/Users/agent/Documents/beta", SEED_PROJECT_RULES)).toBe("beta");

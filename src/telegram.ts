@@ -10,6 +10,7 @@ import { extractRecommendation, LABEL_CP, looksLikeAsk, TITLE_CP, verifiedRecomm
 import { topicFor, type TopicBindings } from "./projects.ts";
 import { redact, redactSpan } from "./redact.ts";
 import { escapeHtml, formatTelegramContent } from "./telegram-format.ts";
+import { AUTOPILOT_DELAY_CHOICES } from "./autopilot-store.ts";
 export { redact } from "./redact.ts";
 
 type Mode = "input" | "turns" | "off";
@@ -61,7 +62,32 @@ export interface TelegramOptions {
   replies?: ReturnType<typeof createReplies>;
   topicsEnabled?: boolean;
   setTimer?: (fn: () => void, ms: number) => () => void;
+  autopilot?: TelegramAutopilotOptions;
 }
+export type TelegramAutopilotGoal = { id:number; sessionKey:string; project:string; goalText:string; status:string; delayMin:number|null;
+  turnsUsed:number; maxTurns:number };
+export type TelegramAutopilotDecision = { id:number; sessionKey:string; project:string; goalId:number; status:string; gateRule:string|null;
+  templateType:string|null; executionMethod:string; turnSeq:number; verdict:{action:string;rationale:string;confidence:number};
+  decidedAt:number; deadlineAt:number|null; delayMin:number|null; replySuggestion:string|null };
+export type TelegramAutopilotOptions = {
+  featureEnabled:boolean;
+  state:() => { enabled:boolean; away:boolean; delayMin:number|null };
+  setEnabled:(enabled:boolean) => void;
+  setAway:(away:boolean) => void;
+  setDefaultDelay:(delayMin:number|null) => void;
+  setProjectDelay:(topic:string,delayMin:number|null) => void;
+  goals:(topic?:string) => TelegramAutopilotGoal[];
+  createGoal:(sessionKey:string,text:string,actor?:string) => number;
+  pauseGoal:(sessionKey:string) => boolean;
+  resumeGoal:(sessionKey:string) => boolean;
+  stopGoal:(sessionKey:string) => boolean;
+  decisions:(project?:string,offset?:number) => TelegramAutopilotDecision[];
+  brief:() => Promise<string>;
+  action:(id:number,action:"send"|"hold"|"dismiss"|"send-suggestion",text?:string,actor?:string) => boolean;
+  goalAction:(id:number,action:"resume"|"stop") => boolean;
+};
+export type TelegramAutopilotNotice = { session:SessionDTO; goal:{id:number;goalText:string}; decision:TelegramAutopilotDecision; reason:string };
+export type TelegramAutopilotSuggestion = TelegramAutopilotNotice & { kind:"free_text"|"send_now"; text?:string; templateText?:string };
 
 const exec = promisify(execFile);
 const tokenPattern = /^\d{6,12}:[A-Za-z0-9_-]{30,}$/;
@@ -77,6 +103,7 @@ const validChatId = (value: unknown): value is string => typeof value === "strin
   Number.isSafeInteger(Number(value)) && Number(value) !== 0;
 const validThreadId = (value: unknown): value is number | null => value === null ||
   (typeof value === "number" && Number.isSafeInteger(value) && value > 0);
+const autopilotDelaySteps: readonly (number|null)[] = [...AUTOPILOT_DELAY_CHOICES, null];
 const isHarness = (dto: SessionDTO) => dto.interactive && ["claude", "omp"].includes(dto.harness);
 const cardCode = /^d:([0-9a-z]{1,8}):(0|[1-9]\d?):(0|[1-9]\d?)$/;
 const pickerCode = /^c:([0-9a-z]{1,8}):([0-9a-z]{1,6}):([0-7]|i|x)$/, ideaCode = /^i:([0-9a-z]{1,8}):([sa])$/;
@@ -157,6 +184,7 @@ function apiBase(value: string): string | undefined {
 
 export function createTelegram(opts: TelegramOptions) {
   const db = opts.db, now = opts.now ?? Date.now, fetcher = opts.fetch ?? fetch, replies = opts.replies;
+  const autopilot = opts.autopilot;
   const topicsEnabled = opts.topicsEnabled ?? process.env.DASH_TG_TOPICS === "1";
   const base = apiBase(opts.apiBase ?? process.env.DASH_TELEGRAM_API_BASE ?? "https://api.telegram.org");
   const sleep = opts.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
@@ -186,6 +214,14 @@ export function createTelegram(opts: TelegramOptions) {
   const last = new Map<string, { status: string; needsReason?: string }>();
   const muted = new Map<string, number>(), ids = new Map<string, string>();
   const statusMaps = new Map<string, { at: number; keys: string[] }>();
+  const suggestionEditPrompts = new Map<number,{decisionId:number;chatId:string;threadId:number|null}>();
+  const rememberSuggestionEditPrompt = (messageId:number,value:{decisionId:number;chatId:string;threadId:number|null}) => {
+    if (!suggestionEditPrompts.has(messageId) && suggestionEditPrompts.size >= 256) {
+      const oldest = suggestionEditPrompts.keys().next().value;
+      if (oldest !== undefined) suggestionEditPrompts.delete(oldest);
+    }
+    suggestionEditPrompts.set(messageId,value);
+  };
   const queue: Alert[] = [];
   let sendingAlerts: Alert[] = [];
   // Cards whose first send is in flight, and cards whose own tap is inside submit() (a synchronous delivery can
@@ -747,6 +783,94 @@ export function createTelegram(opts: TelegramOptions) {
       (lines.length ? `\n\n${lines.join("\n\n")}${more}\n\n<b>Reply:</b> /r N your text${replies ? " · /to name text" : ""}` :
         `\n\nNo sessions are waiting for you.${replies ? "\n\n<b>Send:</b> /to name text" : ""}`);
   };
+  const autopilotTopic = (destination: Destination) =>
+    destination.name && !["general","urgent"].includes(destination.name) ? destination.name : undefined;
+  const projectMatchesTopic = (project: string, topic?: string) => !topic || topic.split("/").includes(project);
+  const delayLabel = (value: number|null) => value === null ? "Never" : value === 0 ? "Now" : `${value} min`;
+  const autopilotMenu = (destination: Destination) => {
+    const state = autopilot?.state();
+    if (!autopilot || !state) return { text:"Autopilot is unavailable.", keyboard:undefined };
+    const topic = autopilotTopic(destination);
+    const goal = topic ? autopilot.goals(topic)[0] : undefined;
+    const delay = goal ? goal.delayMin : state.delayMin;
+    return { text:`<b>Autopilot ${state.enabled ? "ON" : "OFF"}</b> · ${topic ? `topic ${escapeHtml(topic)}` : "default"} · ${delayLabel(delay)}${state.away ? " · Away" : ""}`,
+      keyboard:{inline_keyboard:[
+        [{text:state.enabled ? "⏹ Off" : "▶️ On",callback_data:state.enabled ? "ap:off" : "ap:on"},
+          {text:state.away ? "I'm back" : "Away",callback_data:state.away ? "ap:away:off" : "ap:away:on"}],
+        [{text:"−",callback_data:"ap:delay:-1"},{text:delayLabel(delay),callback_data:"ap:refresh"},
+          {text:"+",callback_data:"ap:delay:1"}],
+      ]}};
+  };
+  const handleAutopilotCommand = async (command:string,arg:string,destination:Destination) => {
+    if (!autopilot || !autopilot.featureEnabled) {
+      await retrySendAt(destination,"Autopilot is disabled on this hub."); return true;
+    }
+    const topic = autopilotTopic(destination), state = autopilot.state();
+    if (command === "/autopilot") {
+      const value = arg.trim().toLowerCase();
+      if (value === "on" || value === "off") {
+        autopilot.setEnabled(value === "on");
+        const updated = autopilotMenu(destination);
+        await retrySendAt(destination,updated.text,updated.keyboard);
+      } else {
+        const menu = autopilotMenu(destination);
+        await retrySendAt(destination,menu.text,menu.keyboard);
+      }
+      return true;
+    }
+    if (command === "/away") {
+      const value = arg.trim().toLowerCase();
+      if (value !== "on" && value !== "off") await retrySendAt(destination,`Away is ${state.away ? "on" : "off"}. Use /away on or /away off.`);
+      else { autopilot.setAway(value === "on"); await retrySendAt(destination,`Away ${value}.`); }
+      return true;
+    }
+    if (command === "/goal") {
+      const match = /^([1-9]\d?)\s+([\s\S]+)$/.exec(arg);
+      const key = match ? statusKeyAt(destination.chatId,destination.threadId,Number(match[1])) : undefined;
+      if (!key) { await retrySendAt(destination,"Run /status, then /goal N <goal text>."); return true; }
+      const text = cleanMessageText(match![2]);
+      if (!text || [...text].length > 500) { await retrySendAt(destination,"Goal text must be 1–500 characters."); return true; }
+      const id = autopilot.createGoal(key,text,`telegram:${userId ?? "owner"}`);
+      await retrySendAt(destination,`Goal #${id} is active for session ${escapeHtml(clipped(db.getSession(key)?.displayName ?? key,80))}.`);
+      return true;
+    }
+    if (command === "/goals") {
+      const goals = autopilot.goals(topic).filter(goal => projectMatchesTopic(goal.project,topic));
+      const lines = goals.slice(0,20).map(goal => {
+        const dto = db.getSession(goal.sessionKey);
+        return `#${goal.id} <b>${escapeHtml(clipped(dto?.displayName ?? goal.sessionKey,80))}</b> · ${escapeHtml(goal.status)} · ${goal.turnsUsed}/${goal.maxTurns} turns · ${delayLabel(goal.delayMin)}\n${escapeHtml(clipped(redact(goal.goalText),160))}`;
+      });
+      await retrySendAt(destination,lines.length ? `<b>Autopilot goals</b>\n\n${lines.join("\n\n")}` : "No active goals in this topic.");
+      return true;
+    }
+    if (command === "/pause" || command === "/resume" || command === "/stop") {
+      const match = /^([1-9]\d?)$/.exec(arg.trim());
+      const key = match ? statusKeyAt(destination.chatId,destination.threadId,Number(match[1])) : undefined;
+      if (!key) { await retrySendAt(destination,`Run /status, then /${command.slice(1)} N.`); return true; }
+      const changed = command === "/pause" ? autopilot.pauseGoal(key) :
+        command === "/resume" ? autopilot.resumeGoal(key) : autopilot.stopGoal(key);
+      await retrySendAt(destination,changed ? `Autopilot goal ${command.slice(1)}d.` : "No matching active goal.");
+      return true;
+    }
+    if (command === "/log") {
+      const page = arg.trim() ? Number(arg.trim()) : 1;
+      if (!Number.isSafeInteger(page) || page < 1 || page > 100) { await retrySendAt(destination,"Use /log [page]."); return true; }
+      const decisions = autopilot.decisions(topic, (page-1)*10);
+      const lines = decisions.filter(decision => projectMatchesTopic(decision.project,topic)).map(decision => {
+        const dto = db.getSession(decision.sessionKey), rationale = clipped(redact(decision.verdict.rationale),140);
+        return `#${decision.id} · <b>${escapeHtml(clipped(dto?.displayName ?? decision.sessionKey,64))}</b> · ${escapeHtml(decision.status)} · ${escapeHtml(decision.gateRule ?? decision.templateType ?? "—")}\n${escapeHtml(rationale)}`;
+      });
+      await retrySendAt(destination,lines.length ? `<b>Autopilot log · page ${page}</b>\n\n${lines.join("\n\n")}` : "No autopilot decisions on this page.");
+      return true;
+    }
+    if (command === "/brief") {
+      if (topic) { await retrySendAt(destination,"Run /brief in General or the owner DM."); return true; }
+      const result = await autopilot.brief();
+      await retrySendAt(destination,escapeHtml(clipped(result,3500)));
+      return true;
+    }
+    return false;
+  };
 
   const replyOutcome = (item: Reply, outcome: Outcome, dto?: SessionDTO, ttlMin = 15) => {
     const card = db.cardForReply(item.id);
@@ -1223,12 +1347,14 @@ export function createTelegram(opts: TelegramOptions) {
     }
   };
 
-  const sendUrgent = async (project: string, body: string): Promise<boolean> => {
-    if (!topicsEnabled || !running || !paired() || ["disabled", "webhook_conflict", "poll_conflict"].includes(state)) return false;
+  const sendUrgent = async (project: string, body: string, keyboard?: Record<string,unknown>): Promise<boolean> => {
+    if (!running || !paired() || ["disabled", "webhook_conflict", "poll_conflict"].includes(state)) return false;
     const bindings = readBindings();
-    const urgentThread = bindings && Object.hasOwn(bindings.topics, "urgent")
-      ? { chatId: bindings.groupChatId, threadId: bindings.topics.urgent, name: "urgent" } satisfies Destination
-      : generalDestination(bindings);
+    const urgentThread = topicsEnabled
+      ? bindings && Object.hasOwn(bindings.topics,"urgent")
+        ? { chatId:bindings.groupChatId,threadId:bindings.topics.urgent,name:"urgent" } satisfies Destination
+        : generalDestination(bindings)
+      : dmDestination();
     if (!urgentThread) return false;
     const mutedUntil = Number(db.getSetting("telegram.mute_until") ?? 0) > now();
     const silent = mutedUntil || destinationMode(urgentThread, bindings) === "off";
@@ -1239,12 +1365,67 @@ export function createTelegram(opts: TelegramOptions) {
     for (let part = 0; part < pages.length; part++) {
       if (epoch !== pairEpoch) return false;
       const text = `⚠️ <b>Urgent${pages.length > 1 ? ` · Part ${part + 1}/${pages.length}` : ""}</b>\nProject: <b>${projectLabel}</b>\n\n${pages[part]}`;
-      const sentAt = await queueSend(destination, text, undefined, undefined, silent);
+      const sentAt = await queueSend(destination, text, part === pages.length - 1 ? keyboard : undefined, undefined, silent);
       if (!sentAt) return false;
       destination = { ...sentAt, name: destination.name };
     }
     return true;
   };
+  const sendProjectAutopilot = async (project:string,body:string,keyboard?:Record<string,unknown>,silent=false) => {
+    if (!running || !paired() || ["disabled","webhook_conflict","poll_conflict"].includes(state)) return false;
+    const destination = destinationForProject(project);
+    if (!destination) return false;
+    const mutedUntil = Number(db.getSetting("telegram.mute_until") ?? 0) > now();
+    if (mutedUntil || destinationMode(destination) === "off") return false;
+    const text = formatTelegramContent(redact(body));
+    let current = destination;
+    for (let part=0; part<text.length; part++) {
+      const sentAt = await queueSend(current,text[part]!,part === text.length-1 ? keyboard : undefined,undefined,silent);
+      if (!sentAt) return false;
+      current = { ...sentAt,name:destination.name };
+    }
+    return true;
+  };
+  const autopilotEscalation = (notice:TelegramAutopilotNotice) => {
+    const {session,goal,decision,reason} = notice;
+    const name = clipped(session.displayName,80);
+    const rationale = clipped(redact(decision.verdict.rationale),400);
+    const suggestion = decision.replySuggestion ? `\n\nSuggestion: ${clipped(redact(decision.replySuggestion),600)}` : "";
+    const keyboard = {inline_keyboard:[[
+      ...(decision.replySuggestion ? [{text:"Send suggestion",callback_data:`ap:send:${decision.id}`}]:[]),
+      {text:"Resume",callback_data:`ap:resume:${goal.id}`},{text:"Stop",callback_data:`ap:stop:${goal.id}`},
+    ]]};
+    return sendUrgent(session.project,`**Autopilot paused for ${name}** · ${clipped(redact(reason),80)}\nGoal: ${clipped(redact(goal.goalText),300)}\n${rationale}${suggestion}`,keyboard);
+  };
+  const autopilotSuggestion = (suggestion:TelegramAutopilotSuggestion) => {
+    const {session,goal,decision} = suggestion;
+    const freeText = suggestion.kind === "free_text";
+    const content = freeText ? suggestion.text ?? decision.replySuggestion ?? "" : suggestion.templateText ?? "";
+    const keyboard = {inline_keyboard:[[
+      {text:freeText ? "Send suggestion" : "Send",callback_data:`ap:send:${decision.id}`},
+      {text:"Edit",callback_data:`ap:edit:${decision.id}`},
+      {text:"Dismiss",callback_data:`ap:dismiss:${decision.id}`},
+    ]]};
+    const body = `**${freeText ? "Owner review · suggestion only" : "Suggest-only autopilot action"}**\nSession: ${clipped(session.displayName,80)}\nGoal: ${clipped(redact(goal.goalText),300)}\nReason: ${clipped(redact(suggestion.reason),100)}\n${content ? `\n${clipped(redact(content),800)}` : ""}\n\nNothing is sent until you choose.`;
+    return sendProjectAutopilot(session.project,body,keyboard,false);
+  };
+  const autopilotPending = (notice:TelegramAutopilotNotice,templateText:string) => {
+    const {session,goal,decision} = notice;
+    const due = decision.deadlineAt ? new Date(decision.deadlineAt).toLocaleTimeString() : "now";
+    const keyboard = {inline_keyboard:[[
+      {text:"✅ Send now",callback_data:`ap:send:${decision.id}`},
+      {text:"✋ Hold",callback_data:`ap:hold:${decision.id}`},
+    ]]};
+    const body = `**Autopilot will act at ${due}**\nSession: ${clipped(session.displayName,80)}\nGoal: ${clipped(redact(goal.goalText),300)}\nWill send: ${clipped(redact(templateText),800)}\nWhy: ${clipped(redact(decision.verdict.rationale),400)}`;
+    return sendProjectAutopilot(session.project,body,keyboard,false);
+  };
+  const autopilotSent = (notice:TelegramAutopilotNotice,templateText:string) =>
+    sendProjectAutopilot(notice.session.project,
+      `🤖 Sent "${clipped(redact(templateText),80)}" to ${clipped(notice.session.displayName,80)} · ${clipped(redact(notice.reason),120)}`,
+      undefined,true);
+  const autopilotDone = (notice:TelegramAutopilotNotice) =>
+    sendProjectAutopilot(notice.session.project,
+      `✅ Goal #${notice.goal.id} done · ${clipped(notice.session.displayName,80)}\n${clipped(redact(notice.reason),200)}`);
   const seedUrgentEpisodes = () => {
     if (!topicsEnabled || !paired()) return;
     for (const dto of db.listSessions(true, true)) {
@@ -1432,6 +1613,20 @@ export function createTelegram(opts: TelegramOptions) {
     const topicRoot = !!message.reply_to_message?.forum_topic_created;
     if (topicRoot && (!topicsEnabled || !parsedCommand)) return;
     const replyTo = topicRoot ? undefined : message.reply_to_message;
+    if (replyTo?.message_id !== undefined) {
+      const edit = suggestionEditPrompts.get(replyTo.message_id);
+      if (edit) {
+        suggestionEditPrompts.delete(replyTo.message_id);
+        if (edit.chatId !== incomingChatId || edit.threadId !== destination.threadId || !autopilot) {
+          await retrySendAt(destination,"That suggestion belongs to another topic."); return;
+        }
+        const text = cleanMessageText(rawText);
+        const sent = !!text && [...text].length <= MAX_MESSAGE_CHARS &&
+          autopilot.action(edit.decisionId,"send-suggestion",text,`telegram:${userId}`);
+        await retrySendAt(destination,sent ? "Edited suggestion queued as your reply." : "Suggestion is stale or could not be queued.");
+        return;
+      }
+    }
     // C3: a non-text DM (photo, sticker, voice) cannot become a draft.
     if (replies && privateDm && !message.reply_to_message && !text) { await retrySendAt(destination, "Only text can be sent to a session."); return; }
     if (replyTo?.message_id !== undefined) {
@@ -1478,6 +1673,8 @@ export function createTelegram(opts: TelegramOptions) {
       if (!topicsEnabled) { await retrySendAt(destination, "Reply to an alert to answer it, or use /status then /r N your text."); return; }
       if (!arg) { await retrySendAt(destination, "Use /unbind <topic-name>."); return; }
       await unbindTopic(arg, destination, bindings);
+    } else if (["/autopilot","/away","/goal","/goals","/pause","/resume","/stop","/log","/brief"].includes(command)) {
+      await handleAutopilotCommand(command,topicsEnabled ? arg ?? "" : rest,destination);
     } else if (command === "/status") await retrySendAt(destination, statusText(destination));
     else if (command === "/r") {
       const match = topicsEnabled ? /^(\d+)\s+([\s\S]+)$/.exec(arg ?? "") : /^\/r\s+(\d+)\s+([\s\S]+)$/.exec(text);
@@ -1667,6 +1864,43 @@ export function createTelegram(opts: TelegramOptions) {
     await openPicker({ chatId: callbackChatId, threadId: thread === undefined || thread === 1 ? null : thread, name: null }, idea.text,
       undefined, "Send to which session?", undefined, idea.id);
   };
+  const handleAutopilotCallback = async (callback:TelegramCallback,chatId:string,data:string,bindings:TopicBindings|null) => {
+    const match = /^ap:(on|off|refresh|away:(?:on|off)|delay:(?:-1|1)|send|hold|dismiss|edit|resume|stop)(?::([1-9]\d*))?$/.exec(data);
+    if (!match || !autopilot?.featureEnabled) { await answerCallback(callback,"Autopilot unavailable"); return; }
+    const thread = callback.message?.message_thread_id;
+    const threadId = thread === undefined || thread === 1 ? null : thread;
+    const topic = threadId === null ? "general" :
+      Object.entries(bindings?.topics ?? {}).find(([,value]) => value === threadId)?.[0] ?? null;
+    const destination:Destination = {chatId,threadId,name:topic};
+    const action = match[1]!, id = match[2] ? Number(match[2]) : undefined;
+    let ok = false;
+    const actor = `telegram:${userId ?? "owner"}`;
+    if (action === "on" || action === "off") { autopilot.setEnabled(action === "on"); ok = true; }
+    else if (action === "away:on" || action === "away:off") { autopilot.setAway(action.endsWith("on")); ok = true; }
+    else if (action === "delay:-1" || action === "delay:1") {
+      const scope = topic && !["general","urgent"].includes(topic) ? topic : undefined;
+      const state = autopilot.state(), goal = scope ? autopilot.goals(scope)[0] : undefined;
+      const current = goal ? goal.delayMin : state.delayMin;
+      const currentIndex = Math.max(0,autopilotDelaySteps.indexOf(current));
+      const next = autopilotDelaySteps[Math.max(0,Math.min(autopilotDelaySteps.length-1,currentIndex+(action === "delay:1" ? 1 : -1)))]!;
+      if (scope) autopilot.setProjectDelay(scope,next); else autopilot.setDefaultDelay(next);
+      ok = true;
+    } else if (action === "send" && id) ok = autopilot.action(id,"send",undefined,actor);
+    else if (action === "hold" && id) ok = autopilot.action(id,"hold",undefined,actor);
+    else if (action === "dismiss" && id) ok = autopilot.action(id,"dismiss",undefined,actor);
+    else if (action === "resume" && id) ok = autopilot.goalAction(id,"resume");
+    else if (action === "stop" && id) ok = autopilot.goalAction(id,"stop");
+    else if (action === "edit" && id) {
+      const prompt = await queueSend(destination,"Reply with the edited suggestion. It will be sent only as your owner reply.",
+        {force_reply:true,selective:true},callback.message?.message_id);
+      if (prompt) { rememberSuggestionEditPrompt(prompt.messageId,{decisionId:id,chatId,threadId}); ok = true; }
+    } else if (action === "refresh") ok = true;
+    await answerCallback(callback,ok ? "Autopilot updated" : "Expired or stale");
+    if (action === "on" || action === "off" || action.startsWith("delay:") || action.startsWith("away:") || action === "refresh") {
+      const menu = autopilotMenu(destination);
+      await retrySendAt(destination,menu.text,menu.keyboard);
+    }
+  };
   const handleCallback = async (callback: TelegramCallback) => {
     const callbackChat = callback.message?.chat, fromId = callback.from?.id;
     if (!paired() || String(fromId) !== userId || !callbackChat) return;
@@ -1674,6 +1908,7 @@ export function createTelegram(opts: TelegramOptions) {
     const privateDm = !topicsEnabled && callbackChatId === chatId;
     const boundGroup = callbackChat.type === "supergroup" && !!bindings && callbackChatId === bindings.groupChatId;
     if (!privateDm && !boundGroup) return;
+    if (callback.data?.startsWith("ap:")) { await handleAutopilotCallback(callback,callbackChatId,callback.data,bindings); return; }
     if (callback.data?.startsWith("q:")) { await handleQuestionCallback(callback, callbackChatId, callback.data); return; }
     if (callback.data?.startsWith("d:")) { await handleCard(callback, callbackChatId, callback.data); return; }
     if (callback.data?.startsWith("c:")) { await handlePicker(callback, callbackChatId, callback.data); return; }
@@ -1740,7 +1975,8 @@ export function createTelegram(opts: TelegramOptions) {
       stopAlertTimer = setTimer(() => { sweepUrgentEpisodes(); sweepAlertUpdates(); failStrandedCards(); sweepDrafts(); }, 60_000);
       void run();
     },
-    close() { running = false; stopAlertTimer(); stopAlertTimer = () => {}; abort.abort(); queue.length = 0; token = undefined; },
+    close() { running = false; stopAlertTimer(); stopAlertTimer = () => {}; abort.abort(); queue.length = 0; token = undefined; suggestionEditPrompts.clear(); },
     observe, observeDecisions, health, info, unpair, replyOutcome, sendUrgent,
+    autopilotEscalation,autopilotSuggestion,autopilotPending,autopilotSent,autopilotDone,
   };
 }

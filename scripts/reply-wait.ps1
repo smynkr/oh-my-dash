@@ -40,7 +40,43 @@ try {
 
         if ($null -ne $result -and $result.StatusCode -eq 200) {
             if (-not [string]::IsNullOrEmpty($result.Body)) {
-                $replyBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($result.Body)
+                $replyText = $result.Body
+                $replyJson = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+                $replyJson.MaxJsonLength = 8192
+                try { $envelope = $replyJson.DeserializeObject($result.Body) }
+                catch { $envelope = $null }
+                if ($envelope -is [System.Collections.IDictionary] -and $envelope.Contains('kind') -and
+                    $envelope['kind'] -ceq 'dash.autopilot.reply.v1') {
+                    $metadata = $envelope['autopilot']
+                    $requiredKeys = @('kind', 'source', 'text', 'autopilot')
+                    if ($envelope.Count -ne $requiredKeys.Count -or
+                        @($envelope.Keys | Where-Object { $requiredKeys -cnotcontains [string]$_ }).Count -gt 0 -or
+                        $envelope['source'] -cne 'autopilot' -or
+                        $envelope['text'] -isnot [string] -or
+                        $metadata -isnot [System.Collections.IDictionary] -or
+                        $metadata.Count -ne 3 -or
+                        @($metadata.Keys | Where-Object { @('goal_id', 'expires_at', 'remaining_ttl_ms') -cnotcontains [string]$_ }).Count -gt 0) {
+                        exit 0
+                    }
+                    foreach ($name in @('goal_id', 'expires_at', 'remaining_ttl_ms')) {
+                        if ($metadata[$name] -isnot [long] -and $metadata[$name] -isnot [int]) { exit 0 }
+                    }
+                    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                    if ($metadata.goal_id -lt 1 -or $metadata.expires_at -le $nowMs -or
+                        $metadata.remaining_ttl_ms -lt 1 -or $metadata.remaining_ttl_ms -gt 86400000) { exit 0 }
+                    $remaining = [Math]::Min([long]$metadata.remaining_ttl_ms, [long]($metadata.expires_at - $nowMs))
+                    if ($remaining -lt 1) { exit 0 }
+                    try {
+                        Write-DashWindowsFenceCache -HostLabel $config.HostLabel -SessionId $sessionId -Active:$true `
+                            -GoalId ([long]$metadata.goal_id) -ExpiresAt ([long]$metadata.expires_at) -RemainingTtlMs $remaining
+                    }
+                    catch {
+                        [System.Console]::Error.WriteLine('dash autopilot fence cache unavailable; reply withheld')
+                        exit 0
+                    }
+                    $replyText = $envelope['text']
+                }
+                $replyBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($replyText)
                 $stderr = [System.Console]::OpenStandardError()
                 $stderr.Write($replyBytes, 0, $replyBytes.Length)
                 $stderr.Flush()

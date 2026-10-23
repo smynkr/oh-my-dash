@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { normalizeClaude, normalizeOmp, claudeInteractive, describePrompt, type NormalizedEvent } from "../src/normalize.ts";
+import { normalizeClaude, normalizeOmp, claudeInteractive, describePrompt, normalizeRecommendedQuestionAnswers, type NormalizedEvent } from "../src/normalize.ts";
 import { reduceLiveness, reduceState, type SessionState } from "../src/state.ts";
 
 const headers = new Headers({ "X-Dash-Host": "test-host", "X-Dash-Entrypoint": "cli", "X-Dash-Attended": "1" });
@@ -59,6 +59,17 @@ describe("Claude normalization", () => {
     expect(noIdentity?.questionIdentity).toBeUndefined();
     expect(noIdentity?.questionData).toBeUndefined();
   });
+});
+
+test("autopilot question answers must be exactly each indexed recommendation", () => {
+  const questions = [
+    { id:"db",question:"Which database?",options:[{label:"Postgres"},{label:"SQLite"}],recommended:1 },
+    { id:"cache",question:"Which cache?",options:[{label:"Redis"},{label:"Memory"}],recommended:0 },
+  ];
+  expect(normalizeRecommendedQuestionAnswers(questions,{ "Which database?":"SQLite","Which cache?":"Redis" }))
+    .toEqual({ "Which database?":"SQLite","Which cache?":"Redis" });
+  expect(normalizeRecommendedQuestionAnswers(questions,{ "Which database?":"Postgres","Which cache?":"Redis" })).toBeUndefined();
+  expect(normalizeRecommendedQuestionAnswers(questions,{ "Which database?":"SQLite" })).toBeUndefined();
 });
 
 test("describes injected prompts and preserves human text", () => {

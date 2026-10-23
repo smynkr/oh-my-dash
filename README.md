@@ -98,6 +98,12 @@ Enable `DASH_TELEGRAM=1` in the collector's environment, store a token for a ded
 
 `DASH_JUDGE` is off by default and only runs when `DASH_REPLIES=1` is also set. A Codex canary has failed to establish MCP tool isolation. Do not enable it until you have checked the exact installed Codex invocation in the actual service environment and verified that no web-search or MCP tool calls are exposed. Leave it unset if isolation cannot be established; there is no automatic rollout. See the [runbook](docs/runbook.md#optional-decision-extraction).
 
+## Optional per-session autopilot and Claude dialogs (AXI-241)
+
+Per-session goals and blocking Claude `AskUserQuestion` handling are opt-in and off by default. Runtime autopilot requires `DASH_AUTOPILOT=1`, `DASH_REPLIES=1`, and the separately stored `settings.autopilot.enabled` switch, which starts off. A deterministic policy gate—not the judge alone—allows only fixed continue or verified-recommendation templates to be sent automatically; free-text suggestions and **Brief me** remain owner-only. Owner replies, stale state, budgets, loop/rate limits, and the master kill switch veto actions. An explicitly installed synchronous Claude `PreToolUse` deny-fence keeps a per-session cache; if the hub cannot confirm current goal state, it fails closed and blocks intercepted tools until a valid response arrives, even when the cache is empty or last said inactive.
+
+Install the fence only by explicitly opting in with `--autopilot` (Windows: `-Autopilot`). Blocking dialog handling additionally requires `--autopilot-dialogs` (`-AutopilotDialogs` on Windows), and is mutually exclusive with the separate remote-question helper. Dialog handling also requires `DASH_DIALOGS=1` and owner-recorded E3/E4/E5 scratch-test evidence; incomplete or invalid gates release the question to Claude's native UI. OMP autopilot is unsupported on Windows until durable cache-directory flushing is available: the extension fails closed on OMP tool calls when an active goal is cached or hub state is unconfirmed, and defers autopilot replies. This export does not deploy, set flags or attestations, enable the stored master switch, install hooks, or perform live experiments. See the [autopilot and Claude dialog runbook](docs/runbook.md#per-session-autopilot-and-claude-dialogs).
+
 ## Dependency licenses
 
 The project is MIT-licensed; see [LICENSE](LICENSE). Runtime dependencies are installed from `bun.lock` rather than vendored in this source tree. Their upstream license texts and notices are:

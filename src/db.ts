@@ -12,6 +12,7 @@ import { resolveProject, ruleErrors, SEED_PROJECT_RULES, type ProjectRule } from
 import type { PreparedAuditContext, ReplyAuditDTO, ReplyAuditInsert } from "./audit.ts";
 import { extractDecisions, extractRecommendation, looksDecisionLike, validateDecisionSet, type DecisionSet } from "./decisions.ts";
 import { redactSpan } from "./redact.ts";
+import { AUTOPILOT_GLOBAL_REPLY_RATE_LIMIT } from "./autopilot-policy.ts";
 
 // A3 on the dashboard: the agent's own words, redacted like the Telegram line.
 const recommendationQuote = (text: string) => { const found = extractRecommendation(text); return found ? redactSpan(text, found.start, found.end) : null; };
@@ -542,6 +543,14 @@ export class DashDB {
     }
     return reply;
   }
+  private autopilotReplyRateLimitReached(exceptId: number, now: number): boolean {
+    const row = this.sqlite.query(`SELECT
+      (SELECT COUNT(*) FROM autopilot_turn_events WHERE event_kind IN ('reply','dialog') AND created_at>=? AND created_at<=?) +
+      (SELECT COUNT(*) FROM replies WHERE source='autopilot' AND id<? AND state IN ('queued','leased')
+        AND committed_at IS NULL AND expires_at>?) AS count`)
+      .get(now - 60 * 60_000,now,exceptId,now) as Row;
+    return n(row.count) >= AUTOPILOT_GLOBAL_REPLY_RATE_LIMIT;
+  }
   private takeQueued(key: string, id: number, turnSeq: number, now: number, mode: "claude"|"omp", waiterId?: string,
     commitCapable = false): ReplyTakeResult {
     return this.sqlite.transaction(() => {
@@ -563,14 +572,15 @@ export class DashDB {
         ? String(row.session_harness) === "claude" && status === "your_turn"
         : String(row.session_harness) === "omp" && (bound ? status === "your_turn" :
           status === "working" || status === "your_turn" || status === "needs_input" && ["question","waiting"].includes(String(row.needs_reason)));
-      if (!deliverable || mode === "omp" && waiterId !== undefined && !commitCapable && row.source === "autopilot") {
+      if (!deliverable || mode === "omp" && waiterId !== undefined && !commitCapable && row.source === "autopilot")
         return { kind:"not_ready" } as const;
-      }
+      if (row.source === "autopilot" && this.autopilotReplyRateLimitReached(id,now)) return { kind:"not_ready" } as const;
       const copy = this.reply(row)!;
       if (mode === "claude") {
-        const changes = this.sqlite.query(`UPDATE replies SET state='delivered',text='',lease_until=NULL,done_at=?,cancel_reason=NULL
-          WHERE id=? AND state='queued' AND committed_at IS NULL`).run(now,id).changes;
-        if (changes !== 1) return { kind:"unavailable" } as const;
+        const changes = this.sqlite.query(`UPDATE replies SET state='delivered',text='',lease_until=NULL,done_at=?,cancel_reason=NULL,
+          committed_at=CASE WHEN source='autopilot' THEN ? ELSE committed_at END
+          WHERE id=? AND state='queued' AND committed_at IS NULL`).run(now,now,id).changes;
+        if (changes < 1) return { kind:"unavailable" } as const;
         this.auditOutcome(id,"delivered",now);
         return { kind:"taken",reply:{ ...copy,state:"delivered",doneAt:now,leaseUntil:null } } as const;
       }
@@ -602,6 +612,8 @@ export class DashDB {
         s(row.pending_question_id) === String(row.answers_question) &&
         !this.questionAnswered(String(row.session_key), String(row.answers_question));
       if (row.committed_at != null) return !stale && questionFresh && deliverable ? { ok:true } as const : { ok:false,reason:"not_ready" } as const;
+      if (row.source === "autopilot" && this.autopilotReplyRateLimitReached(id,now))
+        return { ok:false,reason:"not_ready" } as const;
       if (stale) {
         return { ok:false,reason:"stale",reply:this.finishReply(row,"cancelled",now,"stale") } as const;
       }
@@ -615,7 +627,7 @@ export class DashDB {
       }
       const changes = this.sqlite.query(`UPDATE replies SET committed_at=? WHERE id=? AND state='leased'
         AND lease_until>? AND lease_commit=1 AND committed_at IS NULL`).run(now,id,now).changes;
-      return changes === 1 ? { ok:true } as const : { ok:false,reason:"not_leased" } as const;
+      return changes < 1 ? { ok:false,reason:"not_leased" } as const : { ok:true } as const;
     })();
   }
   ackReply(id: number, now: number): Reply | undefined {
@@ -1065,7 +1077,7 @@ export class DashDB {
     const consumed = this.sqlite.transaction(() => this.sqlite.query(`UPDATE question_invocations
       SET state='consumed',answers_json=NULL,done_at=?,cancel_reason=NULL
       WHERE question_id=? AND session_key=? AND tool_use_id=? AND state='answered' AND expires_at>?`)
-      .run(now,id,key,toolUseId,now).changes === 1)();
+      .run(now,id,key,toolUseId,now).changes > 0)();
     return consumed ? { kind: "taken", answers: invocation.answers } : { kind: "stale" };
   }
   private finishQuestion(id: string, key: string, toolUseId: string, now: number,

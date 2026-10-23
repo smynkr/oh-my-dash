@@ -20,6 +20,7 @@
     </div>
     <div id="telegram-status" class="telegram-status" aria-live="polite" hidden></div>
     <button id="ideas-open" class="button button-secondary ideas-open" type="button" aria-haspopup="dialog" title="Ideas" hidden>Ideas <span id="ideas-badge" class="ideas-badge">0</span></button>
+    <button id="autopilot-open" class="button button-secondary" type="button" aria-haspopup="dialog">Autopilot <span id="autopilot-badge">Off</span></button>
     <button id="notification-enable" class="button button-secondary" type="button">Enable desktop notifications</button>
     <button id="mark-all" class="button button-secondary" type="button">Mark all read</button>
   </header>
@@ -329,6 +330,35 @@
     <p id="ideas-status" class="muted" role="status"></p>
     <ul id="ideas-list" class="ideas-list"></ul>
     <p id="ideas-empty" class="empty-state" hidden></p>
+  </dialog>
+  <dialog id="autopilot-dialog" class="navigation-dialog autopilot-dialog" aria-labelledby="autopilot-title">
+    <form method="dialog"><button class="dialog-close" aria-label="Close autopilot">×</button></form>
+    <h2 id="autopilot-title">Per-session autopilot</h2>
+    <p id="autopilot-status" class="muted" role="status">Loading autopilot status…</p>
+    <div class="autopilot-global-controls">
+      <button id="autopilot-master" class="button button-secondary" type="button" disabled>Autopilot OFF</button>
+      <label class="check-label"><input id="autopilot-away" type="checkbox" disabled> Away — hold dialogs for review</label>
+      <label for="autopilot-delay">Default execution delay</label>
+      <select id="autopilot-delay" disabled>
+        <option value="0">Now</option><option value="1">1 min</option><option value="2">2 min</option>
+        <option value="5">5 min</option><option value="10">10 min</option><option value="15">15 min</option>
+        <option value="20">20 min</option><option value="30">30 min</option><option value="45">45 min</option>
+        <option value="60">60 min</option><option value="90">90 min</option><option value="120">120 min</option>
+        <option value="never">Never (suggest only)</option>
+      </select>
+      <label for="autopilot-stop-phrases">Additional stop-and-ask phrases (one per line)</label>
+      <textarea id="autopilot-stop-phrases" rows="3" maxlength="8000" disabled></textarea>
+      <button id="autopilot-save-settings" class="button button-secondary" type="button" disabled>Save stop phrases</button>
+      <button id="autopilot-brief" class="button button-primary" type="button" disabled>Brief me</button>
+    </div>
+    <div id="autopilot-metrics" class="autopilot-metrics" aria-live="polite"></div>
+    <h3>While you were away</h3>
+    <div class="autopilot-review-toolbar">
+      <span id="autopilot-unreviewed">0 unreviewed decisions</span>
+      <button id="autopilot-review-all" class="button button-secondary" type="button" disabled>Mark all reviewed</button>
+    </div>
+    <p id="autopilot-brief-result" class="autopilot-brief-result" role="status" aria-live="polite"></p>
+    <div id="autopilot-decisions" class="autopilot-decisions"></div>
   </dialog>
   <dialog id="notifications-dialog" class="notification-dialog">
     <form method="dialog"><button class="dialog-close" aria-label="Close">×</button></form>

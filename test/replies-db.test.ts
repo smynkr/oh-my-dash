@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DashDB } from "../src/db.ts";
+import { AutopilotStore } from "../src/autopilot-store.ts";
 import { SEED_PROJECT_RULES } from "../src/projects.ts";
 import { createAudit } from "../src/audit.ts";
 import type { NormalizedEvent } from "../src/normalize.ts";
@@ -136,6 +137,39 @@ test("R1 cancellation includes queued and uncommitted leases but keeps committed
     expect(db.cancelReplies({id:committed.id,reason:"owner_replied"},10)).toEqual([]);
     expect(db.commitOmp(leased.id,"waiter0001",11)).toMatchObject({ok:false,reason:"not_leased"});
     expect(db.getReply(committed.id)).toMatchObject({state:"leased",committedAt:7,text:"synthetic telegram"});
+  } finally { db.close(); }
+});
+
+test("autopilot budget is rechecked at Claude handout and OMP commitment", () => {
+  const db = new DashDB(":memory:", { decisionsEnabled:true });
+  const autopilot = new AutopilotStore(db);
+  const now = 1_000_000;
+  const seedBudget = (goalId:number) => {
+    for (let index=0; index<30; index++) db.sqlite.query(`INSERT INTO autopilot_turn_events
+      (event_key,goal_id,event_kind,created_at) VALUES(?,?,'reply',?)`)
+      .run(`synthetic-budget:${goalId}:${index}`,goalId,now-1_000+index);
+  };
+  try {
+    const claude = db.applyEvent({host:"synthetic-host",harness:"claude",sessionId:"budget-claude",
+      kind:"session_start",ts:now,interactive:true});
+    db.applyEvent({host:"synthetic-host",harness:"claude",sessionId:"budget-claude",
+      kind:"response",ts:now+1,text:"Synthetic response",interactive:true});
+    const claudeGoal = autopilot.createGoal({sessionKey:claude.key,goalText:"Bounded Claude task",expiresAt:now+60_000},now+1);
+    const claudeReply = db.enqueueReply(claude.key,"Synthetic fixed reply","autopilot",`autopilot:goal:${claudeGoal.id}`,
+      db.getSession(claude.key)!.turnSeq,now+2,60_000);
+    seedBudget(claudeGoal.id);
+    expect(db.takeQueuedForClaude(claude.key,claudeReply.id,db.getSession(claude.key)!.turnSeq,now+3).kind).toBe("not_ready");
+    db.sqlite.query("DELETE FROM autopilot_turn_events").run();
+
+    const omp = db.applyEvent({host:"synthetic-host",harness:"omp",sessionId:"budget-omp",
+      kind:"session_start",ts:now+4,interactive:true});
+    const ompGoal = autopilot.createGoal({sessionKey:omp.key,goalText:"Bounded OMP task",expiresAt:now+60_000},now+4);
+    const ompReply = db.enqueueReply(omp.key,"Synthetic fixed reply","autopilot",`autopilot:goal:${ompGoal.id}`,
+      db.getSession(omp.key)!.turnSeq,now+5,60_000);
+    expect(db.leaseQueuedForOmp(omp.key,ompReply.id,"synthetic-budget",db.getSession(omp.key)!.turnSeq,now+6,true).kind)
+      .toBe("leased");
+    seedBudget(ompGoal.id);
+    expect(db.commitOmp(ompReply.id,"synthetic-budget",now+7)).toEqual({ok:false,reason:"not_ready"});
   } finally { db.close(); }
 });
 

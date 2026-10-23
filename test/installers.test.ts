@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, readdir, rm, writeFile, mkdir, chmod, lstat, realpath, symlink } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { mergeSettings, parseArgs as claudeArgs, updateSettings } from "../scripts/install-claude-hooks.ts";
 import { install as installOmp, parseArgs as ompArgs } from "../scripts/install-omp-extension.ts";
 
@@ -44,12 +44,54 @@ describe("Claude hook installer", () => {
     }
     const stop = hooks.Stop.at(-1)!;
     expect(stop.hooks).toHaveLength(1);
-    expect(stop.hooks[0]).toEqual({ type: "command", async: true, asyncRewake: true, timeout: 21600, command: `/bin/sh '${args().replyScript}' 'http://127.0.0.1:4777' 'synthetic-host' # dash-hook` });
+    expect(stop.hooks[0]).toEqual({ type: "command", async: true, asyncRewake: true, timeout: 21600, command: `/bin/sh '${args().replyScript}' 'http://127.0.0.1:4777' 'synthetic-host' '${args().python3}' # dash-hook` });
     expect(hooks.PreToolUse.at(-1)?.matcher).toBe("AskUserQuestion");
     expect(hooks.PostToolUse.at(-1)?.matcher).toBe("AskUserQuestion");
     expect(hooks.PreToolUse.some(group => group.hooks.some(hook => hook.command.includes("# dash-hook-question")))).toBe(false);
   });
 
+  test("autopilot fence is opt-in and installs its cache dependencies beside the hook scripts", async () => {
+    const scripts = join(scratch,"dash scripts");
+    const helper = join(scripts,"claude-autopilot-fence.py");
+    const replyScript = join(scripts,"reply-wait.sh");
+    const optIn = claudeArgs(["--settings",settings,"--url","http://127.0.0.1:4777/ingest/claude",
+      "--host","synthetic-host","--autopilot","--autopilot-fence-helper",helper,"--reply-script",replyScript]);
+    await updateSettings(optIn);
+    const hooks = (await settingsDoc()).hooks as Record<string, Array<{ matcher?:string; hooks:Array<{command:string;timeout?:number}> }>>;
+    const group = hooks.PreToolUse.find(item => item.hooks.some(hook => hook.command.includes("# dash-hook-autopilot-fence")));
+    expect(group?.matcher).toBe(".*");
+    expect(hooks.Stop.at(-1)?.hooks[0]?.command).toContain(`'${optIn.python3}'`);
+    expect(await readFile(helper,"utf8")).toBe(await readFile(join(process.cwd(),"scripts/claude-autopilot-fence.py"),"utf8"));
+    expect(await readFile(join(scripts,"autopilot_fence_cache.py"),"utf8"))
+      .toBe(await readFile(join(process.cwd(),"scripts/autopilot_fence_cache.py"),"utf8"));
+    expect((await lstat(helper)).mode & 0o777).toBe(0o700);
+    await updateSettings({ ...optIn, uninstall:true });
+    expect(await Bun.file(helper).exists()).toBe(false);
+    expect(await Bun.file(join(scripts,"autopilot_fence_cache.py")).exists()).toBe(false);
+    expect(await settingsDoc()).toEqual(original);
+  });
+  test("autopilot dialog opt-in also installs the deny fence and shared cache", async () => {
+    const scripts = join(scratch,"dialog scripts");
+    const dialogHelper = join(scripts,"claude-autopilot-dialog.py");
+    const fenceHelper = join(scripts,"claude-autopilot-fence.py");
+    const replyScript = join(scripts,"reply-wait.sh");
+    const optIn = claudeArgs(["--settings",settings,"--url","http://127.0.0.1:4777/ingest/claude",
+      "--host","synthetic-host","--autopilot-dialogs","--autopilot-dialog-helper",dialogHelper,
+      "--autopilot-fence-helper",fenceHelper,"--reply-script",replyScript]);
+    await updateSettings(optIn);
+    const hooks = (await settingsDoc()).hooks as Record<string, Array<{ matcher?:string; hooks:Array<{command:string;timeout?:number}> }>>;
+    expect(hooks.PreToolUse.some(item => item.hooks.some(hook => hook.command.includes("# dash-hook-autopilot-fence")))).toBe(true);
+    expect(hooks.PreToolUse.some(item => item.matcher === "AskUserQuestion" &&
+      item.hooks.some(hook => hook.command.includes("# dash-hook-autopilot-dialog")))).toBe(true);
+    for (const directory of [join(scratch,"dialog scripts"),dirname(replyScript),dirname(fenceHelper)]) {
+      expect(await Bun.file(join(directory,"autopilot_fence_cache.py")).exists()).toBe(true);
+    }
+    await updateSettings({ ...optIn, uninstall:true });
+    expect(await Bun.file(dialogHelper).exists()).toBe(false);
+    expect(await Bun.file(fenceHelper).exists()).toBe(false);
+    expect(await Bun.file(join(scripts,"autopilot_fence_cache.py")).exists()).toBe(false);
+    expect(await settingsDoc()).toEqual(original);
+  });
   test("remote question answering is opt-in and installs a safely quoted helper", async () => {
     const helper = join(scratch, "question helper's.py");
     const optIn = claudeArgs(["--settings", settings, "--url", "http://127.0.0.1:4777/ingest/claude",
@@ -215,13 +257,14 @@ describe("Claude hook installer", () => {
 });
 
 describe("OMP extension installer", () => {
-  test("install copies the extension into a new target directory", async () => {
+  test("install copies the extension and fence-cache dependency into a new target directory", async () => {
     const target = join(scratch, "nested", "extensions");
     await installOmp(ompArgs(["--target", target]));
     expect(await readFile(join(target, "dash.ts"), "utf8")).toBe(await readFile(join(process.cwd(), "omp-extension/dash.ts"), "utf8"));
+    expect(await readFile(join(target, "fence-cache.ts"), "utf8")).toBe(await readFile(join(process.cwd(), "omp-extension/fence-cache.ts"), "utf8"));
   });
 
-  test("uninstall removes only dash.ts", async () => {
+  test("uninstall removes only the extension and fence-cache dependency", async () => {
     const target = join(scratch, "extensions");
     await mkdir(target);
     await writeFile(join(target, "unrelated.ts"), "synthetic unrelated extension\n");
@@ -232,7 +275,8 @@ describe("OMP extension installer", () => {
 
   test("dry-run creates no target directory", async () => {
     const target = join(scratch, "dry-run-extension");
-    await installOmp(ompArgs(["--target", target, "--dry-run"]));
+    const result = await installOmp(ompArgs(["--target", target, "--dry-run"]));
+    expect(result).toContain("fence-cache.ts");
     expect((await readdir(scratch)).includes("dry-run-extension")).toBe(false);
   });
 });

@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import extension, { chooseDelivery, resolveHost } from "../omp-extension/dash.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 type Handler = (event: Record<string, unknown>, ctx: Record<string, unknown>) => unknown;
 const originalFetch = globalThis.fetch;
@@ -7,6 +10,7 @@ const originalUrl = process.env.DASH_URL;
 const originalHeadless = process.env.DASH_ALLOW_HEADLESS;
 const originalReplyUrl = process.env.DASH_REPLY_URL;
 const originalHost = process.env.DASH_HOST;
+const originalHome = process.env.HOME;
 let handlers: Map<string, Handler>;
 let posts: Array<{ url: string; body: Record<string, unknown>; options: RequestInit }>;
 const interactiveCtx = { mode: "tui", cwd: "/synthetic/project", sessionManager: { getSessionId: () => "synthetic-session" } };
@@ -47,6 +51,8 @@ afterEach(() => {
   else process.env.DASH_REPLY_URL = originalReplyUrl;
   if (originalHost === undefined) delete process.env.DASH_HOST;
   else process.env.DASH_HOST = originalHost;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
 });
 
 describe("OMP feed extension", () => {
@@ -258,21 +264,110 @@ const syntheticAskQuestions = [
     expect(calls).toHaveLength(1);
   });
 
-  test("autopilot uses its exact non-owner prefix", async () => {
+  test("autopilot delivery seeds a private fence that survives extension restart", async () => {
     const sends: string[] = [];
+    const sent = Promise.withResolvers<void>();
+    const home = mkdtempSync(join(tmpdir(), "dash-omp-home-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
     let waits = 0;
     globalThis.fetch = ((url: string | URL | Request) => {
       const value = String(url);
       if (value.includes("/reply/wait/omp")) return Promise.resolve(++waits === 1
-        ? Response.json({ id: 12, text: "synthetic recommendation", source: "autopilot" })
+        ? Response.json({
+          id: 12, text: "synthetic recommendation", source: "autopilot",
+          autopilot: { goal_id: 7, expires_at: Date.now() + 60_000, remaining_ttl_ms: 60_000 },
+        })
         : new Response(null, { status: 409 }));
       if (value.includes("/reply/commit")) return Promise.resolve(Response.json({ ok: true }));
       return Promise.resolve(new Response("{}"));
     }) as typeof fetch;
-    extension({ on: (name, handler) => handlers.set(name, handler), sendUserMessage: (text) => { sends.push(text); } });
-    fire("session_start", {}, { ...interactiveCtx, isIdle: () => true });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(sends).toEqual(["[dash autopilot, not the owner]:\nsynthetic recommendation"]);
+    const register = () => extension({ on: (name, handler) => handlers.set(name, handler), sendUserMessage: (text) => {
+      sends.push(text); sent.resolve();
+    } });
+    const ctx = { ...interactiveCtx, isIdle: () => true };
+    try {
+      register();
+      fire("session_start", {}, ctx);
+      await sent.promise;
+      expect(sends).toEqual(["[dash autopilot, not the owner]:\nsynthetic recommendation"]);
+      globalThis.fetch = (() => { throw new Error("synthetic hub outage"); }) as typeof fetch;
+      expect(await handlers.get("tool_call")!({ toolName: "Bash", args: { command: "echo safe" } }, ctx))
+        .toMatchObject({ block: true });
+
+      register();
+      expect(await handlers.get("tool_call")!({ toolName: "Bash", args: { command: "echo safe" } }, ctx))
+        .toMatchObject({ block: true, reason: "dash hub unreachable; autopilot paused, ask the owner" });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+  test("cold and inactive fence state fail closed on hub outage", async () => {
+    const home = mkdtempSync(join(tmpdir(), "dash-omp-offline-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      extension({ on: (name, handler) => handlers.set(name, handler) });
+      globalThis.fetch = (() => { throw new Error("synthetic hub outage"); }) as typeof fetch;
+      expect(await handlers.get("tool_call")!(
+        { toolName: "Bash", args: { command: "echo safe" } }, interactiveCtx,
+      )).toMatchObject({
+        block: true, reason: "dash hub unreachable; autopilot state unconfirmed, ask the owner",
+      });
+
+      globalThis.fetch = (() => Promise.resolve(Response.json({
+        active_goal: false, goal_id: null, expires_at: null, remaining_ttl_ms: 0,
+      }))) as typeof fetch;
+      expect(await handlers.get("tool_call")!(
+        { toolName: "Bash", args: { command: "echo safe" } }, interactiveCtx,
+      )).toBeUndefined();
+
+      globalThis.fetch = (() => { throw new Error("synthetic hub outage"); }) as typeof fetch;
+      expect(await handlers.get("tool_call")!(
+        { toolName: "Bash", args: { command: "echo safe" } }, interactiveCtx,
+      )).toMatchObject({
+        block: true, reason: "dash hub unreachable; autopilot state unconfirmed, ask the owner",
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("does not commit an autopilot reply when its fence cache cannot be persisted", async () => {
+    const home = mkdtempSync(join(tmpdir(), "dash-omp-home-"));
+    writeFileSync(join(home, ".omp"), "not a directory");
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const acked = Promise.withResolvers<Record<string, unknown>>();
+    const sends: string[] = [];
+    let waits = 0, commits = 0;
+    globalThis.fetch = ((url: string | URL | Request, options?: RequestInit) => {
+      const value = String(url);
+      if (value.includes("/reply/wait/omp")) return Promise.resolve(++waits === 1
+        ? Response.json({id:14,text:"synthetic reply",source:"autopilot",
+          autopilot:{goal_id:7,expires_at:Date.now()+60_000,remaining_ttl_ms:60_000}})
+        : new Response(null,{status:409}));
+      if (value.includes("/reply/commit")) { commits++; return Promise.resolve(Response.json({ok:true})); }
+      if (value.includes("/reply/ack")) {
+        acked.resolve(JSON.parse(String(options?.body)) as Record<string,unknown>);
+        return Promise.resolve(new Response("{}"));
+      }
+      return Promise.resolve(new Response("{}"));
+    }) as typeof fetch;
+    try {
+      extension({on:(name,handler) => handlers.set(name,handler),sendUserMessage:text => {sends.push(text);}});
+      fire("session_start",{}, {...interactiveCtx,isIdle:() => true});
+      expect(await acked.promise).toMatchObject({id:14,outcome:"deferred"});
+      expect(commits).toBe(0);
+      expect(sends).toEqual([]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+      rmSync(home,{recursive:true,force:true});
+    }
   });
 
   test("transient commit failures retry, and injection follows a successful commit", async () => {

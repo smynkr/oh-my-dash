@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-
+import { tmpdir } from "node:os";
 const script = join(process.cwd(), "scripts/reply-wait.sh");
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 
@@ -9,8 +9,10 @@ afterEach(async () => {
   for (const server of servers.splice(0)) server.stop(true);
 });
 
-async function runWaiter(base: string, body: string, waitSeconds = "3") {
-  const proc = Bun.spawn(["/bin/sh", script, base, "synthetic-host"], {
+async function runWaiter(base: string, body: string, waitSeconds = "3", python3?: string) {
+  const args = ["/bin/sh", script, base, "synthetic-host"];
+  if (python3) args.push(python3);
+  const proc = Bun.spawn(args, {
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
     env: { ...process.env, DASH_REPLY_WAIT_S: waitSeconds },
   });
@@ -47,6 +49,30 @@ describe("Claude reply waiter", () => {
     expect(url.searchParams.get("started")).toMatch(/^\d+$/);
     expect(server.requests[0].headers.get("X-Dash-Host")).toBe("synthetic-host");
   });
+  test("ordinary JSON that resembles autopilot metadata stays an owner reply", async () => {
+    const body = JSON.stringify({ source: "autopilot", text: "synthetic owner JSON" });
+    const server = fake([{ status: 200, body }]);
+    expect(await runWaiter(server.base, '{"session_id":"synthetic-session"}')).toEqual({
+      exitCode: 2, stdout: "", stderr: body,
+    });
+  });
+  test("withholds autopilot text when the durable fence cache cannot be seeded", async () => {
+    const previous = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = "relative-state";
+    const server = fake([{ status: 200, body: JSON.stringify({
+      kind: "dash.autopilot.reply.v1", source: "autopilot", text: "synthetic fixed reply",
+      autopilot: { goal_id: 1, expires_at: Date.now() + 60_000, remaining_ttl_ms: 60_000 },
+    }) }]);
+    try {
+      expect(await runWaiter(server.base, '{"session_id":"synthetic-session"}')).toEqual({
+        exitCode: 0, stdout: "", stderr: "dash autopilot fence cache unavailable; reply withheld\n",
+      });
+    } finally {
+      if (previous === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = previous;
+    }
+  });
+
 
   test("204 then 200 continues polling", async () => {
     const server = fake([{ status: 204 }, { status: 200, body: "another synthetic reply" }]);
@@ -86,4 +112,29 @@ describe("Claude reply waiter", () => {
     expect(result.exitCode).toBe(0);
     expect(Date.now() - start).toBeLessThan(4000);
   });
+  test("autopilot seeding uses the configured Python executable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dash-reply-wait-"));
+    const interpreter = join(directory, "custom-python");
+    const marker = join(directory, "interpreter-called");
+    await writeFile(interpreter, `#!/bin/sh
+if [ "$1" = "-c" ]; then
+  actual_python=$(command -v python3) || exit 1
+  exec "$actual_python" "$@"
+fi
+cat >/dev/null
+printf called > '${marker}'
+`);
+    await chmod(interpreter, 0o700);
+    const server = fake([{ status: 200, body: JSON.stringify({
+      kind: "dash.autopilot.reply.v1",
+      source: "autopilot", text: "synthetic autopilot reply",
+      autopilot: { goal_id: 1, expires_at: Date.now() + 60_000, remaining_ttl_ms: 60_000 },
+    }) }]);
+    try {
+      const result = await runWaiter(server.base, '{"session_id":"synthetic-session"}', "3", interpreter);
+      expect(result).toEqual({ exitCode: 2, stdout: "", stderr: "synthetic autopilot reply" });
+      expect(await Bun.file(marker).text()).toBe("called");
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
 });
