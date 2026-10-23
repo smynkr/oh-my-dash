@@ -5,6 +5,7 @@
   const sessionsNode = $('#sessions');
   const timelineNode = $('#timeline');
   const state = { sessions: [], timeline: [], before: null, timelineDone: false, timelineLoading: false, expanded: new Set(), priorStatus: new Map(), view: 'console', source: null, drafts: new Map(), replyStates: new Map(), replyFetchVersion: new Map(), replyNotices: new Map(), replyPending: new Set(), cancelPending: new Set(), replyRefreshTimers: new Map(), replyRefreshUntil: new Map(), picks: new Map(), capabilityFetchVersion: new Map(), capabilityRefreshPending: new Set(), capabilityRefreshNotice: new Map(), repliesEnabled: false };
+  const autopilotUi = { settings: null, sessions: new Map(), loading: new Set(), decisions: [], metrics: null };
   const draftRecovery = { enabled: false, error: '', entries: new Map(), recovered: new Set(), expired: new Set(), timer: null };
   const draftStorageKey = 'dash.reply-drafts.v1', draftLifetime = 30 * 60_000;
   const authorizationPreviews = new Map();
@@ -91,6 +92,181 @@
       panel.replaceChildren(el('strong', '', 'Telegram'), el('span', 'telegram-state', 'unavailable'));
       panel.hidden = false;
     }
+  }
+
+  const autopilotDelayOptions = [['0','Now'],['1','1 min'],['2','2 min'],['5','5 min'],['10','10 min'],['15','15 min'],
+    ['20','20 min'],['30','30 min'],['45','45 min'],['60','60 min'],['90','90 min'],['120','120 min'],['never','Never (suggest only)']];
+  const autopilotDelayValue = value => value === 'never' || value === null ? null : Number(value);
+  function setSelectOptions(select, selected, options = autopilotDelayOptions) {
+    select.replaceChildren(...options.map(([value,label]) => {
+      const option = el('option','',label); option.value = value; option.selected = String(selected ?? 'never') === value; return option;
+    }));
+  }
+  async function loadAutopilotSession(key) {
+    if (autopilotUi.loading.has(key)) return;
+    autopilotUi.loading.add(key);
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(key)}/autopilot`);
+      if (!response.ok) throw new Error('Autopilot goal unavailable');
+      autopilotUi.sessions.set(key,await response.json());
+    } catch { autopilotUi.sessions.set(key,{unavailable:true,featureEnabled:false,goal:null,goals:[],decisions:[]}); }
+    finally { autopilotUi.loading.delete(key); renderSessions(); }
+  }
+  function autopilotGoalControls(session,key) {
+    const section = el('details','session-autopilot');
+    const data = autopilotUi.sessions.get(key);
+    const goal = data?.goal ?? null;
+    const summary = el('summary','','Autopilot goal');
+    if (goal) summary.append(el('span','autopilot-goal-status',`${goal.status} · ${goal.turnsUsed}/${goal.maxTurns} turns`));
+    section.append(summary);
+    section.open = state.expanded.has(`${key}:autopilot`);
+    section.addEventListener('toggle',() => section.open ? state.expanded.add(`${key}:autopilot`) : state.expanded.delete(`${key}:autopilot`));
+    if (!autopilotUi.settings) {
+      section.append(el('p','muted','Loading goal controls…')); void refreshAutopilot(); return section;
+    }
+    if (!data) {
+      section.append(el('p','muted','Loading goal controls…')); void loadAutopilotSession(key); return section;
+    }
+    if (data.unavailable) {
+      section.append(el('p','muted','Goal status is unavailable. Refresh the dashboard to try again.')); return section;
+    }
+    if (!autopilotUi.settings.flagEnabled || !data.featureEnabled) {
+      section.append(el('p','muted','DASH_AUTOPILOT and DASH_REPLIES must be enabled on the hub.')); return section;
+    }
+    const editor = el('div','autopilot-goal-editor');
+    const goalLabel = el('label','','Goal (owner-authored)');
+    const goalText = el('textarea','autopilot-goal-text'); goalText.rows = 2; goalText.maxLength = 500;
+    goalText.value = goal?.goalText ?? ''; goalLabel.append(goalText);
+    const stopLabel = el('label','','Stop condition');
+    const stop = el('input','autopilot-stop-condition'); stop.maxLength = 500; stop.value = goal?.stopCondition ?? 'the goal is met'; stopLabel.append(stop);
+    const delayLabel = el('label','','Execution delay');
+    const delay = el('select','autopilot-goal-delay'); setSelectOptions(delay,goal ? goal.delayMin : autopilotUi.settings.delayMin); delayLabel.append(delay);
+    const budgetLabel = el('label','','Turn budget');
+    const budget = el('input','autopilot-turn-budget'); budget.type='number'; budget.min='1'; budget.max='20'; budget.value=String(goal?.maxTurns ?? 20); budgetLabel.append(budget);
+    const expiryLabel = el('label','','Expires after (hours)');
+    const expiry = el('input','autopilot-expiry'); expiry.type='number'; expiry.min='1'; expiry.max='24';
+    expiry.value=String(goal ? Math.max(1,Math.ceil((goal.expiresAt-Date.now())/3_600_000)) : 8); expiryLabel.append(expiry);
+    editor.append(goalLabel,stopLabel,delayLabel,budgetLabel,expiryLabel);
+    const replacingEscalated = goal?.status === 'escalated';
+    const save = el('button','button button-primary',replacingEscalated ? 'Replace goal' : goal ? 'Save goal' : 'Start goal'); save.type='button';
+    const controls = el('div','autopilot-goal-actions'); controls.append(save);
+    if (goal?.status === 'active') {
+      const pause = el('button','button button-secondary','Pause'); pause.type='button';
+      pause.addEventListener('click',() => postSessionAutopilot(key,{action:'pause',id:goal.id}));
+      controls.append(pause);
+    } else if (goal && ['paused','escalated'].includes(goal.status)) {
+      const resume = el('button','button button-secondary','Resume'); resume.type='button';
+      resume.addEventListener('click',() => postSessionAutopilot(key,{action:'resume',id:goal.id}));
+      controls.append(resume);
+    }
+    if (goal && !['done','stopped'].includes(goal.status)) {
+      const stopGoal = el('button','button button-secondary','Stop'); stopGoal.type='button';
+      stopGoal.addEventListener('click',() => postSessionAutopilot(key,{action:'stop',id:goal.id}));
+      controls.append(stopGoal);
+    }
+    save.addEventListener('click',() => postSessionAutopilot(key,{
+      action:goal && !replacingEscalated ? 'edit' : 'create',...(goal && !replacingEscalated ? {id:goal.id} : {}),
+      goalText:goalText.value,stopCondition:stop.value,delayMin:autopilotDelayValue(delay.value),
+      maxTurns:Number(budget.value),expiresAt:Date.now()+Math.max(1,Math.min(24,Number(expiry.value)||8))*3_600_000,
+    }));
+    section.append(editor,controls);
+    if (goal) section.append(el('p','muted',`${goal.turnsUsed} of ${goal.maxTurns} turns used · expires ${new Date(goal.expiresAt).toLocaleString()} · ${goal.delayMin === null ? 'Never: suggestions only' : `delay ${goal.delayMin} min`}`));
+    const pending = (data.decisions ?? []).filter(item => ['pending','deferred','escalated'].includes(item.status));
+    for (const item of pending.slice(0,3)) section.append(el('p','autopilot-goal-decision',`Decision #${item.id}: ${item.status} · ${item.gateRule ?? item.templateType ?? 'owner review'}`));
+    return section;
+  }
+  async function postSessionAutopilot(key,body) {
+    try {
+      const response=await postJson(`/api/sessions/${encodeURIComponent(key)}/autopilot`,body), payload=await response.json();
+      if (!response.ok) throw new Error(payload.error || 'Could not update goal');
+      autopilotUi.sessions.delete(key); await loadAutopilotSession(key); await refreshAutopilot();
+    } catch (error) { window.alert(error.message || 'Could not update autopilot goal.'); }
+  }
+  async function refreshAutopilotDecisions() {
+    try {
+      const response=await fetch('/api/autopilot/decisions?unreviewed=1&limit=100');
+      if (!response.ok) throw new Error('Decision log unavailable');
+      const data=await response.json(); autopilotUi.decisions=data.decisions ?? [];
+      $('#autopilot-unreviewed').textContent=`${data.unreviewed ?? 0} unreviewed decisions`;
+      renderAutopilotDecisions();
+    } catch { $('#autopilot-decisions').replaceChildren(el('p','muted','Decision log unavailable.')); }
+  }
+  function renderAutopilotDecisions() {
+    const root=$('#autopilot-decisions'); root.replaceChildren();
+    const rows=autopilotUi.decisions.filter(item=>item.reviewedAt==null);
+    if (!rows.length) root.append(el('p','empty-state','No unreviewed decisions.'));
+    for (const item of rows) {
+      const article=el('article','autopilot-decision');
+      const session=state.sessions.find(row=>responseKey(row)===item.sessionKey);
+      const title=el('h4','',`${session ? nameOf(session) : item.project} · ${item.status}`);
+      const rationale=el('p','',item.verdict?.rationale ?? 'No rationale recorded.');
+      const gate=el('p','autopilot-decision-gate',`Gate: ${item.gateRule ?? item.templateType ?? '—'} · confidence ${Math.round((item.verdict?.confidence ?? 0)*100)}%`);
+      article.append(title,gate,rationale);
+      if (item.replySuggestion) {
+        const editor=el('textarea','autopilot-suggestion-editor'); editor.rows=3; editor.maxLength=4000;
+        editor.value=item.replySuggestion; editor.setAttribute('aria-label','Owner-approved suggestion');
+        article.append(editor);
+        const send=el('button','button button-primary','Send suggestion'); send.type='button';
+        send.addEventListener('click',async()=>{send.disabled=true;try{const response=await postJson(`/api/autopilot/decisions/${item.id}`,{action:'send-suggestion',text:editor.value});if(!response.ok)throw new Error('Suggestion is stale or could not be queued.'); await refreshAutopilotDecisions();}catch(error){window.alert(error.message);send.disabled=false;}});
+        article.append(send);
+      }
+      const actions=el('div','autopilot-decision-actions');
+      if (item.status==='pending') {
+        const send=el('button','button button-secondary',item.delayMin===null?'Send':'Send now'); send.type='button';
+        send.addEventListener('click',()=>postAutopilotDecision(item.id,'send-now'));
+        const hold=el('button','button button-secondary','Hold'); hold.type='button'; hold.addEventListener('click',()=>postAutopilotDecision(item.id,'hold'));
+        const dismiss=el('button','button button-secondary','Dismiss'); dismiss.type='button'; dismiss.addEventListener('click',()=>postAutopilotDecision(item.id,'veto'));
+        actions.append(send,hold,dismiss);
+      }
+      const correct=el('button','button button-secondary','Correct'); correct.type='button';
+      correct.addEventListener('click',()=>prefillAutopilotCorrection(item));
+      const reviewed=el('button','button button-secondary','Mark reviewed'); reviewed.type='button';
+      reviewed.addEventListener('click',()=>postAutopilotDecision(item.id,'review'));
+      actions.append(correct,reviewed); article.append(actions); root.append(article);
+    }
+  }
+  async function postAutopilotDecision(id,action) {
+    try { const response=await postJson(`/api/autopilot/decisions/${id}`,{action}); if(!response.ok)throw new Error('Decision changed or is stale.'); await refreshAutopilot(); }
+    catch(error){window.alert(error.message);}
+  }
+  async function prefillAutopilotCorrection(item) {
+    try {
+      const response=await postJson(`/api/autopilot/decisions/${item.id}`,{action:'review'});
+      if (!response.ok) throw new Error('Decision could not be marked reviewed.');
+      await refreshAutopilotDecisions();
+    } catch(error) { window.alert(error.message); }
+    const key=item.sessionKey, text=item.replySuggestion ?? '';
+    const hadDraft=Boolean(state.drafts.get(key)?.trim());
+    if (!hadDraft) state.drafts.set(key,text);
+    state.view='sessions'; setFeedView('sessions'); renderSessions();
+    if (hadDraft) replyNotice(key,'Your existing draft was kept. Clear it before applying this suggestion.');
+    $('#autopilot-dialog').close();
+    requestAnimationFrame(()=>document.querySelector(`[data-key="${CSS.escape(key)}"] .reply-input`)?.focus());
+  }
+  async function refreshAutopilot() {
+    try {
+      const response=await fetch('/api/autopilot'); if(!response.ok)throw new Error('Autopilot unavailable');
+      autopilotUi.settings=await response.json();
+      const healthResponse=await fetch('/healthz');
+      if (healthResponse.ok) autopilotUi.metrics=(await healthResponse.json()).autopilot?.metrics ?? null;
+      const enabled=autopilotUi.settings.flagEnabled && autopilotUi.settings.masterEnabled;
+      $('#autopilot-badge').textContent=autopilotUi.settings.flagEnabled ? enabled ? `ON · ${autopilotUi.settings.goals.filter(goal=>goal.status==='active').length}` : 'OFF' : 'Disabled';
+      $('#autopilot-open').setAttribute('aria-label',`Autopilot ${enabled?'on':'off'}`);
+      renderAutopilotDialog(); await refreshAutopilotDecisions(); renderSessions();
+    } catch { $('#autopilot-badge').textContent='Unavailable'; $('#autopilot-status').textContent='Autopilot status unavailable.'; }
+  }
+  function renderAutopilotDialog() {
+    const settings=autopilotUi.settings; if(!settings)return;
+    const enabled=Boolean(settings.flagEnabled), master=$('#autopilot-master');
+    $('#autopilot-status').textContent=enabled ? `DASH_AUTOPILOT is enabled. Master switch is ${settings.masterEnabled?'ON':'OFF'}; ${settings.goals.filter(goal=>goal.status==='active').length} active goals.` : 'DASH_AUTOPILOT is off on this hub. No goal can act.';
+    master.disabled=!enabled; master.textContent=`Autopilot ${settings.masterEnabled?'ON':'OFF'}`;
+    $('#autopilot-away').disabled=!enabled; $('#autopilot-away').checked=Boolean(settings.away);
+    $('#autopilot-delay').disabled=!enabled; $('#autopilot-delay').value=settings.delayMin===null?'never':String(settings.delayMin);
+    $('#autopilot-stop-phrases').disabled=!enabled; $('#autopilot-stop-phrases').value=(settings.stopPhrases??[]).join('\n');
+    $('#autopilot-save-settings').disabled=!enabled; $('#autopilot-brief').disabled=!enabled;
+    $('#autopilot-review-all').disabled=!enabled;
+    const metrics=autopilotUi.metrics;
+    $('#autopilot-metrics').textContent=metrics ? `Driven: ${Object.values(metrics.turnsByTemplate??{}).reduce((a,b)=>a+b,0)} · Escalations: ${Object.values(metrics.escalationsByReason??{}).reduce((a,b)=>a+b,0)} · Owner overrides ≤5m: ${metrics.ownerOverridesWithinFiveMinutes??0} · Judge p50/p95: ${metrics.judge?.p50Ms??0}/${metrics.judge?.p95Ms??0} ms · failures ${metrics.judge?.failures??0}` : '';
   }
 
   function localProjectRuleErrors() {
@@ -834,6 +1010,37 @@
     }
   }
 
+  async function releaseQuestionToTerminal(key, questionId) {
+    if (state.replyPending.has(key)) return;
+    const session = state.sessions.find(item => responseKey(item) === key);
+    if (!session || statusOf(session) !== 'needs_input' || byId(session, 'harness') !== 'claude' ||
+        (session.pendingQuestion?.id ?? session.pendingQuestionId) !== questionId) {
+      await loadSessions().catch(() => {});
+      replyNotice(key, 'Out of date: the question has been answered or replaced');
+      return;
+    }
+    state.replyNotices.delete(key);
+    state.replyPending.add(key);
+    patchSessionCard(session, session);
+    try {
+      const response = await postJson(`/api/sessions/${encodeURIComponent(key)}/question/release`, { questionId });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        if (response.status === 409 && payload?.error === 'stale question') {
+          await loadSessions().catch(() => {});
+          replyNotice(key, 'Out of date: the question has been answered or replaced');
+        } else replyNotice(key, 'Could not release this question to the terminal.');
+        return;
+      }
+      questionPicks.delete(`${key}#${questionId}`);
+      await loadSessions().catch(() => {});
+    } catch { replyNotice(key, 'Could not release this question to the terminal.'); }
+    finally {
+      state.replyPending.delete(key);
+      const current = state.sessions.find(item => responseKey(item) === key);
+      if (current) patchSessionCard(current, current);
+    }
+  }
   function renderReplyControls(s, key, status, responses) {
     if (!state.repliesEnabled || status === 'ended') return null;
     const controls = el('section', 'reply-controls');
@@ -1044,6 +1251,12 @@
       box.append(group); refreshOptions();
     });
     send.addEventListener('click', submit); refreshSend(); box.append(send);
+    if (isClaude) {
+      const release = el('button', 'button button-secondary', 'Release to terminal');
+      release.type = 'button'; release.disabled = busy; release.dataset.replyFocus = `question-${pending.id}-release`;
+      release.addEventListener('click', () => releaseQuestionToTerminal(key, pending.id));
+      box.append(release);
+    }
     return box;
   }
 
@@ -1174,6 +1387,7 @@
     }); actions.append(copy); card.append(actions);
     card.append(renderSessionCapabilities(s, key));
     if (!historical) {
+      if (autopilotUi.settings?.flagEnabled) card.append(autopilotGoalControls(s,key));
       const replyControls = renderReplyControls(s, key, status, responses);
       if (replyControls) card.append(replyControls);
     }
@@ -3373,10 +3587,39 @@
   $('#ideas-open').addEventListener('click', () => { showNavigationDialog('ideas-dialog'); refreshIdeas(true); });
   $('#ideas-show-all').addEventListener('click', () => { ideasState.showAll = !ideasState.showAll; refreshIdeas(true); });
   $('#idea-form').addEventListener('submit', addIdea);
+  $('#autopilot-open').addEventListener('click', () => { $('#autopilot-dialog').showModal(); refreshAutopilot(); });
+  $('#autopilot-master').addEventListener('click', async () => {
+    const enabled=!autopilotUi.settings?.masterEnabled;
+    try { const response=await postJson('/api/autopilot',{enabled}); if(!response.ok)throw new Error('Could not change autopilot switch.'); await refreshAutopilot(); }
+    catch(error){window.alert(error.message);}
+  });
+  $('#autopilot-away').addEventListener('change', async event => {
+    try { const response=await postJson('/api/autopilot',{away:event.target.checked}); if(!response.ok)throw new Error('Could not change away mode.'); await refreshAutopilot(); }
+    catch(error){window.alert(error.message);await refreshAutopilot();}
+  });
+  $('#autopilot-delay').addEventListener('change', async event => {
+    try { const response=await postJson('/api/autopilot',{delayMin:autopilotDelayValue(event.target.value)}); if(!response.ok)throw new Error('Could not change default delay.'); await refreshAutopilot(); }
+    catch(error){window.alert(error.message);await refreshAutopilot();}
+  });
+  $('#autopilot-save-settings').addEventListener('click', async () => {
+    const stopPhrases=$('#autopilot-stop-phrases').value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean);
+    try { const response=await postJson('/api/autopilot',{stopPhrases}); if(!response.ok)throw new Error('Could not save stop phrases.'); await refreshAutopilot(); }
+    catch(error){window.alert(error.message);}
+  });
+  $('#autopilot-brief').addEventListener('click', async () => {
+    const output=$('#autopilot-brief-result'); output.textContent='Preparing a read-only brief…';
+    try { const response=await postJson('/api/autopilot/brief',{}), payload=await response.json(); if(!response.ok)throw new Error(payload.error || 'Brief unavailable.');
+      output.textContent=[payload.overall,...(payload.items??[]).map(item=>`${item.key}: ${item.summary}${item.blocker?` · Blocker: ${item.blocker}`:''} · Next: ${item.suggested_next}`)].join('\n\n');
+    } catch(error){output.textContent=error.message;}
+  });
+  $('#autopilot-review-all').addEventListener('click', async () => {
+    try { const response=await postJson('/api/autopilot/decisions/review-all',{}); if(!response.ok)throw new Error('Could not mark decisions reviewed.'); await refreshAutopilot(); }
+    catch(error){window.alert(error.message);}
+  });
 
   function connect() {
     state.source?.close(); const source=new EventSource('/api/stream'); state.source=source;
-    source.onopen=()=>{ setConnection('Live',true); loadConsolePreferencesRemote(); scheduleSourcesRefresh(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions().catch(()=>{})).then(()=>{ if(consoleState.selectedKey) fetchReadPosition(consoleState.selectedKey,consoleState.selectionVersion); }); refreshTelegram().catch(()=>{}); refreshIdeas(true); loadTimeline(false,true).catch(()=>{}); }; source.onerror=()=>setConnection('Reconnecting',false);
+    source.onopen=()=>{ setConnection('Live',true); loadConsolePreferencesRemote(); scheduleSourcesRefresh(); refreshReplyAvailability().catch(()=>{}).then(()=>loadSessions().catch(()=>{})).then(()=>{ if(consoleState.selectedKey) fetchReadPosition(consoleState.selectedKey,consoleState.selectionVersion); }); refreshTelegram().catch(()=>{}); refreshAutopilot().catch(()=>{}); refreshIdeas(true); loadTimeline(false,true).catch(()=>{}); }; source.onerror=()=>setConnection('Reconnecting',false);
     source.addEventListener('console-preferences', event => {
       try {
         if (acceptConsolePreferences(JSON.parse(event.data), 'remote')) updateConsolePinButtons();
@@ -3403,6 +3646,7 @@
       refreshSessionFilters(); patchSessionCard(dto,previous); prependTimelineResponses(dto,previous);
       renderPinnedSessions(); syncIdeaSessions();
       if (key === consoleState.selectedKey) fetchReadPosition(key, consoleState.selectionVersion);
+      if (autopilotUi.sessions.has(key)) void loadAutopilotSession(key);
     } catch {} });
     source.addEventListener('sources',()=>scheduleSourcesRefresh());
     source.addEventListener('identity',event=>{ try { const dto=JSON.parse(event.data); recordCapabilityReceipt(dto?.capabilities); } catch {} scheduleSourcesRefresh(); });

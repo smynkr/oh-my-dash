@@ -212,6 +212,8 @@ export function normalizeClaudeQuestions(value: unknown): AskQuestion[] | undefi
       if (typeof question.multiSelect !== "boolean") return undefined;
       normalized.multi = question.multiSelect;
     }
+    if (Number.isInteger(question.recommended) && Number(question.recommended) >= 0 &&
+        Number(question.recommended) < options.length) normalized.recommended = Number(question.recommended);
     questions.push(normalized);
   }
   return Buffer.byteLength(JSON.stringify(questions), "utf8") <= questionDataByteLimit ? questions : undefined;
@@ -259,6 +261,17 @@ export function normalizeQuestionAnswerMap(questions: AskQuestion[], value: unkn
         Buffer.byteLength(answer, "utf8") > questionDataByteLimit ||
         answer !== "" && !answer.trim() || /[\x00-\x08\x0b-\x1f\x7f]/.test(answer)) return undefined;
     answers[question.question] = answer;
+  }
+  return answers;
+}
+
+export function normalizeRecommendedQuestionAnswers(questions: AskQuestion[], value: unknown): Record<string, string> | undefined {
+  const answers = normalizeQuestionAnswerMap(questions, value);
+  if (!answers) return undefined;
+  for (const question of questions) {
+    const index = question.recommended;
+    if (!Number.isSafeInteger(index) || index! < 0 || index! >= question.options.length ||
+        answers[question.question] !== question.options[index!]!.label) return undefined;
   }
   return answers;
 }

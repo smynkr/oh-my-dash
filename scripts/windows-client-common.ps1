@@ -127,3 +127,147 @@ function Invoke-DashWindowsHttp {
         if ($null -ne $response) { $response.Dispose() }
     }
 }
+function Get-DashWindowsFenceCachePath {
+    param([string]$HostLabel, [string]$SessionId)
+    if ($HostLabel -notmatch '^[A-Za-z0-9_-]{1,64}$' -or $SessionId -notmatch '^[A-Za-z0-9_-]{1,128}$') {
+        throw 'Invalid fence cache identity.'
+    }
+    $identity = [System.Text.Encoding]::UTF8.GetBytes($HostLabel + "`n" + $SessionId)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $name = ([BitConverter]::ToString($sha.ComputeHash($identity))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    $root = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'OhMyDash\autopilot-fence'
+    return Join-Path $root ($name + '.json')
+}
+
+function Write-DashWindowsFenceCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$HostLabel,
+        [Parameter(Mandatory = $true)][string]$SessionId,
+        [Parameter(Mandatory = $true)][bool]$Active,
+        [long]$GoalId = 0,
+        [long]$ExpiresAt = 0,
+        [long]$RemainingTtlMs = 0,
+        [switch]$InvalidActive
+    )
+    $path = Get-DashWindowsFenceCachePath $HostLabel $SessionId
+    $directory = Split-Path -Parent $path
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($currentSid, $systemSid)) {
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+            [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+        $null = $acl.AddAccessRule($rule)
+    }
+    if (-not [System.IO.Directory]::Exists($directory)) {
+        $null = [System.IO.Directory]::CreateDirectory($directory, $acl)
+    }
+    [System.IO.Directory]::SetAccessControl($directory, $acl)
+    $cache = [ordered]@{
+        SchemaVersion = 1
+        IdentityHash = [System.IO.Path]::GetFileNameWithoutExtension($path)
+        Active = $Active
+        GoalId = $null
+        ExpiresAt = $null
+        RemainingTtlMs = 0
+        SeedTick = 0
+        DeadlineTick = 0
+    }
+    if ($Active -and $InvalidActive) {
+        $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $nowTick = [System.Diagnostics.Stopwatch]::GetTimestamp()
+        $remaining = if ($RemainingTtlMs -gt 0) { [Math]::Min($RemainingTtlMs, 86400000) } else { 86400000 }
+        $delta = [decimal]$remaining * [decimal][System.Diagnostics.Stopwatch]::Frequency / 1000
+        $deadline = [decimal]$nowTick + [decimal][Math]::Floor($delta)
+        if ($deadline -gt [long]::MaxValue) { throw 'Invalid conservative fence deadline.' }
+        $cache.GoalId = 0
+        $cache.ExpiresAt = $nowMs + $remaining
+        $cache.RemainingTtlMs = $remaining
+        $cache.SeedTick = $nowTick
+        $cache.DeadlineTick = [long]$deadline
+    }
+    elseif ($Active) {
+        $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $nowTick = [System.Diagnostics.Stopwatch]::GetTimestamp()
+        if ($GoalId -lt 1 -or $ExpiresAt -le $nowMs -or $RemainingTtlMs -lt 1 -or $RemainingTtlMs -gt 86400000) {
+            throw 'Invalid active fence metadata.'
+        }
+        $remaining = [Math]::Min($RemainingTtlMs, $ExpiresAt - $nowMs)
+        if ($remaining -lt 1) { throw 'Expired active fence metadata.' }
+        $delta = [decimal]$remaining * [decimal][System.Diagnostics.Stopwatch]::Frequency / 1000
+        $deadline = [decimal]$nowTick + [decimal][Math]::Floor($delta)
+        if ($deadline -gt [long]::MaxValue) { throw 'Invalid active fence deadline.' }
+        $cache.GoalId = $GoalId
+        $cache.ExpiresAt = $ExpiresAt
+        $cache.RemainingTtlMs = $remaining
+        $cache.SeedTick = $nowTick
+        $cache.DeadlineTick = [long]$deadline
+    }
+    Add-Type -AssemblyName System.Web.Extensions
+    $json = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $json.MaxJsonLength = 8192
+    $temp = Join-Path $directory ('.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [System.IO.File]::WriteAllText($temp, $json.Serialize($cache), [System.Text.UTF8Encoding]::new($false))
+        if ([System.IO.File]::Exists($path)) { [System.IO.File]::Replace($temp, $path, $null) }
+        else { [System.IO.File]::Move($temp, $path) }
+    }
+    finally {
+        if ([System.IO.File]::Exists($temp)) { [System.IO.File]::Delete($temp) }
+    }
+}
+
+function Get-DashWindowsFenceState {
+    param([string]$HostLabel, [string]$SessionId)
+    $path = Get-DashWindowsFenceCachePath $HostLabel $SessionId
+    if (-not [System.IO.File]::Exists($path)) { return 'inactive' }
+    try {
+        if ((Get-Item -LiteralPath $path).Length -gt 8192) { return 'invalid' }
+        $json = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $json.MaxJsonLength = 8192
+        $cache = $json.DeserializeObject([System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8))
+        if ($cache -isnot [System.Collections.IDictionary] -or $cache['SchemaVersion'] -ne 1 -or
+            $cache['IdentityHash'] -cne [System.IO.Path]::GetFileNameWithoutExtension($path) -or
+            $cache['Active'] -isnot [bool]) { return 'invalid' }
+        if (-not $cache['Active']) { return 'inactive' }
+        foreach ($name in @('GoalId','ExpiresAt','RemainingTtlMs','SeedTick','DeadlineTick')) {
+            if ($cache[$name] -isnot [long] -and $cache[$name] -isnot [int]) { return 'invalid' }
+        }
+        $nowTick = [System.Diagnostics.Stopwatch]::GetTimestamp()
+        if ($cache['GoalId'] -lt 0 -or $cache['ExpiresAt'] -lt 1 -or
+            $cache['RemainingTtlMs'] -lt 1 -or $cache['RemainingTtlMs'] -gt 86400000 -or
+            $cache['SeedTick'] -lt 0 -or $cache['DeadlineTick'] -le $cache['SeedTick'] -or
+            ($cache['DeadlineTick'] - $cache['SeedTick']) -gt ([decimal]$cache['RemainingTtlMs'] * [decimal][System.Diagnostics.Stopwatch]::Frequency / 1000)) {
+            return 'invalid'
+        }
+        if ($nowTick -lt $cache['SeedTick']) {
+            Write-DashWindowsFenceCache -HostLabel $HostLabel -SessionId $SessionId -Active:$true -InvalidActive `
+                -RemainingTtlMs ([long]$cache['RemainingTtlMs'])
+            return 'active'
+        }
+        if ($nowTick -ge $cache['DeadlineTick']) {
+            Write-DashWindowsFenceCache -HostLabel $HostLabel -SessionId $SessionId -Active:$false
+            return 'inactive'
+        }
+        return 'active'
+    }
+    catch { return 'invalid' }
+}
+
+function Emit-DashWindowsFenceDeny {
+    param([string]$Reason)
+    if ([string]::IsNullOrWhiteSpace($Reason) -or $Reason.Length -gt 512 -or $Reason -match '[\x00-\x1F\x7F]') {
+        $Reason = 'dash hub unreachable; autopilot paused, ask the owner'
+    }
+    $json = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $json.MaxJsonLength = 8192
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::Out.WriteLine($json.Serialize(@{ hookSpecificOutput = @{
+        hookEventName = 'PreToolUse'; permissionDecision = 'deny'; permissionDecisionReason = $Reason
+    } }))
+}

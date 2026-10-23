@@ -9,6 +9,8 @@
  * Ask tool input checked against v18.6.1 packages/coding-agent/src/tools/ask.ts.
  * Its questions carry id/question/header, options (label/description/preview), multi, and a zero-based recommended index.
  */
+import { MAX_FENCE_TTL_MS, clearFenceCache, monotonicNowMs, readFenceCache, writeFenceCache } from "./fence-cache.ts";
+
 import { hostname } from "node:os";
 
 type AnyRecord = Record<string, any>;
@@ -28,6 +30,8 @@ const DEFAULT_URL = "http://127.0.0.1:4777/ingest/omp";
 
 type DeliveryChoice = "defer" | "answer_ask" | "prompt" | "followUp";
 type ReplySource = "telegram" | "web" | "autopilot";
+type AutopilotDelivery = { goal_id: number; expires_at: number; remaining_ttl_ms: number };
+type FenceState = { active: boolean; goalId: number | null; expiresAt: number | null; deadline: number };
 
 export function chooseDelivery({ idle, askPending, approvals }: { idle: boolean; askPending: boolean; approvals: number }): DeliveryChoice {
   if (approvals > 0) return "defer";
@@ -93,6 +97,7 @@ function install(pi: Pi): void {
   const askPending = new Map<string, Set<string>>();
   const questionIdentityBySession = new Map<string, Map<string, string>>();
   const approvals = new Map<string, number>();
+  const fenceBySession = new Map<string, FenceState>();
   const loops = new Map<string, AbortController>();
 
   function rememberContext(event: AnyRecord, ctx: Context): string {
@@ -101,6 +106,128 @@ function install(pi: Pi): void {
     return id;
   }
 
+  function setActiveFence(
+    sid: string, goalId: number | null, expiresAt: number | null, remainingTtlMs: number, persist = true,
+  ): void {
+    const now = monotonicNowMs();
+    const ttl = Math.min(remainingTtlMs, MAX_FENCE_TTL_MS);
+    fenceBySession.set(sid, { active: true, goalId, expiresAt, deadline: now + ttl });
+    if (persist) writeFenceCache(host, sid, { goalId, expiresAt, remainingTtlMs: ttl }, now);
+  }
+
+  function setInactiveFence(sid: string): void {
+    fenceBySession.set(sid, { active: false, goalId: null, expiresAt: null, deadline: 0 });
+    clearFenceCache(host, sid);
+  }
+
+  function conservativeFence(sid: string): void {
+    setActiveFence(sid, null, null, MAX_FENCE_TTL_MS, false);
+    try {
+      writeFenceCache(host, sid, { goalId: null, expiresAt: null, remainingTtlMs: MAX_FENCE_TTL_MS });
+    } catch { /* Keep the bounded in-memory denial if private persistence is unavailable. */ }
+  }
+
+  function seedFence(sid: string, value: unknown): void {
+    const delivery = value && typeof value === "object" ? value as Partial<AutopilotDelivery> : {};
+    const now = Date.now();
+    const valid = Number.isSafeInteger(delivery.goal_id) && Number(delivery.goal_id) > 0 &&
+      Number.isSafeInteger(delivery.expires_at) && Number(delivery.expires_at) > now &&
+      Number.isSafeInteger(delivery.remaining_ttl_ms) && Number(delivery.remaining_ttl_ms) > 0;
+    if (!valid) {
+      setActiveFence(sid, null, null, MAX_FENCE_TTL_MS);
+      return;
+    }
+    const ttl = Math.min(Number(delivery.remaining_ttl_ms), Number(delivery.expires_at) - now, MAX_FENCE_TTL_MS);
+    if (ttl < 1) {
+      setActiveFence(sid, null, null, MAX_FENCE_TTL_MS);
+      return;
+    }
+    setActiveFence(sid, Number(delivery.goal_id), Number(delivery.expires_at), ttl);
+  }
+
+  function restoreFence(sid: string): FenceState | undefined {
+    const now = monotonicNowMs();
+    const cached = readFenceCache(host, sid, now);
+    if (cached.kind === "cold") return undefined;
+    if (cached.kind === "invalid") {
+      conservativeFence(sid);
+      return fenceBySession.get(sid);
+    }
+    const state: FenceState = {
+      active: true, goalId: cached.record.goalId, expiresAt: cached.record.expiresAt,
+      deadline: now + cached.record.remainingTtlMs,
+    };
+    fenceBySession.set(sid, state);
+    return state;
+  }
+
+  function cachedGoalActive(sid: string): boolean {
+    const cached = fenceBySession.get(sid) ?? restoreFence(sid);
+    if (!cached?.active) return false;
+    if (monotonicNowMs() >= cached.deadline) {
+      setInactiveFence(sid);
+      return false;
+    }
+    return true;
+  }
+
+  function exactFenceKeys(value: AnyRecord, allowed: readonly string[]): boolean {
+    return Object.keys(value).every(key => allowed.includes(key));
+  }
+
+  function refreshFence(sid: string, value: unknown): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const reply = value as AnyRecord;
+    const base = ["active_goal", "goal_id", "expires_at", "remaining_ttl_ms"];
+    if (typeof reply.active_goal !== "boolean" || !exactFenceKeys(reply, [...base, "permissionDecision", "reason"])) return false;
+    if (!reply.active_goal) {
+      if (Object.keys(reply).length !== base.length || reply.goal_id !== null || reply.expires_at !== null ||
+          reply.remaining_ttl_ms !== 0) return false;
+      setInactiveFence(sid);
+      return true;
+    }
+    if (Object.keys(reply).length !== base.length && Object.keys(reply).length !== base.length + 2) return false;
+    if (Object.hasOwn(reply, "permissionDecision") &&
+        (reply.permissionDecision !== "deny" || typeof reply.reason !== "string" ||
+         reply.reason.length > 512 || /[\x00-\x1f\x7f]/.test(reply.reason))) return false;
+    if (!Object.hasOwn(reply, "permissionDecision") && Object.hasOwn(reply, "reason")) return false;
+    const now = Date.now();
+    if (!Number.isSafeInteger(reply.goal_id) || reply.goal_id <= 0 ||
+        !Number.isSafeInteger(reply.expires_at) || reply.expires_at <= now ||
+        !Number.isSafeInteger(reply.remaining_ttl_ms) || reply.remaining_ttl_ms <= 0) return false;
+    const ttl = Math.min(reply.remaining_ttl_ms, reply.expires_at - now, MAX_FENCE_TTL_MS);
+    if (ttl < 1) return false;
+    setActiveFence(sid, reply.goal_id, reply.expires_at, ttl);
+    return true;
+  }
+
+  async function checkFence(event: AnyRecord, ctx: Context): Promise<unknown> {
+    const sid = rememberContext(event, ctx);
+    if (!sid) return { block: true, reason: "dash session unavailable; ask the owner" };
+    const tool = typeof event?.toolName === "string" ? event.toolName
+      : typeof event?.name === "string" ? event.name : "";
+    const args = event?.args && typeof event.args === "object" ? event.args : {};
+    try {
+      const response = await fetch(`${replyBase()}/hook/fence`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Dash-Host": host },
+        body: JSON.stringify({ host, harness: "omp", sessionId: sid, tool, input: args }),
+        signal: AbortSignal.timeout(500),
+      });
+      if (response.ok) {
+        const result = await response.json() as AnyRecord;
+        if (refreshFence(sid, result)) {
+          if (result.permissionDecision === "deny")
+            return { block: true, reason: result.reason as string };
+          return;
+        }
+        conservativeFence(sid);
+        return { block: true, reason: "dash autopilot fence metadata invalid; ask the owner" };
+      }
+    } catch { /* A cached active goal fails closed below. */ }
+    if (cachedGoalActive(sid)) return { block: true, reason: "dash hub unreachable; autopilot paused, ask the owner" };
+    return;
+  }
   function startReplyLoop(sid: string): void {
     if (!sid || loops.has(sid) || !pi.sendUserMessage) return;
     const controller = new AbortController();
@@ -165,7 +292,7 @@ function install(pi: Pi): void {
         if (response.status !== 200) { await sleep(5000, controller.signal); continue; }
         backoff = 5000;
         const leasedAt = Date.now();
-        const payload = await response.json() as { id?: number; text?: string; source?: ReplySource };
+        const payload = await response.json() as { id?: number; text?: string; source?: ReplySource; autopilot?: AutopilotDelivery };
         const replyId = payload?.id;
         const source = payload?.source;
         if (typeof replyId !== "number" || !Number.isSafeInteger(replyId) || replyId <= 0 || typeof payload?.text !== "string" ||
@@ -181,39 +308,48 @@ function install(pi: Pi): void {
           if (choice === "defer") {
             outcome = "deferred";
           } else {
-            const prefix = replyPrefix(source, choice === "answer_ask");
-            const committed = await commitReply(replyId, waiter, leasedAt, controller.signal);
-            if (!committed) continue;
-            let sendThrew = false;
-            try {
-              if (choice === "prompt") pi.sendUserMessage!(prefix + payload.text);
-              else if (choice === "followUp") pi.sendUserMessage!(prefix + payload.text, { deliverAs: "followUp" });
-              else {
-                pi.sendUserMessage!(prefix + payload.text, { deliverAs: "steer" });
-                const deadline = Date.now() + 1000;
-                while (Date.now() < deadline && !controller.signal.aborted && hasRememberedAsk(sid, pendingIds)) {
-                  await sleep(50, controller.signal);
-                }
-                const askStillPending = hasRememberedAsk(sid, pendingIds);
-                const abortGate = typeof ctx.hasPendingMessages === "function" ? safeHasPending(ctx) : askStillPending;
-                let abortFailure = false;
-                if (askStillPending && abortGate) {
-                  if (typeof ctx.abort !== "function") {
-                    reportReplyCode("omp_ask_abort_unavailable");
-                    abortFailure = true;
-                  } else {
-                    try { ctx.abort(); }
-                    catch { reportReplyCode("omp_ask_abort_failed"); abortFailure = true; }
+            let fenceReady = true;
+            if (source === "autopilot") {
+              try { seedFence(sid, payload.autopilot); }
+              catch { reportReplyCode("omp_fence_cache_unavailable"); fenceReady = false; }
+            }
+            if (!fenceReady) {
+              outcome = "deferred";
+            } else {
+              const prefix = replyPrefix(source, choice === "answer_ask");
+              const committed = await commitReply(replyId, waiter, leasedAt, controller.signal);
+              if (!committed) continue;
+              let sendThrew = false;
+              try {
+                if (choice === "prompt") pi.sendUserMessage!(prefix + payload.text);
+                else if (choice === "followUp") pi.sendUserMessage!(prefix + payload.text, { deliverAs: "followUp" });
+                else {
+                  pi.sendUserMessage!(prefix + payload.text, { deliverAs: "steer" });
+                  const deadline = Date.now() + 1000;
+                  while (Date.now() < deadline && !controller.signal.aborted && hasRememberedAsk(sid, pendingIds)) {
+                    await sleep(50, controller.signal);
                   }
+                  const askStillPending = hasRememberedAsk(sid, pendingIds);
+                  const abortGate = typeof ctx.hasPendingMessages === "function" ? safeHasPending(ctx) : askStillPending;
+                  let abortFailure = false;
+                  if (askStillPending && abortGate) {
+                    if (typeof ctx.abort !== "function") {
+                      reportReplyCode("omp_ask_abort_unavailable");
+                      abortFailure = true;
+                    } else {
+                      try { ctx.abort(); }
+                      catch { reportReplyCode("omp_ask_abort_failed"); abortFailure = true; }
+                    }
+                  }
+                  if (hasRememberedAsk(sid, pendingIds) && !abortFailure) reportReplyCode("omp_ask_still_pending");
+                  if ((approvals.get(sid) || 0) > 0) reportReplyCode("omp_approval_after_commit");
                 }
-                if (hasRememberedAsk(sid, pendingIds) && !abortFailure) reportReplyCode("omp_ask_still_pending");
-                if ((approvals.get(sid) || 0) > 0) reportReplyCode("omp_approval_after_commit");
+                outcome = "sent";
+              } catch { sendThrew = true; }
+              if (sendThrew) {
+                reportReplyCode("omp_send_uncertain");
+                continue;
               }
-              outcome = "sent";
-            } catch { sendThrew = true; }
-            if (sendThrew) {
-              reportReplyCode("omp_send_uncertain");
-              continue;
             }
           }
         }
@@ -279,6 +415,9 @@ function install(pi: Pi): void {
       }).catch(() => {});
     } catch { /* Feed failures must never affect the agent session. */ }
   }
+  pi.on("tool_call", (event, ctx) => checkFence(event, ctx).catch(() => ({
+    block: true, reason: "dash autopilot fence unavailable; ask the owner",
+  })));
   pi.on("tool_execution_start", (event, ctx) => {
     try {
       const sid = rememberContext(event, ctx);
@@ -395,6 +534,7 @@ function install(pi: Pi): void {
       approvals.delete(id);
       ctxBySession.delete(id);
       emit("session_end", event, ctx);
+      fenceBySession.delete(id);
     } catch { /* Never escape OMP callbacks. */ }
   });
 }

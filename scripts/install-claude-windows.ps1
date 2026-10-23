@@ -1,3 +1,4 @@
+[CmdletBinding()]
 param(
     [string]$HubUrl = 'http://127.0.0.1:4777',
     [string]$HostLabel = $env:COMPUTERNAME,
@@ -6,7 +7,9 @@ param(
     [string]$ClaudePath = '',
     [string]$TaskName = 'OhMyDash-Claude-Liveness',
     [switch]$NoReply,
+    [switch]$Autopilot,
     [switch]$Questions,
+    [switch]$AutopilotDialogs,
     [ValidateRange(1, 600)][int]$QuestionWaitSeconds = 120,
     [switch]$DryRun,
     [switch]$Uninstall
@@ -330,7 +333,9 @@ function Remove-DashHookGroups($Document, [switch]$Install, [object[]]$Groups, [
     return $Document
 }
 
-function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [string]$QuestionPath, [switch]$NoReply, [switch]$Questions, [int]$QuestionWaitSeconds) {
+function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [string]$QuestionPath,
+    [string]$AutopilotDialogPath, [string]$AutopilotFencePath, [switch]$NoReply, [switch]$Autopilot,
+    [switch]$Questions, [switch]$AutopilotDialogs, [int]$QuestionWaitSeconds) {
     $powerShellExe = Get-WindowsPowerShellExe
     $ingestArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
         '-File', $HookPath, '-DashHookMarker', '# dash-hook')
@@ -338,6 +343,10 @@ function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [string]$Que
         '-File', $WaiterPath, '-DashHookMarker', '# dash-hook')
     $questionArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
         '-File', $QuestionPath, '-DashHookMarker', '# dash-hook')
+    $autopilotDialogArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $AutopilotDialogPath, '-DashHookMarker', '# dash-hook')
+    $autopilotFenceArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $AutopilotFencePath, '-DashHookMarker', '# dash-hook')
     $events = @(
         @{ Event = 'SessionStart' },
         @{ Event = 'UserPromptSubmit' },
@@ -374,7 +383,15 @@ function New-DashHookGroups([string]$HookPath, [string]$WaiterPath, [string]$Que
             $groups.Add([pscustomobject]@{ Event = 'Stop'; Group = [ordered]@{ hooks = @($reply) } })
         }
     }
-    if ($Questions) {
+    if ($Autopilot) {
+        $fence = [ordered]@{ type = 'command'; timeout = 5; command = $powerShellExe; args = $autopilotFenceArgs }
+        $groups.Add([pscustomobject]@{ Event = 'PreToolUse'; Group = [ordered]@{ matcher = '.*'; hooks = @($fence) } })
+    }
+    if ($AutopilotDialogs) {
+        $dialog = [ordered]@{ type = 'command'; timeout = 605; command = $powerShellExe; args = $autopilotDialogArgs }
+        $groups.Add([pscustomobject]@{ Event = 'PreToolUse'; Group = [ordered]@{ matcher = 'AskUserQuestion'; hooks = @($dialog) } })
+    }
+    elseif ($Questions) {
         $question = [ordered]@{ type = 'command'; timeout = ($QuestionWaitSeconds + 5); command = $powerShellExe; args = $questionArgs }
         $groups.Add([pscustomobject]@{ Event = 'PreToolUse'; Group = [ordered]@{ matcher = 'AskUserQuestion'; hooks = @($question) } })
     }
@@ -528,7 +545,8 @@ function Remove-InstalledHelpers([string]$Directory) {
         Write-Output 'Installed helper files were preserved because the client config is not owned by this installer.'
         return
     }
-    foreach ($name in @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1', 'claude-question.ps1')) {
+    foreach ($name in @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1',
+        'claude-question.ps1', 'claude-autopilot-dialog.ps1', 'claude-autopilot-fence.ps1')) {
         $path = Join-Path $Directory $name
         $expected = $config.HelperHashes.PSObject.Properties[$name]
         if ($null -eq $expected -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
@@ -547,6 +565,8 @@ $taskSnapshot = $null
 try {
     $SettingsPath = ConvertTo-FullPath $SettingsPath
     $InstallPath = ConvertTo-FullPath $InstallPath
+    if ($AutopilotDialogs -and $Questions) { throw '-AutopilotDialogs cannot be combined with -Questions.' }
+    if ($AutopilotDialogs) { $Autopilot = $true }
     if ($TaskName -notmatch '^[A-Za-z0-9 ._-]{1,128}$') { throw '-TaskName may contain only letters, digits, spaces, dots, underscores, or hyphens.' }
     if (-not $Uninstall -and $HostLabel -notmatch '^[A-Za-z0-9_-]{1,64}$') {
         throw '-HostLabel must be a label of 1 to 64 letters, digits, underscores, or hyphens.'
@@ -578,7 +598,8 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\conhost.exe') -PathType Leaf)) {
         throw 'Windows console host was not found; headless liveness polling requires conhost.exe.'
     }
-    $helperNames = @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1', 'claude-question.ps1')
+    $helperNames = @('claude-hook.ps1', 'reply-wait.ps1', 'claude-liveness.ps1', 'windows-client-common.ps1',
+        'claude-question.ps1', 'claude-autopilot-dialog.ps1', 'claude-autopilot-fence.ps1')
     $helperBytes = @{}
     $helperHashes = [ordered]@{}
     foreach ($name in $helperNames) {
@@ -592,7 +613,11 @@ try {
     $waiterPath = Join-Path $InstallPath 'reply-wait.ps1'
     $livenessPath = Join-Path $InstallPath 'claude-liveness.ps1'
     $questionPath = Join-Path $InstallPath 'claude-question.ps1'
-    $groups = New-DashHookGroups -HookPath $hookPath -WaiterPath $waiterPath -QuestionPath $questionPath -NoReply:$NoReply -Questions:$Questions -QuestionWaitSeconds $QuestionWaitSeconds
+    $autopilotDialogPath = Join-Path $InstallPath 'claude-autopilot-dialog.ps1'
+    $autopilotFencePath = Join-Path $InstallPath 'claude-autopilot-fence.ps1'
+    $groups = New-DashHookGroups -HookPath $hookPath -WaiterPath $waiterPath -QuestionPath $questionPath `
+        -AutopilotDialogPath $autopilotDialogPath -AutopilotFencePath $autopilotFencePath -NoReply:$NoReply `
+        -Autopilot:$Autopilot -Questions:$Questions -AutopilotDialogs:$AutopilotDialogs -QuestionWaitSeconds $QuestionWaitSeconds
     $existingEmptyHookEvents = @(Get-ManagedEmptyHookEvents -Path (Join-Path $InstallPath 'client-config.json'))
     $settings = Get-SettingsOutput -Path $SettingsPath -Install:$true -Groups $groups -PreserveEmptyEvents $existingEmptyHookEvents
     $emptyHookEvents = New-Object 'System.Collections.Generic.List[string]'
@@ -613,6 +638,8 @@ try {
         HostLabel = $HostLabel
         ClaudePath = $ClaudePath
         ReplyWaitSeconds = 21600
+        AutopilotFenceEnabled = [bool]$Autopilot
+        AutopilotDialogsEnabled = [bool]$AutopilotDialogs
         QuestionsEnabled = [bool]$Questions
         QuestionWaitSeconds = $QuestionWaitSeconds
         HelperHashes = $helperHashes

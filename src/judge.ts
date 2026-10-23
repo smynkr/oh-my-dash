@@ -11,7 +11,7 @@ export class JudgeError extends Error {
 }
 export type JudgeModel = "gpt-6-luna" | "gpt-reserve";
 // stillWanted is re-checked after the queue wait and before every spawn; false skips the run without spawning.
-export type JudgeOptions = { model?: JudgeModel; timeoutMs?: number; stillWanted?: () => boolean };
+export type JudgeOptions = { model?: JudgeModel; timeoutMs?: number; stillWanted?: () => boolean; onFallback?: () => void };
 export type Judge = { judge<T>(prompt: string, schema: object, options?: JudgeOptions): Promise<T>; close(): void };
 
 const STDERR_CAP = 64 * 1024;
@@ -25,10 +25,21 @@ const STDERR_DRAIN_MS = 1000;
 export const USAGE_LIMIT_LINE = /^ERROR: You’ve hit your usage limit(?:\b|[., ])/;
 const ANSI_SGR = /\x1b\[[0-9;]*m/g;
 
+const DISABLED_FEATURES = Object.freeze([
+  "shell_tool", "shell_snapshot", "shell_snapshot_v2", "unified_exec", "unified_exec_tty", "write_stdin_approval",
+  "apps", "auth_elicitation", "tool_call_mcp_elicitation", "skill_mcp_dependency_install",
+  "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
+  "in_app_browser", "in_app_local_automation", "code_mode", "code_mode_host", "code_mode_interrupt", "code_mode_only",
+  "image_generation", "plugins", "remote_plugin", "plugin_sharing", "memories", "goals", "hooks", "skill_search",
+  "multi_agent", "multi_agent_v2", "workspace_dependencies", "guardian_approval", "guardian_conversation_history_tools",
+  "tool_suggest",
+]);
 export function judgeArgv(bin: string, model: JudgeModel, dir: string): readonly string[] {
-  return Object.freeze([bin, "exec", "-m", model, "-c", "model_reasoning_effort=max", "-c", 'web_search="disabled"',
-    "-s", "read-only", "--skip-git-repo-check", "--ignore-user-config",
-    "--output-schema", join(dir, "schema.json"), "--output-last-message", join(dir, "last-message.json"), "-"]);
+  const argv = [bin, "exec", "-m", model, "-c", "model_reasoning_effort=max", "-c", 'web_search="disabled"',
+    "-s", "read-only", "--skip-git-repo-check", "--ignore-user-config"];
+  for (const feature of DISABLED_FEATURES) argv.push("--disable", feature);
+  argv.push("--output-schema", join(dir, "schema.json"), "--output-last-message", join(dir, "last-message.json"), "-");
+  return Object.freeze(argv);
 }
 
 const ANNOTATIONS = new Set(["$schema", "title", "description"]);
@@ -179,6 +190,7 @@ export function createJudge(options: { bin?: string; dataDir?: string; maxConcur
         catch (e) {
           if (!(e instanceof JudgeError) || e.kind !== "usage_limit" || model === "gpt-reserve") throw e;
           wanted();
+          opts.onFallback?.();
           return await attempt(prompt, schema, "gpt-reserve", timeoutMs) as T;
         }
       } catch (e) { throw e instanceof JudgeError ? e : new JudgeError("spawn"); }

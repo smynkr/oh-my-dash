@@ -66,12 +66,11 @@ describe("judge runner", () => {
     expect(await make().judge<{ choice: string }>("synthetic prompt", SCHEMA)).toEqual({ choice: "B" });
     const [call] = calls();
     expect(calls()).toHaveLength(1);
-    const jd = dirname(call!.argv[12]!);
+    const schemaIndex = call!.argv.indexOf("--output-schema");
+    const jd = dirname(call!.argv[schemaIndex + 1]!);
     expect(jd.startsWith(join(dataDir, "judge", "j-"))).toBe(true);
     expect(call!.cwd).toBe(join(realpathSync(join(dataDir, "judge")), basename(jd)));
-    expect(call!.argv).toEqual(["exec", "-m", "gpt-6-luna", "-c", "model_reasoning_effort=max", "-c", 'web_search="disabled"',
-      "-s", "read-only", "--skip-git-repo-check", "--ignore-user-config", "--output-schema", join(jd, "schema.json"),
-      "--output-last-message", join(jd, "last-message.json"), "-"]);
+    expect(call!.argv).toEqual(judgeArgv("", "gpt-6-luna", jd).slice(1));
     expect(call!.ls).toBe("schema.json\n");
     expect(call!.permDir).toMatch(/^drwx------/);
     expect(call!.permSchema).toMatch(/^-rw-------/);
@@ -81,15 +80,21 @@ describe("judge runner", () => {
     expect(judgeDirs()).toEqual([]);
   });
 
-  test("judgeArgv is frozen and differs between models only in -m", () => {
+  test("judgeArgv is frozen, disables every tool surface and differs between models only in -m", () => {
     const a = judgeArgv("/bin/fake", "gpt-6-luna", "/d"), b = judgeArgv("/bin/fake", "gpt-reserve", "/d");
     expect(Object.isFrozen(a)).toBe(true);
     expect(a.map((v, i) => v === b[i] ? null : [v, b[i]]).filter(Boolean)).toEqual([["gpt-6-luna", "gpt-reserve"]]);
+    const disabledFeatures = new Set(a.flatMap((value, index) => value === "--disable" ? [a[index + 1]] : []));
+    for (const feature of ["shell_tool", "apps", "tool_call_mcp_elicitation", "browser_use", "computer_use",
+      "in_app_local_automation", "code_mode_host", "image_generation", "remote_plugin", "memories", "goals",
+      "hooks", "skill_search", "multi_agent_v2"]) expect(disabledFeatures.has(feature)).toBe(true);
   });
 
   test("usage-limit line retries exactly once with gpt-reserve in a fresh directory", async () => {
     mode("usage-once");
-    expect(await make().judge("p", SCHEMA)).toEqual({ choice: "B" });
+    let fallbacks = 0;
+    expect(await make().judge("p", SCHEMA, { onFallback: () => { fallbacks++; } })).toEqual({ choice: "B" });
+    expect(fallbacks).toBe(1);
     const cs = calls();
     expect(cs.map(c => c.model).sort()).toEqual(["gpt-6-luna", "gpt-reserve"]);
     expect(new Set(cs.map(c => c.cwd)).size).toBe(2);

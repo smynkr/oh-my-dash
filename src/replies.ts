@@ -1,15 +1,16 @@
-import type { DashDB, Reply, ReplyKind, SessionDTO, ReplySource } from "./db.ts";
 import { createAudit } from "./audit.ts";
+import type { DashDB, Reply, ReplyKind, ReplySource, SessionDTO } from "./db.ts";
 import { GO_REC_AUTH_TEXT } from "./actions.ts";
 import { isReplyKey, messageRefusalReason, type DeliveryObservation } from "./capabilities.ts";
 import type { EventKind, NormalizedEvent } from "./normalize.ts";
-import { normalizeQuestionSelections } from "./normalize.ts";
+import { normalizeQuestionSelections, normalizeRecommendedQuestionAnswers } from "./normalize.ts";
 
-export type { ReplySource } from "./db.ts";
+export type { ReplySource };
+export type AutopilotDelivery = { goal_id: number; expires_at: number; remaining_ttl_ms: number };
 type Harness = "claude" | "omp";
 type Outcome = "delivered" | "expired" | "cancelled";
 type Listener = "loopback" | "tailnet" | "telegram" | "internal";
-type WaitResult = { status: 200; reply: string | { id: number; text: string; source: ReplySource } } | { status: 204 | 409 | 410 };
+type WaitResult = { status: 200; reply: string | { id: number; text: string; source: ReplySource; autopilot?: AutopilotDelivery } } | { status: 204 | 409 | 410 };
 type Pending = { resolve: (result: WaitResult) => void; timer: ReturnType<typeof setTimeout>; observedAt: number; expiresAt: number; signal?: AbortSignal; abort?: () => void };
 type Waiter = { key: string; harness: Harness; waiterId: string; started: number; commitCapable: boolean; peer: string; pending?: Pending };
 type Lease = { waiterId: string; peer: string };
@@ -26,7 +27,7 @@ export type RefusalReason = "disabled" | "invalid_key" | "invalid_source" | "inv
   "session_ended" | "claude_dialog" | "omp_approval" | "not_deliverable" | "too_long" | "idea_not_open";
 export type SubmitResult = { ok: true; replyId: number } | { refused: true; reason: RefusalReason };
 export type RegisterQuestionArgs = { event: NormalizedEvent; id: string; toolUseId: string; timeoutMs: number };
-export type QuestionSubmitArgs = { key: string; questionId: string; answers: unknown; source: "web" | "telegram"; actor: string; listener?: Listener };
+export type QuestionSubmitArgs = { key: string; questionId: string; answers: unknown; source: ReplySource; actor: string; listener?: Listener };
 export type QuestionSubmitResult = { ok: true } | { refused: true; reason: "disabled" | "invalid_key" | "invalid_question" | "invalid_source" | "invalid_actor" | "session_not_found" | "session_ended" | "stale_question" };
 export type QuestionRegisterResult =
   | { ok: true; questionId: string; expiresAt: number }
@@ -41,9 +42,12 @@ export interface RepliesOptions {
   messageTtlMs?: number;
   setTimer?: (fn: () => void, ms: number) => () => void;
   onQueued?: (reply: Reply) => void;
+  onQuestionOutcome?: (source: ReplySource, questionId: string) => void;
   onOutcome?: (reply: Reply, outcome: Outcome, dto?: SessionDTO) => void;
-  send?: (dto: SessionDTO, eventKind?: EventKind) => void;
-  onWaiterChange?: (key: string) => void;
+  send?: (dto: SessionDTO, kind?: string, force?: boolean) => void;
+  onWaiterChange?: (sessionKey: string) => void;
+  autopilotDelivery?: (reply: Reply) => AutopilotDelivery | null;
+  autopilotAllowed?: (sessionKey: string, goalId: number) => boolean;
 }
 
 const questionIdentityPattern = /^[A-Za-z0-9_-]{8,128}$/;
@@ -53,6 +57,11 @@ const actorPattern: Record<ReplySource, RegExp> = {
   web: /^web:[A-Za-z0-9_-]{1,64}$/,
   telegram: /^telegram:[1-9]\d*$/,
   autopilot: /^autopilot:goal:[1-9]\d*$/,
+};
+const actorGoalId = (actor: string): number | null => {
+  const match = /^autopilot:goal:([1-9]\d*)$/.exec(actor);
+  const id = match ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 };
 
 // Autopilot may not send the owner's authorization text, or any sentence of it, however it is cased or spaced.
@@ -74,7 +83,8 @@ const clampMessageTtl = (ms: number) => Number.isFinite(ms) ? Math.min(MESSAGE_T
 /** DASH_MESSAGE_TTL_MS: unset or non-numeric means the 4 h default; numbers are clamped to 60 s..6 h. */
 export const messageTtlFromEnv = (raw: string | undefined) => raw === undefined || raw.trim() === "" || !Number.isFinite(Number(raw)) ? MESSAGE_TTL_MS : clampMessageTtl(Number(raw));
 
-export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_000, messageTtlMs = MESSAGE_TTL_MS, setTimer, onQueued, onOutcome, send, onWaiterChange }: RepliesOptions) {
+export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_000, messageTtlMs = MESSAGE_TTL_MS,
+  setTimer, onQueued, onOutcome, onQuestionOutcome, send, onWaiterChange, autopilotDelivery, autopilotAllowed }: RepliesOptions) {
   const audit = createAudit(db);
   const messageTtl = clampMessageTtl(messageTtlMs);
   const waiters = new Map<string, Waiter>();
@@ -117,6 +127,15 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     while (waiter.pending) {
       const reply = db.nextQueuedReply(key, waiter.harness !== "omp" || waiter.commitCapable);
       if (!reply) return;
+      let delivery: AutopilotDelivery | null = null;
+      if (reply.source === "autopilot") {
+        const goalId = reply.actor ? actorGoalId(reply.actor) : null;
+        try { delivery = goalId ? autopilotDelivery?.(reply) ?? null : null; } catch { delivery = null; }
+        if (!delivery) {
+          cancelled(db.cancelReplies({ key, id: reply.id, source: "autopilot", reason: "inactive_goal" }, now()), dto);
+          continue;
+        }
+      }
       const result = waiter.harness === "claude"
         ? db.takeQueuedForClaude(key, reply.id, dto.turnSeq, now())
         : db.leaseQueuedForOmp(key, reply.id, waiter.waiterId, dto.turnSeq, now(), waiter.commitCapable);
@@ -128,12 +147,14 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       if (result.kind === "not_ready" || result.kind === "unavailable") return;
       if (!result.reply) return;
       if (waiter.harness === "claude") {
-        finish(waiter, { status: 200, reply: claudeBody(result.reply) });
+        const body = claudeBody(result.reply);
+        finish(waiter, { status: 200, reply: delivery ? JSON.stringify({ kind:"dash.autopilot.reply.v1",source:"autopilot",text:body,autopilot:delivery }) : body });
         outcome(result.reply, "delivered", dto);
         syntheticPrompt(dto, result.reply.source);
       } else {
         leases.set(result.reply.id, { waiterId: waiter.waiterId, peer: waiter.peer });
-        finish(waiter, { status: 200, reply: { id: result.reply.id, text: result.reply.text, source: result.reply.source } });
+        finish(waiter, { status: 200, reply: { id: result.reply.id, text: result.reply.text, source: result.reply.source,
+          ...(delivery ? { autopilot: delivery } : {}) } });
       }
       return;
     }
@@ -401,7 +422,10 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       if (args.answersTurn !== undefined && args.answersTurn !== dto.turnSeq) return refuse("stale_turn", args, text, listener);
       if (args.answersTurn !== undefined && dto.status !== "your_turn") return refuse("not_deliverable", args, text, listener);
       const ts = now();
-      const prepared = audit.prepare({ ts, sessionKey: args.key, source: args.source, actor: args.actor, listener, text });
+      const goalId = args.source === "autopilot" ? actorGoalId(args.actor) : null;
+      if (args.source === "autopilot" && (!goalId || !autopilotAllowed?.(args.key, goalId))) return refuse("invalid_source", args);
+      const prepared = audit.prepare({ ts, sessionKey: args.key, source: args.source, actor: args.actor, listener, text,
+        goalId: goalId ?? undefined });
       const reply = args.ideaId === undefined
         ? db.enqueueReply(args.key, text, args.source, args.actor, args.answersTurn, ts, kind === "message" ? messageTtl : ttlMs, prepared, kind, undefined, args.answersQuestion)
         : db.enqueueReply(args.key, text, args.source, args.actor, args.answersTurn, ts, kind === "message" ? messageTtl : ttlMs, prepared, kind, args.ideaId, args.answersQuestion);
@@ -414,12 +438,18 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     submitQuestion(args: QuestionSubmitArgs): QuestionSubmitResult {
       if (!enabled) return refuseQuestion("disabled",args);
       if (!isReplyKey(args.key)) return refuseQuestion("invalid_key",args);
-      if (args.source !== "web" && args.source !== "telegram") return refuseQuestion("invalid_source",args);
+      if (args.source !== "web" && args.source !== "telegram" && args.source !== "autopilot")
+        return refuseQuestion("invalid_source",args);
       if (typeof args.actor !== "string" || !actorPattern[args.source].test(args.actor))
         return refuseQuestion("invalid_actor",args);
-      if (!validQuestionId(args.questionId)) return refuseQuestion("invalid_question",args);
-      const listener = args.listener ?? (args.source === "telegram" ? "telegram" : "loopback");
-      if (args.source === "telegram" ? listener !== "telegram" : listener !== "loopback" && listener !== "tailnet")
+      const goalId = args.source === "autopilot" ? actorGoalId(args.actor) : null;
+      if (args.source === "autopilot" && (!goalId || !autopilotAllowed?.(args.key,goalId)))
+        return refuseQuestion("invalid_source",args);
+      const listener = args.source === "autopilot" ? "internal" :
+        args.listener ?? (args.source === "telegram" ? "telegram" : "loopback");
+      if (args.source === "telegram" ? listener !== "telegram" :
+          args.source === "autopilot" ? listener !== "internal" :
+          listener !== "loopback" && listener !== "tailnet")
         return refuseQuestion("invalid_actor",args,listener);
       const dto = db.getSession(args.key);
       if (!dto) return refuseQuestion("session_not_found",args,listener);
@@ -428,11 +458,13 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       if (!invocation || invocation.state !== "pending" || dto.harness !== "claude" ||
           dto.status !== "needs_input" || dto.needsReason !== "question" || dto.pendingQuestionId !== args.questionId)
         return refuseQuestion("stale_question",args,listener);
-      const answers = normalizeQuestionSelections(invocation.questions,args.answers);
+      const answers = args.source === "autopilot"
+        ? normalizeRecommendedQuestionAnswers(invocation.questions,args.answers)
+        : normalizeQuestionSelections(invocation.questions,args.answers);
       if (!answers) return refuseQuestion("invalid_question",args,listener);
       const ts = now();
       const auditContext = audit.prepare({ ts,sessionKey:args.key,source:args.source,actor:args.actor,listener,
-        text:JSON.stringify(answers) });
+        text:JSON.stringify(answers),goalId:goalId ?? undefined });
       const result = db.answerQuestion(invocation.id,args.key,invocation.toolUseId,answers,args.source,args.actor,
         listener,ts,auditContext);
       if (result !== "accepted") {
@@ -442,6 +474,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
         }
         return refuseQuestion(result === "ended" ? "session_ended" : "stale_question",args,listener);
       }
+      try { onQuestionOutcome?.(args.source,invocation.id); } catch { /* Measurement must not change question delivery. */ }
       const updated = db.getSession(args.key);
       if (updated) send?.(updated,"question_answered");
       const waiter = questionWaiters.get(invocation.id);
@@ -451,8 +484,38 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       }
       return { ok:true };
     },
+    commitOmp(id: number, waiterId: string, peer = "loopback") {
+      const lease = leases.get(id);
+      if (!lease || lease.waiterId !== waiterId || lease.peer !== peer) return false;
+      const reply = db.getReply(id);
+      if (reply?.source === "autopilot") {
+        const goalId = reply.actor ? actorGoalId(reply.actor) : null;
+        let active = false;
+        try { active = !!goalId && !!autopilotDelivery?.(reply) && !!autopilotAllowed?.(reply.sessionKey, goalId); }
+        catch { active = false; }
+        if (!active) {
+          leases.delete(id);
+          cancelled(db.cancelReplies({ key: reply.sessionKey, id, source: "autopilot", reason: "inactive_goal" }, now()), db.getSession(reply.sessionKey));
+          return false;
+        }
+      }
+      const result = db.commitOmp(id, waiterId, now());
+      if (!result.ok && result.reason === "stale" && result.reply) {
+        leases.delete(id);
+        outcome(result.reply, "cancelled", db.getSession(result.reply.sessionKey));
+      }
+      return result.ok;
+    },
     cancel(key: string, id?: number) { return cancelled(db.cancelReplies({ key, id, reason: "owner_cancelled" }, now())); },
     cancelAll() { return cancelled(db.cancelReplies({ reason: "owner_cancelled" }, now())); },
+    cancelAutopilot(key?: string, reason = "autopilot_disabled") {
+      return cancelled(db.cancelReplies({ ...(key ? { key } : {}), source: "autopilot", reason }, now()));
+    },
+    consumeQuestionForHook(id: string,key: string,toolUseId: string): boolean {
+      const invocation = db.getQuestionInvocation(id,key,toolUseId);
+      if (invocation?.state === "consumed") return true;
+      return consumeQuestion(id,key,toolUseId)?.status === 200;
+    },
     registerQuestion,
     waitQuestion,
     cancelQuestion(id: string,key: string,toolUseId: string) {
@@ -467,16 +530,6 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       if (!waiter || !pending || pending.signal?.aborted || pending.expiresAt <= now()) return undefined;
       return { observedAt: pending.observedAt, expiresAt: pending.expiresAt,
         protocol: waiter.harness === "claude" ? "claude-waiter" : waiter.commitCapable ? "omp-commit" : "omp-legacy" };
-    },
-    commitOmp(id: number, waiterId: string, peer = "loopback") {
-      const lease = leases.get(id);
-      if (!lease || lease.waiterId !== waiterId || lease.peer !== peer) return false;
-      const result = db.commitOmp(id, waiterId, now());
-      if (!result.ok && result.reason === "stale" && result.reply) {
-        leases.delete(id);
-        outcome(result.reply, "cancelled", db.getSession(result.reply.sessionKey));
-      }
-      return result.ok;
     },
     ackOmp(id: number, waiterId: string, answer: "sent" | "deferred", peer = "loopback") {
       const ackKey = `${id}:${waiterId}:${peer}:${answer}`;

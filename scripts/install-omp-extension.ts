@@ -21,16 +21,21 @@ export function parseArgs(argv: string[]): Args {
 export async function install(args: Args): Promise<string> {
   const targetDir = resolve(args.target);
   const destination = join(targetDir, "dash.ts");
+  const cacheDestination = join(targetDir, "fence-cache.ts");
   const source = join(import.meta.dir, "..", "omp-extension", "dash.ts");
-  if (args.dryRun) return `${args.uninstall ? "Would remove" : "Would copy"} ${destination}`;
+  const cacheSource = join(import.meta.dir, "..", "omp-extension", "fence-cache.ts");
+  if (args.dryRun) return `${args.uninstall ? "Would remove" : "Would copy"} ${destination} and ${cacheDestination}`;
   if (args.uninstall) {
     await rm(destination, { force: true });
-    return `Removed ${destination}`;
+    await rm(cacheDestination, { force: true });
+    return `Removed ${destination} and ${cacheDestination}`;
   }
   await stat(source);
+  await stat(cacheSource);
   await mkdir(targetDir, { recursive: true });
+  await copyFile(cacheSource, cacheDestination);
   await copyFile(source, destination);
-  return `Installed ${destination}`;
+  return `Installed ${destination} and ${cacheDestination}`;
 }
 
 if (import.meta.main) {

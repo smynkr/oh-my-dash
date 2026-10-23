@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { DashDB, type SessionDTO } from "../src/db.ts";
+import { AutopilotStore } from "../src/autopilot-store.ts";
 import type { NormalizedEvent } from "../src/normalize.ts";
 import { createReplies, messageTtlFromEnv } from "../src/replies.ts";
 import { GO_REC_AUTH_TEXT } from "../src/actions.ts";
 
 function fixture(harness: "claude" | "omp" = "claude", status: SessionDTO["status"] = "your_turn", needsReason?: string, ttlMs = 1000) {
   const db = new DashDB(":memory:");
+  new AutopilotStore(db);
   const clock = { now: 1_000_000 };
   const key = `synthetic-host|${harness}|synthetic-session`;
   const event = (kind: "session_start" | "prompt" | "question" | "permission" | "response" | "session_end") =>
@@ -19,6 +21,13 @@ function fixture(harness: "claude" | "omp" = "claude", status: SessionDTO["statu
   const sent: SessionDTO[] = [];
   const broker = createReplies({ db, now: () => clock.now, ttlMs,
     setTimer: fn => { sweep = fn; return () => {}; },
+    autopilotAllowed: () => true,
+    autopilotDelivery: reply => {
+      const goalId = Number(/^autopilot:goal:([1-9]\d*)$/.exec(reply.actor ?? "")?.[1]);
+      return Number.isSafeInteger(goalId) && goalId > 0
+        ? { goal_id:goalId,expires_at:reply.expiresAt,remaining_ttl_ms:Math.max(0,reply.expiresAt-clock.now) }
+        : null;
+    },
     onOutcome: (_reply, result) => outcomes.push(result), send: row => sent.push(row) });
   const close = () => { broker.close(); db.close(); };
   const submit = (text: string, source: "web" | "telegram" | "autopilot" = "telegram", answersTurn?: number) => {
@@ -261,7 +270,13 @@ describe("reply broker", () => {
         const reply = f.submit("hello", source, source === "autopilot" ? 0 : undefined);
         expect(reply).toMatchObject({ source, actor: source === "web" ? "web:loopback" :
           source === "telegram" ? "telegram:123" : "autopilot:goal:1", answersTurn: source === "autopilot" ? 0 : null });
-        expect(await f.broker.waitClaude(f.key, waiter, 1, 100)).toEqual({ status: 200, reply: bodies[source] });
+        const delivered = await f.broker.waitClaude(f.key, waiter, 1, 100);
+        if (source === "autopilot") {
+          expect(delivered.status).toBe(200);
+          if (delivered.status !== 200 || typeof delivered.reply !== "string") throw new Error("expected autopilot delivery envelope");
+          expect(JSON.parse(delivered.reply)).toMatchObject({ kind:"dash.autopilot.reply.v1",source:"autopilot",text:bodies.autopilot,
+            autopilot:{ goal_id:1,expires_at:expect.any(Number),remaining_ttl_ms:expect.any(Number) } });
+        } else expect(delivered).toEqual({ status:200,reply:bodies[source] });
         expect(f.db.getSession(f.key)?.lastPrompt).toBe(`(reply via ${source})`);
         expect(f.db.getReply(reply.id)?.text).toBe("");
       } finally { f.close(); }
@@ -485,7 +500,9 @@ describe("reply broker", () => {
     try {
       const auto = f.submit("auto", "autopilot", 0);
       const leased = await f.broker.waitOmp(f.key, waiter, 1, 100, undefined, true);
-      expect(leased).toEqual({ status: 200, reply: { id: auto.id, text: "auto", source: "autopilot" } });
+      expect(leased).toMatchObject({ status:200,reply:{ id:auto.id,text:"auto",source:"autopilot",autopilot:{
+        goal_id:1,expires_at:expect.any(Number),remaining_ttl_ms:expect.any(Number),
+      } } });
       const owner = f.submit("owner", "web");
       expect(f.db.getReply(auto.id)).toMatchObject({ state: "cancelled", cancelReason: "owner_replied", text: "" });
       expect(f.broker.commitOmp(auto.id, waiter)).toBe(false);

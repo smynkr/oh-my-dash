@@ -360,6 +360,9 @@ exit $LASTEXITCODE
 
     $configPath = Join-Path $fixture.InstallPath 'client-config.json'
     $config = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8))
+    Assert-Equal $false $config.AutopilotFenceEnabled 'Windows autopilot fence remains off by default'
+    Assert-Equal $false $config.AutopilotDialogsEnabled 'Windows blocking dialogs remain off by default'
+    Assert-Equal $false $config.QuestionsEnabled 'Windows remote questions remain off by default'
     Assert-True (@($config.EmptyHookEvents) -contains 'SessionStart') `
         'reinstall metadata retains an event array that was empty before installation'
 
@@ -534,16 +537,56 @@ exit $LASTEXITCODE
     Assert-True (Test-Path -LiteralPath $modifiedHelper) 'uninstall preserves modified managed helpers'
 
     $noReplyInstall = Invoke-WindowsClaudeScript -ScriptPath $installer `
-        -Arguments (Get-InstallerArguments $fixture @('-NoReply')) -TimeoutSeconds 60
-    Assert-Equal 0 $noReplyInstall.ExitCode 'no-reply configuration installs'
+        -Arguments (Get-InstallerArguments $fixture @('-NoReply','-AutopilotDialogs')) -TimeoutSeconds 60
+    Assert-Equal 0 $noReplyInstall.ExitCode 'explicit autopilot dialogs installation succeeds'
     $installed = $true
+    $autopilotConfig = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8))
+    Assert-Equal $true $autopilotConfig.AutopilotFenceEnabled 'dialog opt-in installs the fail-closed fence'
+    Assert-Equal $true $autopilotConfig.AutopilotDialogsEnabled 'dialog opt-in is recorded in the client config'
+    Assert-True (Test-Path -LiteralPath (Join-Path $fixture.InstallPath 'claude-autopilot-fence.ps1')) `
+        'dialog opt-in installs the local fence helper'
+    Assert-True (Test-Path -LiteralPath (Join-Path $fixture.InstallPath 'claude-autopilot-dialog.ps1')) `
+        'dialog opt-in installs the blocking dialog helper'
+    $optInSettings = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fixture.SettingsPath, [System.Text.Encoding]::UTF8))
+    $autopilotFenceGroup = @($optInSettings.hooks.PreToolUse | Where-Object {
+        @($_.hooks | Where-Object { $_.args -contains 'claude-autopilot-fence.ps1' }).Count -gt 0
+    })[0]
+    Assert-Equal '.*' $autopilotFenceGroup.matcher `
+        'Windows fence covers every tool so unknown tool names fail closed'
+    $preToolCommands = @($optInSettings.hooks.PreToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_ })
+    Assert-True ($preToolCommands.Count -ge 3) 'explicit dialog opt-in adds both fenced tool hooks and the question helper'
+    $autopilotReplySession = 'synthetic-autopilot-reply-session'
+    $autopilotExpiry = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 60000
+    $autopilotEnvelope = ConvertTo-Json -InputObject ([ordered]@{
+        kind = 'dash.autopilot.reply.v1'
+        source = 'autopilot'
+        text = 'Synthetic fixed instruction'
+        autopilot = [ordered]@{ goal_id = 7; expires_at = $autopilotExpiry; remaining_ttl_ms = 60000 }
+    }) -Compress
+    Set-WindowsClaudePlans $fixture.Server @{
+        '/reply/wait/claude' = @(@{ StatusCode = 200; Body = $autopilotEnvelope; ContentType = 'application/json' })
+    }
+    $autopilotReply = Invoke-WindowsClaudeScript -ScriptPath $waiterPath `
+        -Stdin ('{"session_id":"' + $autopilotReplySession + '"}') -TimeoutSeconds 10
+    Assert-Equal 2 $autopilotReply.ExitCode 'an autopilot envelope wakes Claude'
+    Assert-Equal 'Synthetic fixed instruction' $autopilotReply.Stderr 'only the fixed reply text reaches Claude'
+    . (Join-Path $fixture.InstallPath 'windows-client-common.ps1')
+    $autopilotCachePath = Get-DashWindowsFenceCachePath $fixture.HostLabel $autopilotReplySession
+    try {
+        Assert-Equal 'active' (Get-DashWindowsFenceState $fixture.HostLabel $autopilotReplySession) `
+            'the Windows reply waiter seeds an active deny-fence cache before delivery'
+    }
+    finally {
+        if ([System.IO.File]::Exists($autopilotCachePath)) { [System.IO.File]::Delete($autopilotCachePath) }
+    }
+    Set-WindowsClaudePlans $fixture.Server $plans
     $finalUninstall = Invoke-WindowsClaudeScript -ScriptPath $installer `
         -Arguments (Get-InstallerArguments $fixture @('-Uninstall')) -TimeoutSeconds 60
-    Assert-Equal 0 $finalUninstall.ExitCode 'no-reply install uninstalls cleanly'
+    Assert-Equal 0 $finalUninstall.ExitCode 'autopilot hook install uninstalls cleanly'
     $installed = $false
     $taskCreated = $false
 
-    Write-Output 'PASS: native Windows Claude install, lifecycle hook, reply waiter, liveness, and rollback scenarios.'
+    Write-Output 'PASS: native Windows Claude install, opt-in autopilot hooks, lifecycle hook, reply waiter, liveness, and rollback scenarios.'
 }
 finally {
     if ($installed -or $taskCreated) {

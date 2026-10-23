@@ -32,6 +32,100 @@ test("app.js initialises without a synchronous error", () => {
   expect(() => run(...globals.map(() => stub()), never)).not.toThrow();
 });
 
+test("dashboard starts a replacement goal instead of editing an escalated goal", () => {
+  const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");
+  const start = script.indexOf("  function autopilotGoalControls(");
+  const end = script.indexOf("  async function postSessionAutopilot(", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  type FakeNode = {
+    tag: string; className: string; text: string; children: FakeNode[]; listeners: Record<string, () => void>;
+    [key: string]: unknown;
+    append(...children: FakeNode[]): void;
+    addEventListener(name: string, listener: () => void): void;
+  };
+  const calls: Array<{ key: string; body: Record<string, unknown> }> = [];
+  const el = (tag: string, className = "", text = ""): FakeNode => ({
+    tag, className, text, children: [], listeners: {},
+    append(...children) { this.children.push(...children); },
+    addEventListener(name, listener) { this.listeners[name] = listener; },
+  });
+  const sessionKey = "synthetic-session";
+  const goal = {
+    id: 17, status: "escalated" as const, goalText: "Previous owner-authored goal", stopCondition: "complete",
+    delayMin: 0, maxTurns: 20, turnsUsed: 2, expiresAt: Date.now() + 3_600_000,
+  };
+  type RenderControls = (
+    autopilotUi: { settings: { flagEnabled: boolean; delayMin: number }; sessions: Map<string, { goal: typeof goal; featureEnabled: boolean; decisions: unknown[] }> },
+    state: { expanded: Set<string> }, makeElement: typeof el, setSelectOptions: (select: FakeNode, value: unknown) => void,
+    postSessionAutopilot: (key: string, body: Record<string, unknown>) => Promise<void>,
+    refreshAutopilot: () => Promise<void>, loadAutopilotSession: (key: string) => Promise<void>,
+    autopilotDelayValue: (value: string) => number | null,
+  ) => (session: unknown, key: string) => FakeNode;
+  const render = new Function("autopilotUi", "state", "el", "setSelectOptions", "postSessionAutopilot",
+    "refreshAutopilot", "loadAutopilotSession", "autopilotDelayValue",
+    `${script.slice(start, end)} return autopilotGoalControls;`) as RenderControls;
+  const controls = render(
+    { settings: { flagEnabled: true, delayMin: 0 }, sessions: new Map([[sessionKey, { goal, featureEnabled: true, decisions: [] }]]) },
+    { expanded: new Set() }, el,
+    (select, value) => { select.value = String(value); },
+    (key, body) => { calls.push({ key, body }); return Promise.resolve(); },
+    async () => {}, async () => {}, value => Number(value),
+  )({}, sessionKey);
+  const findPrimary = (node: FakeNode): FakeNode | undefined => {
+    if (node.tag === "button" && node.className.includes("button-primary")) return node;
+    for (const child of node.children) {
+      const found = findPrimary(child);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  findPrimary(controls)?.listeners.click?.();
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toMatchObject({ key: sessionKey, body: { action: "create", goalText: goal.goalText } });
+  expect(calls[0]!.body).not.toHaveProperty("id");
+});
+
+test("loading global autopilot settings rerenders session goal controls", async () => {
+  const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");
+  const start = script.indexOf("  async function refreshAutopilot()");
+  const end = script.indexOf("  function renderAutopilotDialog()", start);
+  const refresh = script.slice(start, end);
+  const calls: string[] = [];
+  const harness = new Function("autopilotUi", "fetch", "$", "renderAutopilotDialog", "refreshAutopilotDecisions", "renderSessions", `
+    ${refresh}
+    return refreshAutopilot;
+  `);
+  const fetch = async (url: string) => url === "/api/autopilot"
+    ? { ok: true, json: async () => ({ flagEnabled: true, masterEnabled: false, goals: [] }) }
+    : { ok: true, json: async () => ({ autopilot: { metrics: null } }) };
+  const $ = () => ({ setAttribute() {}, textContent: "" });
+  const load = harness({ settings: null, metrics: null }, fetch, $, () => calls.push("dialog"), async () => {}, () => calls.push("sessions"));
+  await load();
+  expect(calls).toEqual(["dialog", "sessions"]);
+});
+
+test("autopilot correction keeps an existing unsent reply draft", async () => {
+  const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");
+  const start = script.indexOf("  async function prefillAutopilotCorrection(");
+  const end = script.indexOf("  async function refreshAutopilot()", start);
+  const handler = script.slice(start, end);
+  const key = "synthetic-session";
+  const drafts = new Map([[key, "owner's unfinished draft"]]);
+  const notices: string[] = [];
+  const harness = new Function("postJson", "refreshAutopilotDecisions", "state", "setFeedView", "renderSessions",
+    "$", "requestAnimationFrame", "document", "CSS", "replyNotice", "window",
+    `${handler}\nreturn prefillAutopilotCorrection;`);
+  const prefill = harness(
+    async () => ({ ok: true }), async () => {}, { drafts, view: "console" }, () => {}, () => {},
+    () => ({ close() {} }), (callback: () => void) => callback(), { querySelector: () => undefined },
+    { escape: (value: string) => value }, (_key: string, message: string) => notices.push(message), { alert() {} },
+  ) as (item: { sessionKey: string; replySuggestion: string }) => Promise<void>;
+  await prefill({ sessionKey: key, replySuggestion: "autopilot's suggested correction" });
+  expect(drafts.get(key)).toBe("owner's unfinished draft");
+  expect(notices).toEqual(["Your existing draft was kept. Clear it before applying this suggestion."]);
+});
+
 test("project rules are fetched only when Telegram topics are enabled", async () => {
   const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");
   const globals = ["document", "window", "localStorage", "sessionStorage", "navigator", "location", "history", "EventSource",

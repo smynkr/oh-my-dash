@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DashDB, type SessionDTO } from "../src/db.ts";
-import { createTelegram, redact } from "../src/telegram.ts";
+import { createTelegram, redact, type TelegramAutopilotOptions } from "../src/telegram.ts";
 import { createReplies } from "../src/replies.ts";
 import { createDashServer } from "../src/server.ts";
 import { CONTINUE_LABEL, CONTINUE_TEXT } from "../src/actions.ts";
@@ -138,7 +138,7 @@ const apiSettled = (check: () => boolean, label = "Bot API calls settled") => ev
 
 const resources: Array<() => void> = [];
 afterEach(() => { while (resources.length) resources.pop()!(); apiInFlight = new Set(); });
-function fixture(options: { paired?: boolean; webhook?: string; clock?: { now: number }; sleep?: (ms: number) => Promise<void>; token?: string | undefined; snippetChars?: number; mode?: "input" | "turns" | "off"; seededQuestion?: boolean; pollStatus?: number; reportError?: (area: string, error: unknown) => void; repliesEnabled?: boolean; ttlMs?: number; topicsEnabled?: boolean; bindings?: { groupChatId: string; topics: Record<string, number | null> }; setTimer?: (fn: () => void, ms: number) => () => void; decisionsEnabled?: boolean; judgeEnabled?: boolean; observeReplies?: boolean; db?: DashDB } = {}) {
+function fixture(options: { paired?: boolean; webhook?: string; clock?: { now: number }; sleep?: (ms: number) => Promise<void>; token?: string | undefined; snippetChars?: number; mode?: "input" | "turns" | "off"; seededQuestion?: boolean; pollStatus?: number; reportError?: (area: string, error: unknown) => void; repliesEnabled?: boolean; ttlMs?: number; topicsEnabled?: boolean; bindings?: { groupChatId: string; topics: Record<string, number | null> }; setTimer?: (fn: () => void, ms: number) => () => void; decisionsEnabled?: boolean; judgeEnabled?: boolean; observeReplies?: boolean; db?: DashDB; autopilot?: TelegramAutopilotOptions } = {}) {
   const topicsEnabled = options.topicsEnabled ?? false;
   const db = options.db ?? new DashDB(":memory:", { topicsEnabled, decisionsEnabled: options.decisionsEnabled, judgeEnabled: options.judgeEnabled });
   const bot = new FakeBot();
@@ -156,6 +156,7 @@ function fixture(options: { paired?: boolean; webhook?: string; clock?: { now: n
     // As in the server: a delivered reply's synthetic prompt reaches Telegram as a prompt event.
     send: options.observeReplies ? (dto, kind) => telegram.observe(dto, kind) : undefined }) : undefined;
   telegram = createTelegram({ db, apiBase: bot.base, fetch: trackedFetch, now: () => clock.now, replies, topicsEnabled, setTimer: options.setTimer,
+    autopilot: options.autopilot,
     readToken: async () => options.token === undefined ? token : options.token,
     sleep: options.sleep ?? (async ms => { clock.now += ms; }), snippetChars: options.snippetChars, reportError: options.reportError });
   resources.push(() => { telegram.close(); replies?.close(); bot.close(); db.close(); });
@@ -3691,11 +3692,11 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
 
   test("/to keeps its match header when a stale target rebuilds the picker", async () => {
     const f = await pairedFixture({ repliesEnabled: true });
-    const first = seedAt(f.db, "example-one", "your_turn", 3);
-    seedAt(f.db, "example-two", "your_turn", 2);
-    f.bot.enqueue(message("/to example synthetic text"));
+    const first = seedAt(f.db, "invest-one", "your_turn", 3);
+    seedAt(f.db, "invest-two", "your_turn", 2);
+    f.bot.enqueue(message("/to invest synthetic text"));
     await apiSettled(() => f.bot.sent.length === 1);
-    expect(f.bot.sent[0]!.text).toBe("&quot;example&quot; matches 2 sessions:");
+    expect(f.bot.sent[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
 
     f.db.applyEvent({ host: first.host, harness: first.harness, sessionId: first.sessionId,
       kind: "session_end", ts: f.clock.now, interactive: true });
@@ -3703,9 +3704,9 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
     await apiSettled(() => answers(f.bot).length === 1 && edits(f.bot).length === 1);
 
     expect(answers(f.bot)[0]).toBe("That session has ended.");
-    expect(edits(f.bot)[0]!.text).toBe("&quot;example&quot; matches 2 sessions:");
+    expect(edits(f.bot)[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
     expect(buttons(edits(f.bot)[0]!).map(button => button.text)).toEqual([
-      "🟢 example-two · synthetic-host", "💡 Save to Ideas", "✖️ Cancel",
+      "🟢 invest-two · synthetic-host", "💡 Save to Ideas", "✖️ Cancel",
     ]);
   });
 
@@ -3843,5 +3844,111 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
     expect(f.bot.sent[4]!.text).not.toContain("New messages");
     expect(f.db.getDraft(1)).toBeUndefined();
     expect(f.db.listIdeas("all")).toHaveLength(0);
+  });
+});
+describe("Telegram autopilot commands", () => {
+  test("parses goal, pause and goal-action callback indices", async () => {
+    const calls: Array<[string, ...unknown[]]> = [];
+    const autopilot: TelegramAutopilotOptions = {
+      featureEnabled:true,
+      state:() => ({enabled:true,away:false,delayMin:0}),
+      setEnabled:() => {},
+      setAway:() => {},
+      setDefaultDelay:() => {},
+      setProjectDelay:() => {},
+      goals:() => [],
+      createGoal:(key,text) => { calls.push(["create",key,text]); return 7; },
+      pauseGoal:key => { calls.push(["pause",key]); return true; },
+      resumeGoal:key => { calls.push(["resume",key]); return true; },
+      stopGoal:key => { calls.push(["stop",key]); return true; },
+      decisions:() => [],
+      brief:async () => "",
+      action:() => true,
+      goalAction:(id,action) => { calls.push(["goalAction",id,action]); return true; },
+    };
+    const f = await pairedFixture({autopilot});
+    f.db.applyEvent({host:"synthetic-host",harness:"claude",sessionId:"session-1",kind:"question",
+      ts:f.clock.now,text:"Synthetic question",interactive:true});
+    f.bot.enqueue(message("/status"));
+    await eventually(() => f.db.getSetting("telegram.offset") === "2");
+    f.bot.enqueue(message("/goal 1 Keep the task bounded"));
+    await eventually(() => f.db.getSetting("telegram.offset") === "3");
+    f.bot.enqueue(message("/pause 1"));
+    await eventually(() => f.db.getSetting("telegram.offset") === "4");
+    f.bot.enqueueUpdate({callback_query:{id:"autopilot-resume",from:{id:owner},
+      message:{chat:{id:chat,type:"private"}},data:"ap:resume:7"}});
+    await eventually(() => f.db.getSetting("telegram.offset") === "5");
+    expect(calls).toEqual([
+      ["create","synthetic-host|claude|session-1","Keep the task bounded"],
+      ["pause","synthetic-host|claude|session-1"],
+      ["goalAction",7,"resume"],
+    ]);
+  });
+  test("a topic-level Never delay stays Never when adjusted", async () => {
+    const changes: Array<[string, number | null]> = [];
+    const goal = { delayMin: null } as never;
+    const autopilot: TelegramAutopilotOptions = {
+      featureEnabled: true,
+      state: () => ({ enabled: true, away: false, delayMin: 0 }),
+      setEnabled: () => {},
+      setAway: () => {},
+      setDefaultDelay: () => {},
+      setProjectDelay: (topic, delay) => { changes.push([topic, delay]); },
+      goals: () => [goal],
+      createGoal: () => 1,
+      pauseGoal: () => true,
+      resumeGoal: () => true,
+      stopGoal: () => true,
+      decisions: () => [],
+      brief: async () => "",
+      action: () => true,
+      goalAction: () => true,
+    };
+    const f = await topicFixture({ autopilot });
+    f.bot.enqueueUpdate({ callback_query: { id: "never-delay", from: { id: owner },
+      message: { chat: { id: group, type: "supergroup" }, message_thread_id: 42 }, data: "ap:delay:1" } });
+    await eventually(() => changes.length === 1);
+    expect(changes).toEqual([["invest", null]]);
+    expect(sendCalls(f.bot).some(call => String(call.body.text).includes("Never"))).toBe(true);
+  });
+
+  test.each([{mode:"off" as const},{muted:true}])("suppresses autopilot cards when muted or off (%j)", async settings => {
+    const f = await pairedFixture(settings.mode ? {mode:settings.mode} : {});
+    if (settings.muted) f.db.setSetting("telegram.mute_until",String(f.clock.now+60_000));
+    const session = dto("working");
+    const notice = {
+      session,goal:{id:1,goalText:"Complete a bounded task"},
+      decision:{id:1,sessionKey:session.key,project:session.project,goalId:1,status:"pending",
+        gateRule:"cooldown",templateType:"T_CONTINUE",executionMethod:"timer",turnSeq:1,
+        verdict:{action:"continue",rationale:"routine",confidence:0.9},decidedAt:f.clock.now,
+        deadlineAt:f.clock.now+60_000,delayMin:1,replySuggestion:null},
+      reason:"cooldown",
+    };
+    expect(await f.telegram.autopilotPending(notice,"fixed template")).toBe(false);
+    expect(f.bot.sent).toHaveLength(0);
+  });
+  test("renders autopilot notices through the Markdown formatter", async () => {
+    const f = await topicFixture();
+    const session = { ...dto("working"), displayName:"Session <one>", project:"invest" };
+    const notice = {
+      session,goal:{id:1,goalText:"Complete <one>"},
+      decision:{id:1,sessionKey:session.key,project:session.project,goalId:1,status:"pending",
+        gateRule:"cooldown",templateType:"T_CONTINUE",executionMethod:"timer",turnSeq:1,
+        verdict:{action:"continue",rationale:"routine <one>",confidence:0.9},decidedAt:f.clock.now,
+        deadlineAt:f.clock.now+60_000,delayMin:1,replySuggestion:null},
+      reason:"cooldown",
+    };
+    expect(await f.telegram.autopilotPending(notice,"Continue <one>")).toBe(true);
+    const text = sendCalls(f.bot)[0]!.body.text as string;
+    expect(text).toContain("<b>Autopilot will act at ");
+    expect(text).toContain("Session &lt;one&gt;");
+    expect(text).not.toContain("&lt;b&gt;");
+    expect(visibleText(text)).toContain("Continue <one>");
+  });
+  test("routes interactive urgent fallback to General in topic mode", async () => {
+    const f = await topicFixture({bindings:{groupChatId:String(group),topics:{invest:42,general:null}}});
+    expect(await f.telegram.sendUrgent("invest","Synthetic urgent fallback",{inline_keyboard:[[{text:"Resume",callback_data:"ap:resume:1"}]]})).toBe(true);
+    expect(sendCalls(f.bot)[0]!.body).toMatchObject({chat_id:String(group),parse_mode:"HTML"});
+    expect(sendCalls(f.bot)[0]!.body).not.toHaveProperty("message_thread_id");
   });
 });
