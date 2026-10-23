@@ -99,6 +99,70 @@ test("deny fence returns active goal TTL and denies sensitive MCP tools", async 
   expect(fence.remaining_ttl_ms).toBeGreaterThan(0);
 });
 
+test("stop-phrase changes cancel queued and leased autopilot replies", async () => {
+  process.env.DASH_REPLIES = "1";
+  process.env.DASH_AUTOPILOT = "1";
+  app = createDashServer({ port: 0, dataPath: ":memory:", backfill: false, liveness: false, now: () => now });
+  const base = `http://127.0.0.1:${app.server.port}`;
+  const session = app.db.applyEvent({ host: localHost(), harness: "omp", sessionId: "synthetic-stop-policy-session",
+    kind: "session_start", ts: now, interactive: true });
+  expect((await ownerJson(base, "/api/autopilot", { enabled: true })).status).toBe(200);
+  const goal = new AutopilotStore(app.db).createGoal({ sessionKey: session.key, goalText: "Continue the bounded task" }, now);
+  const queued = app.db.enqueueReply(session.key, "Proceed with the synthetic deployment", "autopilot",
+    `autopilot:goal:${goal.id}`, session.turnSeq, now, 60_000);
+  const leased = app.db.enqueueReply(session.key, "Continue the synthetic deployment", "autopilot",
+    `autopilot:goal:${goal.id}`, session.turnSeq, now, 60_000);
+  expect(queued).toBeDefined();
+  expect(leased).toBeDefined();
+  expect(app.db.leaseQueuedForOmp(session.key, leased!.id, "synthetic-waiter", session.turnSeq, now, true).kind)
+    .toBe("leased");
+
+  const updated = await ownerJson(base, "/api/autopilot", { stopPhrases: ["synthetic deployment"] });
+  expect(updated.status).toBe(200);
+  expect(app.db.getReply(queued!.id)).toMatchObject({ state: "cancelled", cancelReason: "stop_phrases_changed" });
+  expect(app.db.getReply(leased!.id)).toMatchObject({ state: "cancelled", cancelReason: "stop_phrases_changed" });
+});
+
+test("stop-phrase changes cancel queued and leased replies and stale linked decisions without a controller", async () => {
+  process.env.DASH_REPLIES = "1";
+  app = createDashServer({ port: 0, dataPath: ":memory:", backfill: false, liveness: false, now: () => now });
+  const base = `http://127.0.0.1:${app.server.port}`;
+  const session = app.db.applyEvent({ host: localHost(), harness: "omp", sessionId: "synthetic-stop-policy-disabled-session",
+    kind: "session_start", ts: now, interactive: true });
+  const store = new AutopilotStore(app.db);
+  const goal = store.createGoal({ sessionKey: session.key, goalText: "Continue the bounded task" }, now);
+  const queued = app.db.enqueueReply(session.key, "Proceed with the synthetic deployment", "autopilot",
+    `autopilot:goal:${goal.id}`, session.turnSeq, now, 60_000);
+  const leased = app.db.enqueueReply(session.key, "Continue the synthetic deployment", "autopilot",
+    `autopilot:goal:${goal.id}`, session.turnSeq, now, 60_000);
+  expect(queued).toBeDefined();
+  expect(leased).toBeDefined();
+  expect(app.db.leaseQueuedForOmp(session.key, leased!.id, "synthetic-disabled-waiter", session.turnSeq, now, true).kind)
+    .toBe("leased");
+  const sentDecision = (replyId: number) => {
+    const decision = store.recordDecision({
+      sessionKey: session.key, project: session.project, goalId: goal.id, turnSeq: session.turnSeq,
+      responseId: null, responseHash: null, decisionSetHash: null, goalVersionId: goal.goalVersionId,
+      templateType: "T_CONTINUE", verdict: { action: "continue", rationale: "synthetic", confidence: 0.9, risk_flags: [] },
+      delayMin: null, decidedAt: now, status: "sent", executionMethod: "immediate",
+    });
+    app!.db.sqlite.query("UPDATE autopilot_decisions SET reply_id=? WHERE id=?").run(replyId, decision.id);
+    return decision.id;
+  };
+  const queuedDecision = sentDecision(queued!.id), leasedDecision = sentDecision(leased!.id);
+
+  const updated = await ownerJson(base, "/api/autopilot", { stopPhrases: ["synthetic deployment"] });
+  expect(updated.status).toBe(200);
+  expect(app.db.getReply(queued!.id)).toMatchObject({ state: "cancelled", cancelReason: "stop_phrases_changed" });
+  expect(app.db.getReply(leased!.id)).toMatchObject({ state: "cancelled", cancelReason: "stop_phrases_changed" });
+  expect(store.getDecision(queuedDecision)).toMatchObject({
+    status: "stale", gateRule: "stop_phrases_changed", executionMethod: "none",
+  });
+  expect(store.getDecision(leasedDecision)).toMatchObject({
+    status: "stale", gateRule: "stop_phrases_changed", executionMethod: "none",
+  });
+});
+
 test("E3-E5-gated hook answers only the indexed recommendation through the audited reply path", async () => {
   Object.assign(process.env, {
     DASH_REPLIES: "1", DASH_AUTOPILOT: "1", DASH_DIALOGS: "1", DASH_DIALOGS_E3_PASS: "1",

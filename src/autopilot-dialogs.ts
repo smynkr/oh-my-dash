@@ -236,6 +236,8 @@ interface PendingAutopilotDelay {
   turnSeq: number;
   goalId: number;
   delayMin: number;
+  goalVersionId: number;
+  goalPolicyRevision: number;
   answerAt: number;
   expiresAt: number;
   startedAt: number | undefined;
@@ -495,7 +497,7 @@ export function createAutopilotDialogs(options: AutopilotDialogsOptions): Autopi
     request: AskHookRegistration,
     current: CurrentInvocation,
     now: number,
-    expected?: Pick<PendingAutopilotDelay, "goalId" | "delayMin">,
+    expected?: Pick<PendingAutopilotDelay, "goalId" | "delayMin" | "goalVersionId" | "goalPolicyRevision">,
   ): AutoEligibility | DialogReleaseReason => {
     let master: boolean;
     let goal: AutopilotGoal | undefined;
@@ -509,7 +511,9 @@ export function createAutopilotDialogs(options: AutopilotDialogsOptions): Autopi
       goal = options.store.goalForSession(request.sessionKey);
       if (!goal) return "no_goal";
       if (goal.sessionKey !== request.sessionKey || goal.status !== "active") return "inactive_goal";
-      if (expected && (goal.id !== expected.goalId || goal.delayMin !== expected.delayMin)) return "stale";
+      if (expected && (goal.id !== expected.goalId || goal.delayMin !== expected.delayMin ||
+          goal.goalVersionId !== expected.goalVersionId || (goal.policyRevision ?? 0) !== expected.goalPolicyRevision))
+        return "stale";
       if (!Number.isSafeInteger(goal.turnSeqAtResume) || goal.turnSeqAtResume < 0 ||
           current.session.turnSeq < goal.turnSeqAtResume) return "stale";
       if (!Number.isSafeInteger(goal.maxTurns) || goal.maxTurns < 1 || goal.maxTurns > 20 ||
@@ -598,7 +602,9 @@ export function createAutopilotDialogs(options: AutopilotDialogsOptions): Autopi
       sessionKey: request.sessionKey, host: request.host, toolUseId: request.toolUseId,
       invocationId: request.invocationId, questionFingerprint: checked.questionFingerprint,
       hookDeadlineMs: request.hookDeadlineMs, turnSeq: checked.session.turnSeq,
-      goalId: eligible.goal.id, delayMin: eligible.delayMin, answerAt, expiresAt: window.expiresAt, startedAt,
+      goalId: eligible.goal.id, goalVersionId: eligible.goal.goalVersionId,
+      goalPolicyRevision: eligible.goal.policyRevision ?? 0, delayMin: eligible.delayMin,
+      answerAt, expiresAt: window.expiresAt, startedAt,
     };
     pending.set(request.invocationId, pendingDelay);
     if (!markIssued(request, window.expiresAt, startedAt)) {

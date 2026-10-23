@@ -506,7 +506,9 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       }
       return result.ok;
     },
-    cancel(key: string, id?: number) { return cancelled(db.cancelReplies({ key, id, reason: "owner_cancelled" }, now())); },
+    cancel(key: string, id?: number, reason = "owner_cancelled") {
+      return cancelled(db.cancelReplies({ key, id, reason }, now()));
+    },
     cancelAll() { return cancelled(db.cancelReplies({ reason: "owner_cancelled" }, now())); },
     cancelAutopilot(key?: string, reason = "autopilot_disabled") {
       return cancelled(db.cancelReplies({ ...(key ? { key } : {}), source: "autopilot", reason }, now()));

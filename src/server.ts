@@ -1,4 +1,4 @@
-import { createAutopilot, autopilotTemplateText, type AutopilotController } from "./autopilot.ts";
+import { cancelAutopilotRepliesAndDecisions, createAutopilot, autopilotTemplateText, type AutopilotController } from "./autopilot.ts";
 import { dirname, join, resolve } from "node:path";
 import { isIP } from "node:net";
 import { DashDB, type Idea, type Reply, type SearchOptions, type SessionDTO, type SourceReportRecord, type SourceSessionMetadata } from "./db.ts";
@@ -234,6 +234,11 @@ export function createDashServer(options: ServerOptions = {}) {
     for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
     return true;
   };
+  const emitAutopilotSessionChanged = (key: string) => {
+    const session = db.getSession(key);
+    if (session) emitSession(session,true);
+    return session;
+  };
   const emitSources = () => {
     const message = encoder.encode("event: sources\ndata: {}\n\n");
     for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
@@ -405,8 +410,7 @@ export function createDashServer(options: ServerOptions = {}) {
       onEscalation: notice => { emitSession(notice.session,true); void telegram?.autopilotEscalation(notice); },
       onSuggestion: suggestion => { emitSession(suggestion.session,true); void telegram?.autopilotSuggestion(suggestion); },
       onChanged: (key,decision) => {
-        const session = db.getSession(key);
-        if (session) emitSession(session,true);
+        const session = emitAutopilotSessionChanged(key);
         if (!decision || !session) return;
         const goal = autopilotStore.getGoal(decision.goalId);
         if (!goal) return;
@@ -828,6 +832,8 @@ export function createDashServer(options: ServerOptions = {}) {
       const settings = body as Record<string,unknown>;
       if (settings.enabled === true && !autopilotRuntimeEnabled) return json({ error:"DASH_AUTOPILOT and DASH_REPLIES must be enabled" },409);
       try {
+        const stopPhrasesChanged = Array.isArray(settings.stopPhrases) &&
+          JSON.stringify(autopilotStore.customStopPhrases()) !== JSON.stringify(settings.stopPhrases);
         if (typeof settings.enabled === "boolean") {
           if (autopilotController) autopilotController.setMasterEnabled(settings.enabled);
           else {
@@ -838,7 +844,13 @@ export function createDashServer(options: ServerOptions = {}) {
         if (typeof settings.away === "boolean") autopilotStore.setAway(settings.away);
         if (Object.hasOwn(settings,"delayMin")) autopilotStore.setDefaultDelayMin(settings.delayMin as number | null);
         if (Array.isArray(settings.stopPhrases)) autopilotStore.setCustomStopPhrases(settings.stopPhrases as string[]);
-        autopilotController?.refreshPending();
+        if (autopilotController) {
+          autopilotController.refreshPending(undefined, { invalidateAutopilotReplies: stopPhrasesChanged });
+        } else if (stopPhrasesChanged && replies) {
+          cancelAutopilotRepliesAndDecisions({
+            db, store:autopilotStore, replies, now, onChanged: key => { emitAutopilotSessionChanged(key); },
+          }, undefined, "stale", "stop_phrases_changed", "stop_phrases_changed");
+        }
         return json(autopilotState());
       } catch (error) {
         reportError("autopilot settings",error);
