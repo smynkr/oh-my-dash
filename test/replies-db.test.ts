@@ -296,8 +296,8 @@ test("fresh topic databases seed requested defaults without replacing stored rul
   let db = new DashDB(path, { topicsEnabled: true });
   try {
     expect(db.getProjectRules()).toEqual({ rules: SEED_PROJECT_RULES, errors: [] });
-    db.applyEvent(event("seed", "/Volumes/Clawdata/tmp/invest-123/task"));
-    expect(db.getSession("synthetic-host|claude|seed")?.project).toBe("invest");
+    db.applyEvent(event("seed", "/Volumes/ExampleData/tmp/example-123/task"));
+    expect(db.getSession("synthetic-host|claude|seed")?.project).toBe("example");
     db.setSetting("projects.rules", JSON.stringify(custom));
   } finally { db.close(); }
 

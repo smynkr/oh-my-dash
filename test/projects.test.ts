@@ -2,9 +2,9 @@ import { expect, test } from "bun:test";
 import { resolveProject, ruleErrors, SEED_PROJECT_RULES, topicFor, type TopicBindings } from "../src/projects.ts";
 
 test("the four seed path rules resolve their intended projects and preserve fallback basenames", () => {
-  expect(resolveProject("/Users/agent/Developer/investapi/task", SEED_PROJECT_RULES)).toBe("invest");
-  expect(resolveProject("/Users/agent/.invest-triage/task", SEED_PROJECT_RULES)).toBe("invest");
-  expect(resolveProject("/Volumes/Clawdata/tmp/invest-123/task", SEED_PROJECT_RULES)).toBe("invest");
+  expect(resolveProject("/Users/agent/Developer/example-api/task", SEED_PROJECT_RULES)).toBe("example");
+  expect(resolveProject("/Users/agent/.example-triage/task", SEED_PROJECT_RULES)).toBe("example");
+  expect(resolveProject("/Volumes/ExampleData/tmp/example-123/task", SEED_PROJECT_RULES)).toBe("example");
   expect(resolveProject("/Users/agent/Documents/Defense", SEED_PROJECT_RULES)).toBe("Defense");
   expect(resolveProject("/Users/agent/checkouts/unmatched/repo", SEED_PROJECT_RULES)).toBe("repo");
   expect(resolveProject("/Users/agent/projects/alpha/task", SEED_PROJECT_RULES)).toBe("alpha");

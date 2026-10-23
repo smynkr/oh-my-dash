@@ -5,9 +5,9 @@ export type TopicBindings = { groupChatId: string; topics: Record<string, number
 export type TopicBinding = { chatId: string; threadId: number | null; name: string };
 
 export const SEED_PROJECT_RULES: readonly ProjectRule[] = Object.freeze([
-  Object.freeze({ pattern: "/investapi(/|$)", project: "invest" }),
-  Object.freeze({ pattern: "/\\.invest-triage(/|$)", project: "invest" }),
-  Object.freeze({ pattern: "^/Volumes/Clawdata/tmp/([a-z0-9]+)[-_]", project: "$1" }),
+  Object.freeze({ pattern: "/example-api(/|$)", project: "example" }),
+  Object.freeze({ pattern: "/\\.example-triage(/|$)", project: "example" }),
+  Object.freeze({ pattern: "^/Volumes/ExampleData/tmp/([a-z0-9]+)[-_]", project: "$1" }),
   Object.freeze({ pattern: "/Documents/([^/]+)", project: "$1" }),
   Object.freeze({ pattern: "/(?:Documents|projects|Code|workspaces)/([^/]+)(?:/|$)", project: "$1" }),
 ]);

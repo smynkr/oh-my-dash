@@ -14,6 +14,8 @@ describe("autopilot deny fence", () => {
     expect(fenceMatch("Read", { file_path: "/var/root/.aws/credentials" })).toEqual({ deny: true, rule: "secrets_iam" });
     expect(fenceMatch("mcp__stripe.charge", { amount: 10 })).toEqual({ deny: true, rule: "payment_money" });
     expect(fenceMatch("AskUserQuestion", { questions: [] })).toEqual({ deny: false });
+    expect(fenceMatch("AskUserQuestion", { questions: [{ question: "Should I git push --force?", options: [] }] }))
+      .toEqual({ deny: false });
     expect(fenceMatch("WebFetch", { url: "https://example.test" })).toEqual({ deny: true, rule: "uninspectable" });
     expect(fenceMatch("Bash", { command: "echo hello" })).toEqual({ deny: false });
   });
