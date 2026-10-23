@@ -109,6 +109,7 @@ try {
         $state = Get-DashWindowsFenceState $config.HostLabel $session
         if ($state -eq 'active') { Emit-DashWindowsFenceDeny 'dash hub unreachable; autopilot paused, ask the owner' }
         elseif ($state -eq 'invalid') { Emit-DashWindowsFenceDeny 'dash autopilot fence cache invalid; ask the owner' }
+        else { Emit-DashWindowsFenceDeny 'dash hub unreachable; autopilot state unconfirmed, ask the owner' }
         exit 0
     }
 }

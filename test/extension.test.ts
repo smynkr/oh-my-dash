@@ -304,6 +304,39 @@ const syntheticAskQuestions = [
       rmSync(home, { recursive: true, force: true });
     }
   });
+  test("cold and inactive fence state fail closed on hub outage", async () => {
+    const home = mkdtempSync(join(tmpdir(), "dash-omp-offline-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      extension({ on: (name, handler) => handlers.set(name, handler) });
+      globalThis.fetch = (() => { throw new Error("synthetic hub outage"); }) as typeof fetch;
+      expect(await handlers.get("tool_call")!(
+        { toolName: "Bash", args: { command: "echo safe" } }, interactiveCtx,
+      )).toMatchObject({
+        block: true, reason: "dash hub unreachable; autopilot state unconfirmed, ask the owner",
+      });
+
+      globalThis.fetch = (() => Promise.resolve(Response.json({
+        active_goal: false, goal_id: null, expires_at: null, remaining_ttl_ms: 0,
+      }))) as typeof fetch;
+      expect(await handlers.get("tool_call")!(
+        { toolName: "Bash", args: { command: "echo safe" } }, interactiveCtx,
+      )).toBeUndefined();
+
+      globalThis.fetch = (() => { throw new Error("synthetic hub outage"); }) as typeof fetch;
+      expect(await handlers.get("tool_call")!(
+        { toolName: "Bash", args: { command: "echo safe" } }, interactiveCtx,
+      )).toMatchObject({
+        block: true, reason: "dash hub unreachable; autopilot state unconfirmed, ask the owner",
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("does not commit an autopilot reply when its fence cache cannot be persisted", async () => {
     const home = mkdtempSync(join(tmpdir(), "dash-omp-home-"));
     writeFileSync(join(home, ".omp"), "not a directory");

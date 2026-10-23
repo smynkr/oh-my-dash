@@ -547,6 +547,50 @@ exit $LASTEXITCODE
         'dialog opt-in installs the local fence helper'
     Assert-True (Test-Path -LiteralPath (Join-Path $fixture.InstallPath 'claude-autopilot-dialog.ps1')) `
         'dialog opt-in installs the blocking dialog helper'
+    $fencePath = Join-Path $fixture.InstallPath 'claude-autopilot-fence.ps1'
+    $coldFenceInput = ConvertTo-Json -InputObject ([ordered]@{
+        session_id = 'synthetic-cold-offline-session'
+        hook_event_name = 'PreToolUse'
+        tool_name = 'Bash'
+        tool_input = [ordered]@{ command = 'echo safe' }
+    }) -Depth 10 -Compress
+    Set-WindowsClaudePlans $fixture.Server @{
+        '/hook/fence' = @(@{ StatusCode = 503; Body = 'synthetic outage'; ContentType = 'text/plain' })
+    }
+    $coldFence = Invoke-WindowsClaudeScript -ScriptPath $fencePath -Stdin $coldFenceInput -TimeoutSeconds 10
+    $coldFenceResult = ConvertFrom-Json -InputObject $coldFence.Stdout
+    Assert-Equal 'deny' $coldFenceResult.hookSpecificOutput.permissionDecision `
+        'a cold Windows fence cache denies calls while the hub state is unconfirmed'
+
+    $inactiveFenceInput = ConvertTo-Json -InputObject ([ordered]@{
+        session_id = 'synthetic-inactive-offline-session'
+        hook_event_name = 'PreToolUse'
+        tool_name = 'Bash'
+        tool_input = [ordered]@{ command = 'echo safe' }
+    }) -Depth 10 -Compress
+    $inactiveFenceBody = ConvertTo-Json -InputObject ([ordered]@{
+        active_goal = $false
+        goal_id = $null
+        expires_at = $null
+        remaining_ttl_ms = 0
+    }) -Compress
+    Set-WindowsClaudePlans $fixture.Server @{
+        '/hook/fence' = @(@{ StatusCode = 200; Body = $inactiveFenceBody; ContentType = 'application/json' })
+    }
+    $inactiveFence = Invoke-WindowsClaudeScript -ScriptPath $fencePath -Stdin $inactiveFenceInput -TimeoutSeconds 10
+    Assert-Equal '' $inactiveFence.Stdout 'a fresh inactive response allows the ordinary tool call'
+    Set-WindowsClaudePlans $fixture.Server @{
+        '/hook/fence' = @(@{ StatusCode = 503; Body = 'synthetic outage'; ContentType = 'text/plain' })
+    }
+    $offlineFence = Invoke-WindowsClaudeScript -ScriptPath $fencePath -Stdin $inactiveFenceInput -TimeoutSeconds 10
+    $offlineFenceResult = ConvertFrom-Json -InputObject $offlineFence.Stdout
+    Assert-Equal 'deny' $offlineFenceResult.hookSpecificOutput.permissionDecision `
+        'a stale inactive Windows cache denies calls during a hub outage'
+    Assert-Equal 'dash hub unreachable; autopilot state unconfirmed, ask the owner' `
+        $offlineFenceResult.hookSpecificOutput.permissionDecisionReason `
+        'an inactive cache cannot confirm the current remote goal state'
+    Set-WindowsClaudePlans $fixture.Server $plans
+
     $optInSettings = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fixture.SettingsPath, [System.Text.Encoding]::UTF8))
     $autopilotFenceGroup = @($optInSettings.hooks.PreToolUse | Where-Object {
         @($_.hooks | Where-Object { $_.args -contains 'claude-autopilot-fence.ps1' }).Count -gt 0

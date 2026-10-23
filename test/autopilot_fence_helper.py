@@ -1,10 +1,12 @@
 import importlib.util
 import json
+import io
 import os
 import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -75,6 +77,30 @@ class FenceResponseValidationTests(unittest.TestCase):
         self.assertFalse(denied)
         self.assertIsNone(reason)
         write_cache.assert_called_once_with("synthetic-host", "synthetic-session", False)
+
+class FenceNetworkFailureTests(unittest.TestCase):
+    def test_cold_or_inactive_cache_denies_when_hub_is_unreachable(self):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "synthetic-session",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo safe"},
+        }
+        for cached_state in (None, False):
+            with self.subTest(cached_state=cached_state):
+                output = io.StringIO()
+                stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(payload).encode("utf-8")))
+                with patch.object(fence, "post_fence", side_effect=OSError("synthetic hub outage")), \
+                        patch.object(fence, "read_fence_cache", return_value=cached_state), \
+                        patch.object(sys, "argv", [
+                            "claude-autopilot-fence.py", "--hub-url", "http://127.0.0.1:4777",
+                            "--host", "synthetic-host",
+                        ]), patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", output):
+                    fence.run()
+                self.assertTrue(output.getvalue())
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
 
 class FenceCacheSeedTests(unittest.TestCase):
     def test_seed_helper_writes_only_bounded_live_goal_metadata(self):

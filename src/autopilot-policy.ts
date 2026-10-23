@@ -77,6 +77,8 @@ const stopRules: Array<[string, RegExp[]]> = [
     /\brm\b[^\n;|&]*(?:--recursive\b|(?:^|\s)-[A-Za-z]*r[A-Za-z]*\b)[^\n;|&]*(?:--force\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b)/i,
     /\brm\b[^\n;|&]*(?:--force\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b)[^\n;|&]*(?:--recursive\b|(?:^|\s)-[A-Za-z]*r[A-Za-z]*\b)/i,
     /\brmdir\s+\/s\b/i, /\bfind\b[^\n;|&]*\s-delete\b/i,
+    /\b(?:powershell(?:\.exe)?|pwsh(?:\.exe)?)\b[^\n;|&]*\bremove-item\b[^\n;|&]*(?:-recurse\b[^\n;|&]*-force\b|-force\b[^\n;|&]*-recurse\b)/i,
+    /\b(?:(?:cmd(?:\.exe)?\s+\/c\s+))?del(?:\.exe)?\b[^\n;|&]*(?:\/s\b[^\n;|&]*\/q\b|\/q\b[^\n;|&]*\/s\b)/i,
     /\bgit\s+clean\b[^\n;|&]*(?:--force\b|-[A-Za-z]*f[A-Za-z]*\b)/i,
   ]],
   ["drop_truncate", [/\b(?:drop|truncate)\s+(?:table|database|schema|collection|index|view|function|trigger|type|sequence)\b/i]],

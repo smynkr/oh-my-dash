@@ -573,9 +573,14 @@ export function createAutopilot({ db, store, replies, judge, now = Date.now, tim
     const explicitError = latestTurnEndIsError(db, key) && session.turnSeq > goal.turnSeqAtResume;
     if (!response && !explicitError || hasDecisionForTurn(key, goal, session.turnSeq, response)) return;
     const existing = wakes.get(key);
+    const responseChanged = (existing?.response?.id ?? null) !== (response?.id ?? null) ||
+      (!!existing?.response && !!response && (
+        existing.response.text !== response.text ||
+        expectedDecisionHash(existing.response) !== expectedDecisionHash(response)
+      ));
     if (existing && existing.turnSeq === session.turnSeq && existing.goalId === goal.id &&
         existing.goalVersionId === goal.goalVersionId && existing.goalPolicyRevision === (goal.policyRevision ?? 0) &&
-        existing.generation === generation && (existing.response?.id ?? null) === (response?.id ?? null)) return;
+        existing.generation === generation && !responseChanged) return;
     cancelWake(key);
     const job: WakeJob = { key, turnSeq: session.turnSeq, goalId: goal.id, goalVersionId: goal.goalVersionId,
       goalPolicyRevision:goal.policyRevision ?? 0, response, generation, cancelled: false };

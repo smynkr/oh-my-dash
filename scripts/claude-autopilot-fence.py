@@ -149,6 +149,8 @@ def run():
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError, UnicodeError):
             if cache_deny(host, session):
                 emit_deny("dash hub unreachable; autopilot paused, ask the owner")
+            else:
+                emit_deny("dash hub unreachable; autopilot state unconfirmed, ask the owner")
     except BaseException:
         # Malformed local hook data fails closed; no tool input or exception is logged.
         emit_deny("dash autopilot fence: uninspectable tool call; ask the owner")

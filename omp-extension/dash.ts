@@ -224,9 +224,9 @@ function install(pi: Pi): void {
         conservativeFence(sid);
         return { block: true, reason: "dash autopilot fence metadata invalid; ask the owner" };
       }
-    } catch { /* A cached active goal fails closed below. */ }
+    } catch { /* A failed request cannot confirm that an inactive cache is still current. */ }
     if (cachedGoalActive(sid)) return { block: true, reason: "dash hub unreachable; autopilot paused, ask the owner" };
-    return;
+    return { block: true, reason: "dash hub unreachable; autopilot state unconfirmed, ask the owner" };
   }
   function startReplyLoop(sid: string): void {
     if (!sid || loops.has(sid) || !pi.sendUserMessage) return;

@@ -94,6 +94,15 @@ describe("autopilot deterministic policy", () => {
     expect(matchStopAndAsk("Pay attention to the order of these steps.")).toBeUndefined();
     expect(matchStopAndAsk("Drop the result into the output directory.")).toBeUndefined();
   });
+  test("escalates recursive deletion through Windows shells", () => {
+    for (const text of [
+      "powershell.exe -Command Remove-Item -Recurse -Force C:\\synthetic\\target",
+      "powershell -NoProfile -Command \"Remove-Item -Force -Recurse C:\\synthetic\\target\"",
+      "cmd /c del /s /q C:\\synthetic\\target\\*",
+      "cmd.exe /c del /q /s C:\\synthetic\\target\\*",
+    ]) expect(matchStopAndAsk(text)).toBe("rm_rf");
+  });
+
 
   test("matches configured stop phrases by Unicode code point count", () => {
     const phrase = "😀".repeat(100);
