@@ -125,6 +125,33 @@ const templateTypeForVerdict = (verdict: AutopilotVerdict, response: ResponseDTO
 function safeCallback<T extends unknown[]>(callback: ((...args: T) => void) | undefined, ...args: T) {
   try { callback?.(...args); } catch { /* Owner-facing notifications cannot interrupt a safety decision. */ }
 }
+export function cancelAutopilotRepliesAndDecisions(
+  { db, store, replies, now = Date.now, onChanged }: Pick<CreateAutopilotOptions, "db" | "store" | "replies" | "now" | "onChanged">,
+  sessionKey?: string, status: "cancelled_owner" | "held" | "stale" = "cancelled_owner", reason = "switch_off",
+  cancelReason?: string,
+) {
+  const rows = sessionKey === undefined
+    ? db.sqlite.query(`SELECT r.id,r.session_key,d.id AS decision_id FROM replies r
+        LEFT JOIN autopilot_decisions d ON d.reply_id=r.id
+        WHERE r.source='autopilot' AND r.state IN ('queued','leased') AND r.committed_at IS NULL ORDER BY r.id`).all()
+    : db.sqlite.query(`SELECT r.id,r.session_key,d.id AS decision_id FROM replies r
+        LEFT JOIN autopilot_decisions d ON d.reply_id=r.id
+        WHERE r.source='autopilot' AND r.state IN ('queued','leased') AND r.committed_at IS NULL
+          AND r.session_key=? ORDER BY r.id`).all(sessionKey);
+  for (const row of rows as Array<{ id: number; session_key: string; decision_id: number | null }>) {
+    replies.cancel(String(row.session_key), Number(row.id), cancelReason);
+    const reply = db.sqlite.query("SELECT state,committed_at FROM replies WHERE id=?").get(Number(row.id)) as
+      { state: string; committed_at: number | null } | null;
+    if (!reply || reply.state !== "cancelled" || reply.committed_at !== null || row.decision_id === null) continue;
+    const decision = store.getDecision(Number(row.decision_id));
+    if (!decision || decision.status !== "sent" ||
+        !store.transitionDecision(decision.id, ["sent"], status, now(), {
+          gateRule: reason, executionMethod: status === "cancelled_owner" ? "owner" : "none",
+        })) continue;
+    const updated = store.getDecision(decision.id);
+    if (updated) safeCallback(onChanged, updated.sessionKey, updated);
+  }
+}
 
 function sanitizedVerdict(value: unknown): AutopilotVerdict {
   if (!matchesSchema(AUTOPILOT_VERDICT_SCHEMA, value)) throw new JudgeError("schema");
@@ -888,26 +915,8 @@ export function createAutopilot({ db, store, replies, judge, now = Date.now, tim
 
   function cancelAutopilotReplies(sessionKey?: string, status: "cancelled_owner" | "held" | "stale" = "cancelled_owner",
     reason = "switch_off", cancelReason?: string) {
-    const rows = sessionKey === undefined
-      ? db.sqlite.query(`SELECT r.id,r.session_key,d.id AS decision_id FROM replies r
-          LEFT JOIN autopilot_decisions d ON d.reply_id=r.id
-          WHERE r.source='autopilot' AND r.state IN ('queued','leased') AND r.committed_at IS NULL ORDER BY r.id`).all()
-      : db.sqlite.query(`SELECT r.id,r.session_key,d.id AS decision_id FROM replies r
-          LEFT JOIN autopilot_decisions d ON d.reply_id=r.id
-          WHERE r.source='autopilot' AND r.state IN ('queued','leased') AND r.committed_at IS NULL
-            AND r.session_key=? ORDER BY r.id`).all(sessionKey);
-    for (const row of rows as Array<{ id: number; session_key: string; decision_id: number | null }>) {
-      replies.cancel(String(row.session_key), Number(row.id), cancelReason);
-      const reply = db.sqlite.query("SELECT state,committed_at FROM replies WHERE id=?").get(Number(row.id)) as
-        { state: string; committed_at: number | null } | null;
-      if (!reply || reply.state !== "cancelled" || reply.committed_at !== null || row.decision_id === null) continue;
-      const decision = store.getDecision(Number(row.decision_id));
-      if (!decision || decision.status !== "sent") continue;
-      const updated = transition(decision, ["sent"], status, {
-        gateRule: reason, executionMethod: status === "cancelled_owner" ? "owner" : "none",
-      });
-      notifyChanged(updated);
-    }
+    cancelAutopilotRepliesAndDecisions({ db, store, replies, now, onChanged },
+      sessionKey, status, reason, cancelReason);
   }
   function setMasterEnabled(value: boolean) {
     const result = store.setMasterEnabled(value, now());

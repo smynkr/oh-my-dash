@@ -77,7 +77,7 @@ const stopRules: Array<[string, RegExp[]]> = [
     /\brm\b[^\n;|&]*(?:--recursive\b|(?:^|\s)-[A-Za-z]*r[A-Za-z]*\b)[^\n;|&]*(?:--force\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b)/i,
     /\brm\b[^\n;|&]*(?:--force\b|(?:^|\s)-[A-Za-z]*f[A-Za-z]*\b)[^\n;|&]*(?:--recursive\b|(?:^|\s)-[A-Za-z]*r[A-Za-z]*\b)/i,
     /\b(?:rmdir|rd)\s+\/s\b/i, /\bfind\b[^\n;|&]*\s-delete\b/i,
-    /\b(?:remove-item|ri|rm|rmdir|rd|del|erase)\b[^\n;|&]*(?:-(?:recurse|rec|r)\b[^\n;|&]*-(?:force|fo)\b|-(?:force|fo)\b[^\n;|&]*-(?:recurse|rec|r)\b)/i,
+    /\b(?:remove-item|ri|rm|rmdir|rd|del|erase)\b[^\n;|&]*(?:-(?:r|re|rec|recu|recur|recurs|recurse)\b[^\n;|&]*-(?:fo|for|forc|force)\b|-(?:fo|for|forc|force)\b[^\n;|&]*-(?:r|re|rec|recu|recur|recurs|recurse)\b)/i,
     /\b(?:(?:cmd(?:\.exe)?\s+\/c\s+))?del(?:\.exe)?\b[^\n;|&]*(?:\/s\b[^\n;|&]*\/q\b|\/q\b[^\n;|&]*\/s\b)/i,
     /\bgit\s+clean\b[^\n;|&]*(?:--force\b|-[A-Za-z]*f[A-Za-z]*\b)/i,
   ]],

@@ -115,12 +115,18 @@ describe("autopilot deterministic policy", () => {
       "cmd.exe /c del /q /s C:\\synthetic\\target\\*",
       "cmd /c rd /s /q C:\\synthetic\\target",
     ]) expect(matchStopAndAsk(text)).toBe("rm_rf");
+    for (const recurse of ["r", "re", "rec", "recu", "recur", "recurs", "recurse"])
+      for (const force of ["fo", "for", "forc", "force"]) {
+        expect(matchStopAndAsk(`Remove-Item -${recurse} -${force} C:\\synthetic\\target`)).toBe("rm_rf");
+        expect(matchStopAndAsk(`Remove-Item -${force} -${recurse} C:\\synthetic\\target`)).toBe("rm_rf");
+      }
     for (const text of [
       "del",
       "rd",
       "The words del and rd are mentioned in this sentence.",
       "The path C:\\synthetic\\del\\rd should remain untouched.",
     ]) expect(matchStopAndAsk(text)).toBeUndefined();
+    expect(matchStopAndAsk("Remove-Item -Recurse -F C:\\synthetic\\target")).toBeUndefined();
   });
 
   test("matches configured stop phrases by Unicode code point count", () => {
