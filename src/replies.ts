@@ -381,7 +381,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
         (args.expectedTurn !== undefined && (!Number.isSafeInteger(args.expectedTurn) || args.expectedTurn < 0)) ||
         (args.source === "autopilot" && args.answersTurn === undefined) ||
         (kind === "message" && args.answersTurn !== undefined)) return refuse("invalid_turn", args);
-      if (args.ideaId !== undefined && (kind !== "message" || !Number.isSafeInteger(args.ideaId) || db.getIdea(args.ideaId)?.state !== "open"))
+      if (args.ideaId !== undefined && (kind !== "message" || !Number.isSafeInteger(args.ideaId)))
         return refuse("idea_not_open", args);
               if (args.answersQuestion !== undefined && (typeof args.answersQuestion !== "string" ||
           !questionIdentityPattern.test(args.answersQuestion) || (args.source !== "web" && args.source !== "telegram") || args.answersTurn !== undefined || kind === "message")) {
@@ -400,12 +400,13 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       if (args.expectedTurn !== undefined && args.expectedTurn !== dto.turnSeq) return refuse("stale_turn", args, text, listener);
       if (args.answersTurn !== undefined && args.answersTurn !== dto.turnSeq) return refuse("stale_turn", args, text, listener);
       if (args.answersTurn !== undefined && dto.status !== "your_turn") return refuse("not_deliverable", args, text, listener);
-      if (args.source !== "autopilot") cancelled(db.cancelReplies({ key: args.key, source: "autopilot", reason: "owner_replied" }, now()), dto);
       const ts = now();
       const prepared = audit.prepare({ ts, sessionKey: args.key, source: args.source, actor: args.actor, listener, text });
-      const reply = db.enqueueReply(args.key, text, args.source, args.actor, args.answersTurn, ts, kind === "message" ? messageTtl : ttlMs, prepared, kind, args.ideaId,
-        args.answersQuestion);
-      if (args.ideaId !== undefined) db.markIdeaSent(args.ideaId, args.key, reply.id, ts);
+      const reply = args.ideaId === undefined
+        ? db.enqueueReply(args.key, text, args.source, args.actor, args.answersTurn, ts, kind === "message" ? messageTtl : ttlMs, prepared, kind, undefined, args.answersQuestion)
+        : db.enqueueReply(args.key, text, args.source, args.actor, args.answersTurn, ts, kind === "message" ? messageTtl : ttlMs, prepared, kind, args.ideaId, args.answersQuestion);
+      if (!reply) return refuse("idea_not_open", args, text, listener);
+      if (args.source !== "autopilot") cancelled(db.cancelReplies({ key: args.key, source: "autopilot", reason: "owner_replied" }, ts), dto);
       onQueued?.(reply);
       tryDispatch(args.key);
       return { ok: true, replyId: reply.id };

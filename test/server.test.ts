@@ -188,22 +188,28 @@ describe("sessions and timeline API", () => {
     for (let index = 1; index <= 7; index++) {
       app.db.applyEvent({ ...event, text: `synthetic history response ${index}` });
     }
+    app.db.sqlite.query("UPDATE responses SET ts=? WHERE session_key=?").run(event.ts, key);
     app.db.applyEvent({ ...event, sessionId: "synthetic-other-session", text: "response from another session" });
 
     const route = `/api/sessions/${encodeURIComponent(key)}/responses`;
     const all: ResponsePage["responses"] = [];
-    let before: number | undefined, hasMore = true;
+    let before: { ts: number; id: number } | undefined, hasMore = true;
     while (hasMore) {
-      const page = await (await fetch(`${base}${route}?limit=2${before === undefined ? "" : `&before=${before}`}`)).json() as ResponsePage;
+      const cursor = before === undefined ? "" : `&before=${before.ts}&beforeId=${before.id}`;
+      const page = await (await fetch(`${base}${route}?limit=2${cursor}`)).json() as ResponsePage;
       expect(page.responses.length).toBeLessThanOrEqual(2);
       all.push(...page.responses);
       hasMore = page.hasMore;
-      if (hasMore) before = page.responses.at(-1).ts;
+      if (hasMore) {
+        const last = page.responses.at(-1)!;
+        before = { ts: last.ts, id: last.id };
+      }
     }
     expect(all.map(response => response.text)).toEqual(Array.from({ length: 7 }, (_, index) =>
       `synthetic history response ${7 - index}`));
     expect(all.every(response => response.sessionKey === key)).toBe(true);
-    expect(new Set(all.map(response => response.ts)).size).toBe(7);
+    expect(new Set(all.map(response => response.ts)).size).toBe(1);
+    expect(new Set(all.map(response => response.id)).size).toBe(7);
     expect(all.every(response => response.seen === false)).toBe(true);
     expect(app.db.getSession(key)?.unreadCount).toBe(7);
 
@@ -214,7 +220,12 @@ describe("sessions and timeline API", () => {
 
   test("session response history rejects invalid cursors and pagination but reads headless and ended sessions", async () => {
     const route = `/api/sessions/${encodeURIComponent(key)}/responses`;
-    for (const query of ["before=not-a-timestamp", "before=1.5", "limit=0", "limit=-1", "limit=1.5", "limit=101"]) {
+    for (const query of [
+      "before=not-a-timestamp", "before=1.5", "before=1", "beforeId=1",
+      "before=1&beforeId=0", "before=1&beforeId=1.5", "before=1&beforeId=9007199254740992",
+      "before=1&beforeId=1&beforeId=2", "before=1&before=2&beforeId=1",
+      "limit=0", "limit=-1", "limit=1.5", "limit=101",
+    ]) {
       const response = await fetch(`${base}${route}?${query}`);
       expect(response.status).toBe(400);
     }
@@ -318,7 +329,7 @@ describe("output search API", () => {
     expect(await getJson(`/api/search?${new URLSearchParams({ q: "   " })}`)).toEqual({ results: [], nextCursor: null });
     const invalid = [
       "limit=0", "limit=101", "limit=1.5", "harness=codex", "headless=true", "ended=",
-      "cursor=not-a-cursor", "q=x&q=y", "unknown=value",
+      "cursor=not-a-cursor", "q=x&q=y", "cwd=x&cwd=y", "repositoryHost=x&repositoryHost=y", "unknown=value",
     ];
     for (const query of invalid) expect((await fetch(`${base}/api/search?${query}`)).status).toBe(400);
     expect((await fetch(`${base}/api/search?${new URLSearchParams({ q: "x".repeat(257) })}`)).status).toBe(400);
@@ -354,6 +365,35 @@ describe("output search API", () => {
     expect(identitySearch.results.map(result => [result.key, result.match])).toEqual([
       [owned.key, "identity"], [owned.key, "identity"],
     ]);
+  });
+
+  test("search filters by the selected repository folder on its host", async () => {
+    const selected = addResponse("folder-selected", "repository folder phrase", {
+      host: "repository-host", cwd: "/work/synthetic-repo",
+    });
+    addResponse("folder-sibling", "repository folder phrase", {
+      host: "repository-host", cwd: "/work/other-repo",
+    });
+    addResponse("folder-other-host", "repository folder phrase", {
+      host: "other-host", cwd: "/work/synthetic-repo",
+    });
+    const noFolder = addResponse("folder-unknown", "repository folder phrase", { host: "repository-host" });
+    const rootFolder = addResponse("folder-root", "repository folder phrase", { host: "repository-host", cwd: "/" });
+
+    const page = await getJson(`/api/search?${new URLSearchParams({
+      q: "repository folder phrase", repositoryHost: "repository-host", cwd: "/work/synthetic-repo/",
+    })}`) as SearchPage;
+    expect(page.results.map(result => result.key)).toEqual([selected.key]);
+
+    const unknownPage = await getJson(`/api/search?${new URLSearchParams({
+      q: "repository folder phrase", repositoryHost: "repository-host", cwd: "",
+    })}`) as SearchPage;
+    expect(unknownPage.results.map(result => result.key)).toEqual([noFolder.key]);
+
+    const rootPage = await getJson(`/api/search?${new URLSearchParams({
+      q: "repository folder phrase", repositoryHost: "repository-host", cwd: "/",
+    })}`) as SearchPage;
+    expect(rootPage.results.map(result => result.key)).toEqual([rootFolder.key]);
   });
 
   test("headless and ended switches include exactly their hidden session classes", async () => {
@@ -922,6 +962,7 @@ describe("project rules API", () => {
 
   test("is hidden when disabled; enabled saves and previews rules and broadcasts refreshed projects", async () => {
     await ingest(payload("SessionStart"));
+    expect((await getJson("/api/telegram")).topicsEnabled).toBe(false);
     expect((await getJson("/api/sessions")).sessions[0].project).toBe("project");
     expect((await fetch(`${base}/api/projects/rules`)).status).toBe(404);
     for (const [path, body] of [["/api/projects/rules", { rules: [] }], ["/api/projects/preview", { cwd: "/tmp/example" }]] as const) {
@@ -931,6 +972,7 @@ describe("project rules API", () => {
     }
 
     enableTopics();
+    expect((await getJson("/api/telegram")).topicsEnabled).toBe(true);
     await ingest(payload("SessionStart", { cwd: "/projects/alpha/build" }));
     expect((await getJson("/api/sessions")).sessions[0].project).toBe("alpha");
 

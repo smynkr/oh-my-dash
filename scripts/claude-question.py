@@ -112,13 +112,14 @@ def run():
         "X-Dash-Entrypoint": "cli",
     }
     opener = build_opener(NoRedirect)
-    registered = False
+    registration_attempted = False
     previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
     signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
     try:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
+        registration_attempted = True
         status, _ = request_json(opener, base.rstrip("/") + "/question/register", "POST", headers, {
             "sessionId": session,
             "toolUseId": tool_use_id,
@@ -128,7 +129,6 @@ def run():
         }, min(5, remaining))
         if status != 201:
             return
-        registered = True
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -162,14 +162,14 @@ def run():
                 },
             }, ensure_ascii=False, separators=(",", ":")) + "\n")
             sys.stdout.flush()
-            registered = False
+            registration_attempted = False
             return
     except (OSError, URLError, TimeoutError, ValueError):
         return
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         try:
-            if registered:
+            if registration_attempted:
                 # Cancellation has its own absolute bound, including a slow response body.
                 signal.setitimer(signal.ITIMER_REAL, 2)
                 cancel(opener, base, headers, session, tool_use_id, question_id)

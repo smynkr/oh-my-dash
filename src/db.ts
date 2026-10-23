@@ -55,7 +55,7 @@ export interface SearchResult {
 }
 export interface SearchPage { results: SearchResult[]; nextCursor: string | null }
 export interface SearchOptions {
-  q: string; limit: number; cursor?: string; host?: string; project?: string; account?: string;
+  q: string; limit: number; cursor?: string; host?: string; project?: string; cwd?: string; repositoryHost?: string; account?: string;
   harness?: Harness; headless?: boolean; ended?: boolean;
 }
 export interface SourceReportRecord { host: string; lastReportAt: number | null; lastHeartbeatAt: number | null }
@@ -85,7 +85,7 @@ export type ReplyKind = "reply" | "message";
 export type DraftState = "pending" | "sent" | "idea" | "cancelled" | "expired";
 export interface TgDraft {
   id: number; chatId: string; threadId: number | null; sourceMessageId: number | null; pickerMessageId: number | null;
-  text: string; targets: string[]; ideaId: number | null; state: DraftState; replyId: number | null; createdAt: number; expiresAt: number;
+  text: string; targets: string[]; pickerHeader: string; ideaId: number | null; state: DraftState; replyId: number | null; createdAt: number; expiresAt: number;
   /** Picker rendering; bumped whenever targets change so a button from an older keyboard never maps to a new target. */
   rev: number;
 }
@@ -154,6 +154,7 @@ function cloneRules(rules: readonly ProjectRule[]): ProjectRule[] {
 }
 
 class CardIdOverflow extends Error {}
+class IdeaNotOpen extends Error {}
 
 // Picks are decimal decision indexes mapped to option indexes, both checked against the card's DecisionSet.
 function validPicks(raw: unknown, set: DecisionSet): Record<string, number> | null {
@@ -322,6 +323,7 @@ export class DashDB {
         text TEXT NOT NULL,
         targets_json TEXT NOT NULL,
         rev INTEGER NOT NULL DEFAULT 0,
+        picker_header TEXT NOT NULL DEFAULT 'Send to which session?',
         idea_id INTEGER,
         state TEXT NOT NULL CHECK (state IN ('pending','sent','idea','cancelled','expired')),
         reply_id INTEGER,
@@ -348,6 +350,7 @@ export class DashDB {
     `);
     const columns = new Set((this.sqlite.query("PRAGMA table_info(sessions)").all() as { name: string }[]).map(c => c.name));
     const replyColumns = new Set((this.sqlite.query("PRAGMA table_info(replies)").all() as { name: string }[]).map(c => c.name));
+    const draftColumns = new Set((this.sqlite.query("PRAGMA table_info(tg_drafts)").all() as { name: string }[]).map(c => c.name));
     const responseColumns = new Set((this.sqlite.query("PRAGMA table_info(responses)").all() as { name: string }[]).map(c => c.name));
     this.sqlite.transaction(() => {
       for (const [name, type] of [["session_kind", "TEXT"], ["last_hook_event_ts", "INTEGER"], ["last_liveness_status", "TEXT"], ["dead_since", "INTEGER"], ["turn_seq", "INTEGER NOT NULL DEFAULT 0"], ["account_alias", "TEXT"], ["account_alias_override", "TEXT"], ["display_name_override", "TEXT"], ["pending_question_id", "TEXT"]] as const) {
@@ -359,6 +362,7 @@ export class DashDB {
         if (!replyColumns.has(name)) this.sqlite.exec(`ALTER TABLE replies ADD COLUMN ${name} ${type}`);
       }
       this.sqlite.exec("UPDATE replies SET tg_chat_id=COALESCE((SELECT v FROM settings WHERE k='telegram.chat_id'),'') WHERE tg_msg_id IS NOT NULL AND tg_chat_id IS NULL");
+      if (!draftColumns.has("picker_header")) this.sqlite.exec("ALTER TABLE tg_drafts ADD COLUMN picker_header TEXT NOT NULL DEFAULT 'Send to which session?'");
       this.sqlite.exec("CREATE INDEX IF NOT EXISTS replies_session_source_state ON replies(session_key,source,state,id)");
       for (const [name, type] of [["decisions_json", "TEXT"], ["decision_state", "TEXT NOT NULL DEFAULT 'skipped'"], ["turn_seq", "INTEGER"]] as const) {
         if (!responseColumns.has(name)) this.sqlite.exec(`ALTER TABLE responses ADD COLUMN ${name} ${type}`);
@@ -469,17 +473,38 @@ export class DashDB {
       goalId:context.goalId ?? null, rule:context.rule ?? null };
   }
   enqueueReply(key: string, text: string, source: ReplySource, actor: string, answersTurn: number | undefined,
-    now: number, ttlMs: number, auditContext?: PreparedAuditContext, kind: ReplyKind = "reply", ideaId?: number, answersQuestion?: string): Reply {
-    return this.sqlite.transaction(() => {
-      if (auditContext && (auditContext.sessionKey !== key || auditContext.source !== source || auditContext.actor !== actor)) {
-        throw new Error("reply audit context mismatch");
-      }
-      const result = this.sqlite.query(`INSERT INTO replies(session_key,text,state,created_at,expires_at,source,actor,answers_turn,kind,idea_id,answers_question)
-        VALUES(?,?,'queued',?,?,?,?,?,?,?,?)`).run(key,text,now,now+ttlMs,source,actor,value(answersTurn),kind,value(ideaId),value(answersQuestion));
-      const id = Number(result.lastInsertRowid);
-      if (auditContext) this.insertAuditRow(this.auditEntryFromContext(auditContext,id));
-      return this.getReply(id)!;
-    })();
+    now: number, ttlMs: number, auditContext?: PreparedAuditContext, kind?: ReplyKind, ideaId?: undefined, answersQuestion?: string): Reply;
+  enqueueReply(key: string, text: string, source: ReplySource, actor: string, answersTurn: number | undefined,
+    now: number, ttlMs: number, auditContext: PreparedAuditContext | undefined, kind: ReplyKind, ideaId: number,
+    answersQuestion?: string): Reply | undefined;
+  enqueueReply(key: string, text: string, source: ReplySource, actor: string, answersTurn: number | undefined,
+    now: number, ttlMs: number, auditContext: PreparedAuditContext | undefined, kind: ReplyKind,
+    ideaId: number | undefined, answersQuestion?: string): Reply | undefined;
+  enqueueReply(key: string, text: string, source: ReplySource, actor: string, answersTurn: number | undefined,
+    now: number, ttlMs: number, auditContext?: PreparedAuditContext, kind: ReplyKind = "reply", ideaId?: number, answersQuestion?: string): Reply | undefined {
+    if (auditContext && (auditContext.sessionKey !== key || auditContext.source !== source || auditContext.actor !== actor)) {
+      throw new Error("reply audit context mismatch");
+    }
+    let reply: Reply | undefined;
+    try {
+      reply = this.sqlite.transaction(() => {
+        const result = this.sqlite.query(`INSERT INTO replies(session_key,text,state,created_at,expires_at,source,actor,answers_turn,kind,idea_id,answers_question)
+          VALUES(?,?,'queued',?,?,?,?,?,?,?,?)`).run(key,text,now,now+ttlMs,source,actor,value(answersTurn),kind,value(ideaId),value(answersQuestion));
+        const id = Number(result.lastInsertRowid);
+        if (ideaId !== undefined) {
+          const changed = this.sqlite.query(`UPDATE ideas SET state='sent',sent_session_key=?,sent_reply_id=?,done_at=?
+            WHERE id=? AND state='open'`).run(key,id,now,ideaId).changes;
+          if (changed !== 1) throw new IdeaNotOpen();
+        }
+        if (auditContext) this.insertAuditRow(this.auditEntryFromContext(auditContext,id));
+        return this.getReply(id)!;
+      })();
+    } catch (error) {
+      if (error instanceof IdeaNotOpen) return undefined;
+      throw error;
+    }
+    if (ideaId !== undefined) this.ideasChanged(true);
+    return reply;
   }
   getReply(id: number): Reply | undefined { return this.reply(this.sqlite.query("SELECT * FROM replies WHERE id=?").get(id) as Row | null); }
   getReplies(key: string, limit = 20): ReplyPublicDTO[] {
@@ -641,10 +666,6 @@ export class DashDB {
     return (rows as Row[]).map(row => this.ideaRow(row)!);
   }
   openIdeaCount(): number { return n((this.sqlite.query("SELECT COUNT(*) AS n FROM ideas WHERE state='open'").get() as Row).n); }
-  markIdeaSent(id: number, key: string, replyId: number, now: number): boolean {
-    return this.ideasChanged(this.sqlite.query("UPDATE ideas SET state='sent',sent_session_key=?,sent_reply_id=?,done_at=? WHERE id=? AND state='open'")
-      .run(key, replyId, now, id).changes === 1);
-  }
   archiveIdea(id: number, now: number): boolean {
     return this.ideasChanged(this.sqlite.query("UPDATE ideas SET state='archived',done_at=? WHERE id=? AND state='open'").run(now, id).changes === 1);
   }
@@ -660,14 +681,15 @@ export class DashDB {
     return { id:n(row.id), chatId:String(row.chat_id), threadId:row.thread_id == null ? null : n(row.thread_id),
       sourceMessageId:row.source_message_id == null ? null : n(row.source_message_id),
       pickerMessageId:row.picker_message_id == null ? null : n(row.picker_message_id), text:String(row.text), targets,
-      ideaId:row.idea_id == null ? null : n(row.idea_id), state:row.state as DraftState, replyId:row.reply_id == null ? null : n(row.reply_id),
+      pickerHeader:s(row.picker_header) ?? "Send to which session?", ideaId:row.idea_id == null ? null : n(row.idea_id),
+      state:row.state as DraftState, replyId:row.reply_id == null ? null : n(row.reply_id),
       createdAt:n(row.created_at), expiresAt:n(row.expires_at), rev:n(row.rev ?? 0) };
   }
-  createDraft(draft: { chatId: string; threadId?: number | null; sourceMessageId?: number | null; text: string; targets: string[]; ideaId?: number | null },
-    now: number, ttlMs = DRAFT_TTL_MS): TgDraft {
-    const id = Number(this.sqlite.query(`INSERT INTO tg_drafts(chat_id,thread_id,source_message_id,text,targets_json,idea_id,state,created_at,expires_at)
-      VALUES(?,?,?,?,?,?,'pending',?,?)`).run(draft.chatId, value(draft.threadId), value(draft.sourceMessageId), draft.text,
-      JSON.stringify(draft.targets), value(draft.ideaId), now, now + ttlMs).lastInsertRowid);
+  createDraft(draft: { chatId: string; threadId?: number | null; sourceMessageId?: number | null; text: string; targets: string[];
+    pickerHeader?: string; ideaId?: number | null }, now: number, ttlMs = DRAFT_TTL_MS): TgDraft {
+    const id = Number(this.sqlite.query(`INSERT INTO tg_drafts(chat_id,thread_id,source_message_id,text,targets_json,picker_header,idea_id,state,created_at,expires_at)
+      VALUES(?,?,?,?,?,?,?,'pending',?,?)`).run(draft.chatId, value(draft.threadId), value(draft.sourceMessageId), draft.text,
+      JSON.stringify(draft.targets), draft.pickerHeader ?? "Send to which session?", value(draft.ideaId), now, now + ttlMs).lastInsertRowid);
     return this.getDraft(id)!;
   }
   getDraft(id: number): TgDraft | undefined { return this.draftRow(this.sqlite.query("SELECT * FROM tg_drafts WHERE id=?").get(id) as Row | null); }
@@ -1305,9 +1327,9 @@ export class DashDB {
       return invocation?.state === "pending" && invocation.expiresAt > Date.now()
         ? { id, questions: invocation.questions } : undefined;
     }
-    if (row.harness !== "omp" || this.questionAnswered(key,id)) return undefined;
-    const event = this.sqlite.query("SELECT detail FROM events WHERE session_key=? AND kind='question' ORDER BY id DESC LIMIT 1")
-      .get(key) as Row | null;
+    const event = this.sqlite.query(`SELECT detail FROM events WHERE session_key=? AND kind='question'
+      AND CASE WHEN json_valid(detail) THEN json_extract(detail,'$.questionIdentity') END=?
+      ORDER BY id DESC LIMIT 1`).get(key,id) as Row | null;
     try {
       const detail: unknown = JSON.parse(String(event?.detail));
       if (!detail || typeof detail !== "object" || Array.isArray(detail) ||
@@ -1349,6 +1371,7 @@ export class DashDB {
   search(options: SearchOptions): SearchPage | null {
     const signature = createHash("sha256").update(JSON.stringify({
       q: options.q, limit: options.limit, host: options.host ?? "", project: options.project ?? null,
+      cwd: options.cwd ?? null, repositoryHost: options.repositoryHost ?? null,
       account: options.account ?? null, harness: options.harness ?? "", headless: options.headless ?? false, ended: options.ended ?? false,
     })).digest("hex");
     const boundary = options.cursor === undefined ? undefined : this.decodeSearchCursor(options.cursor, signature);
@@ -1380,6 +1403,14 @@ export class DashDB {
     const predicates = ["(response_match OR identity_match)", "(?=1 OR interactive=1)", "(?=1 OR status!='ended')"];
     const bindings: (number | string)[] = [options.q, JSON.stringify(projects), options.headless ? 1 : 0, options.ended ? 1 : 0];
 
+    if (options.repositoryHost !== undefined) { predicates.push("host=?"); bindings.push(options.repositoryHost); }
+    if (options.cwd !== undefined) {
+      if (options.cwd === "") predicates.push("(cwd IS NULL OR cwd='')");
+      else {
+        predicates.push("(cwd IS NOT NULL AND cwd!='' AND CASE WHEN rtrim(cwd,'/')='' THEN '/' ELSE rtrim(cwd,'/') END=?)");
+        bindings.push(options.cwd.replace(/\/+$/, "") || "/");
+      }
+    }
     if (options.host) { predicates.push("host=?"); bindings.push(options.host); }
     if (options.harness) { predicates.push("harness=?"); bindings.push(options.harness); }
     if (options.project !== undefined) {
@@ -1457,13 +1488,13 @@ export class DashDB {
         host, host, harness, harness, Math.min(Math.max(1,limit),500)) as Row[];
     return rows.map((r) => { const dto = this.response(r); dto.displayName ||= s(r.title) || (s(r.cwd) ? basename(String(r.cwd)) : dto.sessionId); return dto; });
   }
-  sessionResponses(key: string, limit = 50, before?: number): ResponsePage | null {
+  sessionResponses(key: string, limit = 50, before?: { ts: number; id: number }): ResponsePage | null {
     const session = this.sqlite.query("SELECT 1 FROM sessions WHERE key=?").get(key);
     if (!session) return null;
     const boundedLimit = Number.isFinite(limit) ? Math.min(Math.max(1, Math.trunc(limit)), 100) : 50;
     const rows = this.sqlite.query(`SELECT r.*,s.display_name,s.display_name_override,s.account_alias,s.account_alias_override,s.title,s.cwd,s.host,s.harness,s.session_id FROM responses r
-      JOIN sessions s ON s.key=r.session_key WHERE r.session_key=? AND (? IS NULL OR r.ts<?)
-      ORDER BY r.ts DESC,r.id DESC LIMIT ?`).all(key, value(before), value(before), boundedLimit + 1) as Row[];
+      JOIN sessions s ON s.key=r.session_key WHERE r.session_key=? AND (? IS NULL OR r.ts<? OR (r.ts=? AND r.id<?))
+      ORDER BY r.ts DESC,r.id DESC LIMIT ?`).all(key, value(before?.ts), value(before?.ts), value(before?.ts), value(before?.id), boundedLimit + 1) as Row[];
     const hasMore = rows.length > boundedLimit;
     if (hasMore) rows.pop();
     const responses = rows.map(row => {
