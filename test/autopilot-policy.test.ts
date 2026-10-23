@@ -94,15 +94,34 @@ describe("autopilot deterministic policy", () => {
     expect(matchStopAndAsk("Pay attention to the order of these steps.")).toBeUndefined();
     expect(matchStopAndAsk("Drop the result into the output directory.")).toBeUndefined();
   });
+
   test("escalates recursive deletion through Windows shells", () => {
     for (const text of [
       "powershell.exe -Command Remove-Item -Recurse -Force C:\\synthetic\\target",
       "powershell -NoProfile -Command \"Remove-Item -Force -Recurse C:\\synthetic\\target\"",
+      "Remove-Item -Recurse -Force C:\\synthetic\\target",
+      "powershell -Command \"echo start; Remove-Item -Recurse -Force C:\\synthetic\\target\"",
+      "powershell -Command ri -Recurse -Force C:\\synthetic\\target",
+      "powershell -Command Remove-Item -r -fo C:\\synthetic\\target",
+      "powershell -Command \"Remove-Item -Recurse -Confirm:$false -Force C:\\synthetic\\target\"",
+      "rd -Recurse -Force C:\\synthetic\\target",
+      "rd -Force -Recurse C:\\synthetic\\target",
+      "del -Recurse -Force C:\\synthetic\\target",
+      "del -Force -Recurse C:\\synthetic\\target",
+      "erase -Recurse -Force C:\\synthetic\\target",
+      "rmdir -Recurse -Force C:\\synthetic\\target",
+      "rm -Recurse -Force C:\\synthetic\\target",
       "cmd /c del /s /q C:\\synthetic\\target\\*",
       "cmd.exe /c del /q /s C:\\synthetic\\target\\*",
+      "cmd /c rd /s /q C:\\synthetic\\target",
     ]) expect(matchStopAndAsk(text)).toBe("rm_rf");
+    for (const text of [
+      "del",
+      "rd",
+      "The words del and rd are mentioned in this sentence.",
+      "The path C:\\synthetic\\del\\rd should remain untouched.",
+    ]) expect(matchStopAndAsk(text)).toBeUndefined();
   });
-
 
   test("matches configured stop phrases by Unicode code point count", () => {
     const phrase = "😀".repeat(100);

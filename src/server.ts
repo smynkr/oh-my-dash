@@ -828,6 +828,8 @@ export function createDashServer(options: ServerOptions = {}) {
       const settings = body as Record<string,unknown>;
       if (settings.enabled === true && !autopilotRuntimeEnabled) return json({ error:"DASH_AUTOPILOT and DASH_REPLIES must be enabled" },409);
       try {
+        const stopPhrasesChanged = Array.isArray(settings.stopPhrases) &&
+          JSON.stringify(autopilotStore.customStopPhrases()) !== JSON.stringify(settings.stopPhrases);
         if (typeof settings.enabled === "boolean") {
           if (autopilotController) autopilotController.setMasterEnabled(settings.enabled);
           else {
@@ -838,7 +840,11 @@ export function createDashServer(options: ServerOptions = {}) {
         if (typeof settings.away === "boolean") autopilotStore.setAway(settings.away);
         if (Object.hasOwn(settings,"delayMin")) autopilotStore.setDefaultDelayMin(settings.delayMin as number | null);
         if (Array.isArray(settings.stopPhrases)) autopilotStore.setCustomStopPhrases(settings.stopPhrases as string[]);
-        autopilotController?.refreshPending();
+        if (autopilotController) {
+          autopilotController.refreshPending(undefined, { invalidateAutopilotReplies: stopPhrasesChanged });
+        } else if (stopPhrasesChanged) {
+          replies?.cancelAutopilot(undefined,"stop_phrases_changed");
+        }
         return json(autopilotState());
       } catch (error) {
         reportError("autopilot settings",error);

@@ -297,6 +297,30 @@ describe("autopilot Claude dialog decisions", () => {
     expect(capped.dialogs.register(capped.request())).toMatchObject({ action: "release", reason: "delay_cap" });
   });
 
+  test("releases delayed answers after goal text or stop condition edits", () => {
+    const edits: Array<(current: AutopilotGoal) => Partial<AutopilotGoal>> = [
+      current => ({
+        goalVersionId: current.goalVersionId + 1,
+        goalText: "Owner changed the goal during the delay",
+        policyRevision: (current.policyRevision ?? 0) + 1,
+      }),
+      current => ({
+        stopCondition: "The owner changed the stop condition",
+        policyRevision: (current.policyRevision ?? 0) + 1,
+      }),
+    ];
+    for (const edit of edits) {
+      const f = fixture({ delayMin: 1 });
+      const request = f.request();
+      const held = f.dialogs.register(request);
+      expect(held).toMatchObject({ action: "hold", mode: "autopilot_delay" });
+      if (held.action !== "hold") throw new Error("Expected delayed hold");
+      f.state.activeGoal = { ...f.state.activeGoal!, ...edit(f.state.activeGoal!) };
+      f.setNow(held.answerAt!);
+      expect(f.dialogs.resolveDelayedAnswer(request)).toMatchObject({ action: "release", reason: "stale" });
+    }
+  });
+
   test("away transition cancels the delayed answer and produces owner hold", () => {
     const f = fixture({ delayMin: 1 });
     const request = f.request();
