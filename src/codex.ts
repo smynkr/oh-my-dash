@@ -447,6 +447,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     startingTurnByThread: new Map<string, TurnStartReservation>(),
     loaded: new Set<string>(),
     adapterOwnedThreads: new Set<string>(),
+    adapterOwnershipGeneration: 0,
+    adapterOwnedGenerationByThread: new Map<string, number>(),
     pollers: new Map<string, AbortController>(),
     syncing: false,
     syncAgain: false,
@@ -545,6 +547,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
 
   const appServerOwned = (profile: typeof profiles[number], threadId: string) =>
     profile.loaded.has(threadId) || profile.adapterOwnedThreads.has(threadId);
+  const markAdapterOwned = (profile: typeof profiles[number], threadId: string) => {
+    profile.adapterOwnedThreads.add(threadId);
+    profile.adapterOwnedGenerationByThread.set(threadId, ++profile.adapterOwnershipGeneration);
+  };
 
   const report = (area: string, code: string) => {
     const key = `${area}:${code}`;
@@ -687,7 +693,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           return { outcome: "failed", reason: reason === "thread_active_elsewhere" ? reason : "thread_resume_failed" };
         }
         profile.loaded.add(threadId);
-        profile.adapterOwnedThreads.add(threadId);
+        markAdapterOwned(profile, threadId);
       }
       if (starting) {
         const reservation = profile.startingTurnByThread.get(threadId);
@@ -696,7 +702,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           reservation.expiresAt = reservation.requestedAt + turnStartReservationMs;
         }
         await app.request("turn/start", { threadId, input: [{ type: "text", text: message.text! }], clientUserMessageId: `dash-${message.id}` });
-        profile.adapterOwnedThreads.add(threadId);
+        markAdapterOwned(profile, threadId);
         keepStartReservation = true;
       } else if (message.action === "turn/steer") {
         await app.request("turn/steer", { threadId, input: [{ type: "text", text: message.text! }], expectedTurnId: message.expectedTurnId!, clientUserMessageId: `dash-${message.id}` });
@@ -869,8 +875,17 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
   };
 
   const syncRaw = async (profile: typeof profiles[number], app: CodexAppServer) => {
-    profile.loaded = await listLoaded(app);
-    for (const threadId of profile.adapterOwnedThreads) if (!profile.loaded.has(threadId)) profile.adapterOwnedThreads.delete(threadId);
+    const ownershipGenerationAtStart = profile.adapterOwnershipGeneration;
+    const loadedSnapshot = await listLoaded(app);
+    profile.loaded = new Set(loadedSnapshot);
+    for (const threadId of profile.adapterOwnedThreads) {
+      const ownershipGeneration = profile.adapterOwnedGenerationByThread.get(threadId) ?? 0;
+      if (ownershipGeneration > ownershipGenerationAtStart) profile.loaded.add(threadId);
+      else if (!loadedSnapshot.has(threadId)) {
+        profile.adapterOwnedThreads.delete(threadId);
+        profile.adapterOwnedGenerationByThread.delete(threadId);
+      }
+    }
     const summaries = await listThreads(app);
     const seen = new Set<string>();
     const version = profile.version;
@@ -1014,6 +1029,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       const sessionId = profile.sessionByThread.get(threadId)!;
       profile.sessionByThread.delete(threadId);
       profile.adapterOwnedThreads.delete(threadId);
+      profile.adapterOwnedGenerationByThread.delete(threadId);
       profile.threadBySession.delete(sessionId);
       profile.metadataSignature.delete(threadId);
       profile.failedTurnReads.delete(threadId);
@@ -1101,6 +1117,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       profile.activeTurnByThread.clear();
       profile.loaded.clear();
       profile.adapterOwnedThreads.clear();
+      profile.adapterOwnedGenerationByThread.clear();
       profile.threadStatusById.clear();
       try {
         await app.start();
@@ -1125,6 +1142,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         stopPollers(profile);
         profile.loaded.clear();
         profile.adapterOwnedThreads.clear();
+        profile.adapterOwnedGenerationByThread.clear();
         profile.app = undefined;
         await publishLiveness(true);
         const code = error instanceof CodexRpcError ? `rpc_${error.code ?? "unknown"}` : processErrorCode(error);

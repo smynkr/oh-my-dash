@@ -22,6 +22,7 @@ type FakeProfile = {
   turns?: unknown[];
   turnsFile?: string;
   turnsDelayMs?: number;
+  loadedThreadsDelayMs?: number;
   turnAfterStart?: unknown;
   threadMetadataFile?: string;
   threadListMetadataFile?: string;
@@ -729,6 +730,55 @@ describe("Codex app-server adapter", () => {
     expect(events.find(event => event.kind === "session_start" && event.sessionId === session)?.codexControl)
       .toMatchObject({ source:"vscode",appServerOwned:true });
   }, 10_000);
+
+  test("ownership survives a thread/loaded/list snapshot racing with resume", async () => {
+    const home = makeHome("resume-during-sync-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "resume_during_sync_thread", turnId = "resume_during_sync_turn";
+    const turnsFile = join(home,"turns.json");
+    writeFileSync(turnsFile,"[]");
+    const { adapter, events } = startAdapter({
+      identities:[{accountAlias:"ResumeDuringSync",codeHome:home}],
+      hub,
+      fixture:{
+        profiles:{[basename(home)]:{
+          threadId,title:"Resume during sync",turnsFile,
+          turnAfterStart:activeTurn(turnId,"start during a stale loaded-list snapshot"),
+          loadedThreadsDelayMs:1_500,
+        }},
+        loadedThreads:[],
+      },
+      pollIntervalMs:250,
+      requestTimeoutMs:3_000,
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("ResumeDuringSync",threadId);
+    const target = sessionKey("codex-test-host",session);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.appServerOwned === false) && hub.waitSessions.has(session));
+    const listDeadline = Date.now() + 5_000;
+    while (readRpc(home).filter(request => request.method === "thread/loaded/list").length < 2) {
+      if (Date.now() >= listDeadline) throw new Error("second thread/loaded/list request did not start");
+      await new Promise(resolve => setTimeout(resolve,10));
+    }
+
+    hub.enqueue(session,{ id:962,target,action:"turn/start",text:"start during a stale loaded-list snapshot" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 962));
+    expect(hub.receipts.find(receipt => receipt.id === 962)).toMatchObject({ outcome:"accepted",target });
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.activeTurnId === turnId));
+    const activeSnapshot = events.find(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.activeTurnId === turnId);
+    expect(activeSnapshot?.codexControl?.appServerOwned).toBe(true);
+
+    await waitUntil(() => hub.activeWaitSessions.has(session));
+    hub.enqueue(session,{ id:963,target,action:"turn/steer",text:"steer after concurrent resume",expectedTurnId:turnId });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 963));
+    expect(hub.receipts.find(receipt => receipt.id === 963)).toMatchObject({ outcome:"accepted",target });
+    expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(1);
+    expect(readRpc(home).filter(request => request.method === "turn/steer")).toHaveLength(1);
+  }, 10_000);
+
   test("restart clears adapter ownership before steering an unowned thread", async () => {
     const home = makeHome("owned-restart-home"), hub = new FakeControlHub();
     activeHub = hub;
