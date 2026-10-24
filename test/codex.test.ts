@@ -700,6 +700,13 @@ describe("Codex app-server adapter", () => {
     await waitUntil(() => hub.receipts.some(receipt => receipt.id === 932));
     expect(hub.receipts.find(receipt => receipt.id === 932)).toMatchObject({ outcome:"accepted" });
     await waitUntil(() => events.some(event => event.kind === "response" && event.sessionId === session));
+    const completedResponse = events.find(event => event.kind === "response" && event.text === "completed answer");
+    expect(completedResponse?.responseSource).toBeUndefined();
+    const db = new DashDB(":memory:");
+    try {
+      db.applyEvent(completedResponse!);
+      expect(db.getSession(sessionKey("codex-test-host",session))?.unreadCount).toBe(1);
+    } finally { db.close(); }
 
     hub.enqueue(session,{ id:933,target,action:"turn/start",text:"start again after completion" });
     await waitUntil(() => hub.receipts.some(receipt => receipt.id === 933));

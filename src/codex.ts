@@ -811,21 +811,26 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
               if (turn.status === "inProgress") activeTurnId = turnId;
             }
             const startReservation = profile.startingTurnByThread.get(threadId);
+            let submittedTurnId: string | undefined;
             let observedStartedTurn = Boolean(activeTurnId);
-            if (!observedStartedTurn && startReservation) {
+            if (startReservation) {
               if (startReservation.baselineTurnIds) {
                 for (const turnId of turnIds) if (!startReservation.baselineTurnIds.has(turnId)) {
                   observedStartedTurn = true;
+                  submittedTurnId = turnId;
                   break;
                 }
               } else {
                 const startedAfter = startReservation.requestedAt - turnStartClockSkewMs;
                 for (const turn of turns) {
+                  const turnId = string(turn.id);
+                  if (!turnId || !threadIdPattern.test(turnId)) continue;
                   if (turn.status !== "completed" && turn.status !== "interrupted" && turn.status !== "failed") continue;
                   if (turnPrompt(turn) !== startReservation.prompt) continue;
                   const turnStartedAt = asSeconds(turn.startedAt);
                   if (turnStartedAt !== undefined && turnStartedAt >= startedAfter) {
                     observedStartedTurn = true;
+                    submittedTurnId = turnId;
                     break;
                   }
                 }
@@ -859,7 +864,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                 await emitEvent({ host: options.host, harness: "codex", sessionId, kind: "response",
                   ts: asSeconds(turn.completedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                   accountAlias: profile.identity.accountAlias, text, prompt, interactive: true,
-                  ...(previousActiveTurnId === turnId ? {} : { responseSource: "backfill" as const }),
+                  ...(previousActiveTurnId === turnId || submittedTurnId === turnId ? {} : { responseSource: "backfill" as const }),
                   codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) });
                 emittedTerminal.set(turnId, signature);
               } else if (turn.status === "interrupted" || turn.status === "failed") {
@@ -871,7 +876,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                 await emitEvent({ host: options.host, harness: "codex", sessionId, kind: "error",
                   ts: asSeconds(turn.completedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                   accountAlias: profile.identity.accountAlias, text, detail: turn.status, interactive: true,
-                  ...(previousActiveTurnId === turnId ? {} : { responseSource: "backfill" as const }),
+                  ...(previousActiveTurnId === turnId || submittedTurnId === turnId ? {} : { responseSource: "backfill" as const }),
                   codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) });
                 emittedTerminal.set(turnId, signature);
               }
