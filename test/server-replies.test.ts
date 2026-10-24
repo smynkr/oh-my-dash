@@ -299,6 +299,43 @@ test("Codex request-timeout acknowledgements persist as expired unknown receipts
     state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
   });
 });
+
+test("listed but unowned Codex threads expose turn/start only and can lease it for resume", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true);
+  const session = app!.db.applyEvent({
+    host:localHost(),harness:"codex",sessionId:"unloaded_codex_session",kind:"session_start",ts:nowMs,interactive:true,
+    codexControl:{ source:"vscode",appServerOwned:false,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null },
+  });
+  const capabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(session.key))).json();
+  expect(capabilities.actions.message).toMatchObject({ status:"supported" });
+  expect(capabilities.actions.steer).toMatchObject({ status:"unavailable",code:"codex_not_owned" });
+  expect(capabilities.actions.interrupt).toMatchObject({ status:"unavailable",code:"codex_not_owned" });
+  const submitted = await apiJson(baseUrl + apiReplyPath(session.key), { action:"turn/start",text:"Synthetic unloaded start" });
+  expect(submitted.status).toBe(202);
+  const { replyId } = await submitted.json() as { replyId:number };
+  const waitUrl = new URL("/reply/wait/codex",baseUrl);
+  waitUrl.searchParams.set("session",session.sessionId);
+  waitUrl.searchParams.set("waiter","unloadedcodexwaiter");
+  waitUrl.searchParams.set("started",String(nowMs));
+  waitUrl.searchParams.set("wait","1");
+  waitUrl.searchParams.set("commit","1");
+  const delivered = await fetch(waitUrl);
+  expect(delivered.status).toBe(200);
+  expect(await delivered.json()).toMatchObject({ id:replyId,target:session.key });
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", {
+    id:replyId,waiter:"unloadedcodexwaiter",target:session.key,
+  }),200,{ ok:true });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
+    id:replyId,waiter:"unloadedcodexwaiter",target:session.key,outcome:"accepted",
+  }),200,{ ok:true });
+  expect(app!.db.getReply(replyId)).toMatchObject({ state:"delivered",codexControlStatus:"accepted" });
+  const refusedSteer = await apiJson(baseUrl + apiReplyPath(session.key), {
+    action:"turn/steer",text:"must not steer",expectedTurnId:"unobserved_turn",
+  });
+  expect(await refusedSteer.json()).toEqual({ refused:true,reason:"codex_not_owned" });
+});
+
 test("Codex loopback control routes honor only a configured source host label", async () => {
   process.env.DASH_CODEX = "1";
   const host = "codex-profile-host";

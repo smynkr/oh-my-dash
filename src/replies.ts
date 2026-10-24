@@ -483,11 +483,12 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       }
       const dto = db.getSession(args.key);
       if (!dto) return refuseCodex("session_not_found", args, auditText, listener);
-      const refusal = messageRefusalReason(dto, enabled, codexEnabled);
+      const refusal = messageRefusalReason(dto, enabled, codexEnabled, args.action);
       if (refusal) return refuseCodex(refusal, args, auditText, listener);
       if (dto.harness !== "codex") return refuseCodex("invalid_key", args, auditText, listener);
       const control = dto.codexControl;
-      if (!control?.appServerOwned || control.source !== "appServer") return refuseCodex("codex_not_owned", args, auditText, listener);
+      if (!control || !control.appServerOwned && args.action !== "turn/start")
+        return refuseCodex("codex_not_owned", args, auditText, listener);
       const supported = args.action === "turn/start" ? control.turnStart :
         args.action === "turn/steer" ? control.turnSteer : control.turnInterrupt;
       if (!supported) return refuseCodex("unsupported_control", args, auditText, listener);

@@ -4,9 +4,11 @@ import { createInterface } from "node:readline";
 
 type Profile = {
   threadId?: string;
+  threadIds?: string[];
   title?: string;
   cwd?: string;
   turns?: unknown[];
+  turnsByThread?: Record<string, unknown[]>;
   turnsFile?: string;
   turnsDelayMs?: number;
   turnAfterStart?: unknown;
@@ -35,24 +37,29 @@ if (!codeHome) throw new Error("fake app-server requires a test CODEX_HOME");
 const config = JSON.parse(process.argv[2] ?? "{}") as FixtureConfig;
 const profile = config.profiles?.[basename(codeHome)] ?? {};
 const threadId = profile.threadId ?? "fake_thread";
+const threadIds = profile.threadIds ?? [threadId];
 const thread = {
   id: threadId,
   name: profile.title ?? `Fake ${basename(codeHome)}`,
   cwd: profile.cwd ?? `/tmp/${basename(codeHome)}`,
-  source: "appServer",
+  source: "vscode",
   status: { type: "active" },
   updatedAt: 1_800_000_000,
 };
+const loadedThreads = new Set(config.loadedThreads ?? [threadId]);
 const failAfterInitialSync = new Set(config.failAfterInitialSync ?? []);
 const failOnceMethods = new Set(config.failOnceMethods ?? []);
 const unsupportedOnceMethods = new Set(config.unsupportedOnceMethods ?? []);
 let initialSyncComplete = false;
-function currentThread(kind: "list" | "read" = "list"): Record<string, unknown> {
+function currentThread(kind: "list" | "read" = "list", id = threadId): Record<string, unknown> {
+  const index = Math.max(0, threadIds.indexOf(id));
+  const base = { ...thread, id, updatedAt: thread.updatedAt + index,
+    ...(index ? { name: `${thread.name} ${index}` } : {}) };
   const path = kind === "list"
     ? profile.threadListMetadataFile ?? profile.threadMetadataFile
     : profile.threadReadMetadataFile ?? profile.threadMetadataFile;
-  if (!path || !existsSync(path)) return thread;
-  return { ...thread, ...(JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>) };
+  if (!path || !existsSync(path)) return base;
+  return { ...base, ...(JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>) };
 }
 const rpcLogPath = join(codeHome, "fake-app-server-rpc.jsonl");
 const launchCountPath = join(codeHome, "fake-app-server-launches");
@@ -101,17 +108,22 @@ lines.on("line", line => {
       }
       return;
     case "thread/list":
-      result = { data: params.archived === true ? [] : [currentThread("list")] };
+      result = { data: params.archived === true ? [] : threadIds.map(id => currentThread("list", id)) };
       break;
     case "thread/loaded/list":
-      initialSyncComplete = true;
-      result = { data: config.loadedThreads ?? [threadId] };
+      result = { data: [...loadedThreads] };
       break;
     case "thread/read":
-      result = { thread: currentThread("read") };
+      result = { thread: currentThread("read", typeof params.threadId === "string" ? params.threadId : threadId) };
+      break;
+    case "thread/resume":
+      loadedThreads.add(typeof params.threadId === "string" ? params.threadId : threadId);
+      result = { thread: currentThread("read", typeof params.threadId === "string" ? params.threadId : threadId) };
       break;
     case "thread/turns/list":
-      result = { data: profile.turnsFile ? JSON.parse(readFileSync(profile.turnsFile, "utf8")) : profile.turns ?? [] };
+      result = { data: profile.turnsFile ? JSON.parse(readFileSync(profile.turnsFile, "utf8")) :
+        profile.turnsByThread?.[String(params.threadId)] ?? profile.turns ?? [] };
+      initialSyncComplete = true;
       if (profile.turnsDelayMs) {
         setTimeout(() => respond({ id, result }), profile.turnsDelayMs);
         return;

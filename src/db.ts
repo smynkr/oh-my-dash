@@ -608,14 +608,16 @@ export class DashDB {
     commitCapable = false): ReplyTakeResult {
     return this.sqlite.transaction(() => {
       const row = this.sqlite.query(`SELECT r.*,s.turn_seq,s.status AS session_status,s.needs_reason,s.pending_question_id,s.harness AS session_harness,
-        s.codex_source,s.codex_app_server_owned,s.codex_active_turn_id
+        s.codex_app_server_owned,s.codex_turn_start,s.codex_active_turn_id
         FROM replies r JOIN sessions s ON s.key=r.session_key WHERE r.id=? AND r.session_key=?`).get(id,key) as Row | null;
       if (!row || row.state !== "queued" || n(row.expires_at) <= now) return { kind:"unavailable" } as const;
       if (mode === "codex") {
         const action = row.codex_action;
         const activeTurnId = s(row.codex_active_turn_id);
         const expectedTurnId = s(row.codex_expected_turn_id);
-        if (String(row.session_harness) !== "codex" || row.codex_source !== "appServer" || !bool(row.codex_app_server_owned) ||
+        const owned = bool(row.codex_app_server_owned);
+        const resumableStart = action === "turn/start" && bool(row.codex_turn_start);
+        if (String(row.session_harness) !== "codex" || !owned && !resumableStart ||
             row.source !== "web" || !commitCapable || waiterId === undefined ||
             action !== "turn/start" && action !== "turn/steer" && action !== "turn/interrupt") return { kind:"not_ready" } as const;
         if (action === "turn/start" ? activeTurnId !== undefined : !expectedTurnId || expectedTurnId !== activeTurnId) {
@@ -638,7 +640,8 @@ export class DashDB {
         : mode === "omp"
           ? String(row.session_harness) === "omp" && (bound ? status === "your_turn" :
             status === "working" || status === "your_turn" || status === "needs_input" && ["question","waiting"].includes(String(row.needs_reason)))
-          : String(row.session_harness) === "codex" && row.codex_source === "appServer" && bool(row.codex_app_server_owned) && status !== "ended";
+          : String(row.session_harness) === "codex" && String(row.session_status) !== "ended" &&
+            (bool(row.codex_app_server_owned) || row.codex_action === "turn/start" && bool(row.codex_turn_start));
       if (!deliverable || mode === "omp" && waiterId !== undefined && !commitCapable && row.source === "autopilot")
         return { kind:"not_ready" } as const;
       if (row.source === "autopilot" && this.autopilotReplyRateLimitReached(id,now)) return { kind:"not_ready" } as const;
@@ -703,7 +706,7 @@ export class DashDB {
   commitCodex(id: number, now: number): ReplyCommitResult {
     return this.sqlite.transaction(() => {
       const row = this.sqlite.query(`SELECT r.*,s.turn_seq,s.status AS session_status,s.harness AS session_harness,
-        s.codex_source,s.codex_app_server_owned,s.codex_active_turn_id
+        s.codex_app_server_owned,s.codex_turn_start,s.codex_active_turn_id
         FROM replies r JOIN sessions s ON s.key=r.session_key WHERE r.id=?`).get(id) as Row | null;
       if (!row) return { ok:false,reason:"not_found" } as const;
       if (row.state !== "leased" || row.lease_until == null || n(row.lease_until) <= now) return { ok:false,reason:"not_leased" } as const;
@@ -714,7 +717,8 @@ export class DashDB {
       const stale = action === "turn/start" ? activeTurnId !== undefined :
         action === "turn/steer" || action === "turn/interrupt" ? !expectedTurnId || expectedTurnId !== activeTurnId : true;
       const deliverable = String(row.session_harness) === "codex" && row.source === "web" &&
-        row.codex_source === "appServer" && bool(row.codex_app_server_owned) && String(row.session_status) !== "ended";
+        (bool(row.codex_app_server_owned) || action === "turn/start" && bool(row.codex_turn_start)) &&
+        String(row.session_status) !== "ended";
       if (row.committed_at != null) return !stale && deliverable ? { ok:true } as const : { ok:false,reason:"not_ready" } as const;
       if (stale) return { ok:false,reason:"stale",reply:this.finishReply(row,"cancelled",now,"stale_turn") } as const;
       if (!deliverable) {
