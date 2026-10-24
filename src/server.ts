@@ -142,6 +142,9 @@ export function createDashServer(options: ServerOptions = {}) {
   const topicsEnabled = process.env.DASH_TG_TOPICS === "1";
   const decisionsEnabled = process.env.DASH_REPLIES === "1";
   const codexEnabled = process.env.DASH_CODEX === "1";
+  const codexLoopbackHostLabels = new Set([localHost()]);
+  const configuredCodexHost = process.env.DASH_HOST?.trim();
+  if (configuredCodexHost && hostLabel(configuredCodexHost)) codexLoopbackHostLabels.add(configuredCodexHost);
   const judgeEnabled = decisionsEnabled && process.env.DASH_JUDGE === "1";
   const dataDir = options.dataPath && options.dataPath !== ":memory:" ? dirname(resolve(options.dataPath)) : resolve(process.env.DASH_DATA ?? join(root,"data"));
   const db = new DashDB(options.dataPath ?? join(dataDir, "dash.sqlite"), { topicsEnabled, decisionsEnabled, judgeEnabled });
@@ -686,14 +689,16 @@ export function createDashServer(options: ServerOptions = {}) {
           (path.endsWith("codex") && (!codexEnabled || rawCommit !== "1"))) return json({ error: "bad request" }, 400);
         const label = request.headers.get("X-Dash-Host");
         const harness = path.endsWith("claude") ? "claude" : path.endsWith("codex") ? "codex" : "omp";
+        const host = listener === "loopback" && harness !== "codex" ? localHost() : label ?? localHost();
+        const key = `${host}|${harness}|${session}`;
+        const targetSessionHost = harness === "codex" ? db.getSession(key)?.host : undefined;
         const loopbackHostAllowed = harness === "codex"
-          ? label === null || hostLabel(label)
+          ? label === null || (hostLabel(label) &&
+            codexLoopbackHostLabels.has(label) && targetSessionHost === label)
           : label === null || label === localHost();
         if (listener === "loopback" ? !loopbackHostAllowed :
           (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer))))
           return json({ error: "forbidden" }, 403);
-        const host = listener === "loopback" && harness !== "codex" ? localHost() : label ?? localHost();
-        const key = `${host}|${harness}|${session}`;
         disableTimeout();
         const result = harness === "claude"
           ? await replies.waitClaude(key, waiter, Number(rawStarted), waitSec * 1000, request.signal)
@@ -701,6 +706,9 @@ export function createDashServer(options: ServerOptions = {}) {
             ? await replies.waitCodex(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, listener === "loopback" ? "loopback" : peer)
             : await replies.waitOmp(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, rawCommit === "1", listener === "loopback" ? "loopback" : peer);
         if (result.status !== 200) return new Response(null, { status: result.status, headers: headers() });
+        if (harness === "codex" &&
+            (typeof result.reply !== "object" || result.reply === null || result.reply.target !== key))
+          return json({ error: "forbidden" }, 403);
         return harness === "claude"
           ? new Response(result.reply as string, { headers: headers({ "Content-Type": "text/plain; charset=utf-8" }) })
           : json(result.reply);
@@ -721,8 +729,10 @@ export function createDashServer(options: ServerOptions = {}) {
         const label = request.headers.get("X-Dash-Host");
         const replyHostLabel = label ?? localHost();
         const replyHostMatches = !!reply && hostLabel(replyHostLabel) && reply.sessionKey.startsWith(`${replyHostLabel}|`);
+        const codexLoopbackHostAllowed = label === null ||
+          (hostLabel(label) && codexLoopbackHostLabels.has(label));
         if (listener === "loopback"
-          ? (codexControl ? !replyHostMatches : label !== null && label !== localHost())
+          ? (codexControl ? (!codexLoopbackHostAllowed || !replyHostMatches) : label !== null && label !== localHost())
           : (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)) ||
             (reply && !reply.sessionKey.startsWith(`${label}|`)))) return json({ error: "forbidden" }, 403);
         const leasePeer = listener === "loopback" ? "loopback" : peer;

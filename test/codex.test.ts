@@ -386,20 +386,68 @@ describe("Codex app-server adapter", () => {
       host: "codex-test-host", harness: "codex", sessionId: betaSession, cwd: "/fake/beta", name: "Beta history", detail: "busy",
     }));
   }, 10_000);
-  test("remote Codex events carry a stable idempotency key", async () => {
+  test("remote Codex turn events carry a stable idempotency key", async () => {
     const home = makeHome("event-id-home"), hub = new FakeControlHub();
     activeHub = hub;
-    const threadId = "event_id_thread", session = sessionIdFor("EventId",threadId);
+    const threadId = "event_id_thread", turnId = "event_id_turn";
+    const session = sessionIdFor("EventId",threadId);
     const { adapter } = startAdapter({
       identities:[{accountAlias:"EventId",codeHome:home}],
-      fixture:{profiles:{[basename(home)]:{threadId,title:"Event identity"}}},
+      fixture:{profiles:{[basename(home)]:{threadId,title:"Event identity",
+        turns:[completedTurn(turnId,"stable prompt","stable output")]}}},
       hub,
     });
     await adapter.waitForReady(5_000);
-    await waitUntil(() => hub.codexIngests.some(item => item.event.sessionId === session));
-    const forwarded = hub.codexIngests.find(item => item.event.sessionId === session)!;
+    await waitUntil(() => hub.codexIngests.some(item => item.event.sessionId === session && item.event.kind === "response"));
+    const forwarded = hub.codexIngests.find(item => item.event.sessionId === session && item.event.kind === "response")!;
     expect(forwarded.eventId).toMatch(/^[0-9a-f]{64}$/);
-    expect(forwarded.eventId).toBe(createHash("sha256").update(JSON.stringify(forwarded.event)).digest("hex"));
+    expect(forwarded.eventId).toBe(createHash("sha256").update(threadId).update("\0").update(turnId).update("\0")
+      .update(JSON.stringify(forwarded.event)).digest("hex"));
+  }, 10_000);
+  test("session snapshot events get unique IDs after app-server restart", async () => {
+    const home = makeHome("session-start-restart-event-id-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "session_start_restart_id_thread", session = sessionIdFor("RestartEventId",threadId);
+    const { adapter } = startAdapter({
+      identities:[{accountAlias:"RestartEventId",codeHome:home}],
+      fixture: { crashFirstLaunch:true,crashDelayMs:750,
+        profiles:{[basename(home)]:{threadId,title:"Restart snapshot"}} },
+      hub,
+    });
+    await adapter.waitForReady(5_000);
+    await waitUntil(() => hub.codexIngests.some(item => item.event.sessionId === session && item.event.kind === "session_start"));
+    const initial = hub.codexIngests.find(item => item.event.sessionId === session && item.event.kind === "session_start")!;
+    await waitUntil(() => launchCount(home) >= 2 &&
+      hub.codexIngests.filter(item => item.event.sessionId === session && item.event.kind === "session_start").length >= 2);
+    const snapshots = hub.codexIngests.filter(item => item.event.sessionId === session && item.event.kind === "session_start");
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0]?.event).toEqual(snapshots[1]?.event);
+    expect(initial.eventId).toMatch(/^[0-9a-f]{64}$/);
+    expect(snapshots[1]?.eventId).toMatch(/^[0-9a-f]{64}$/);
+    expect(snapshots[1]?.eventId).not.toBe(initial.eventId);
+  }, 10_000);
+
+  test("remote event IDs distinguish identical output from different turns", async () => {
+    const home = makeHome("distinct-turn-event-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "distinct_turn_event_thread", session = sessionIdFor("DistinctTurns", threadId);
+    const { adapter } = startAdapter({
+      identities: [{ accountAlias:"DistinctTurns",codeHome:home }],
+      fixture: { profiles: { [basename(home)]: {
+        threadId, title:"Identical turn output", turns: [
+          completedTurn("first_identical_turn", "same prompt", "same output"),
+          completedTurn("second_identical_turn", "same prompt", "same output"),
+        ],
+      } } },
+      hub,
+    });
+    await adapter.waitForReady(5_000);
+    await waitUntil(() => hub.codexIngests.filter(item => item.event.sessionId === session && item.event.kind === "response").length === 2);
+    const responses = hub.codexIngests.filter(item => item.event.sessionId === session && item.event.kind === "response");
+    expect(responses.map(item => item.event)).toHaveLength(2);
+    expect(responses[0]?.event).toMatchObject({ ts:1_800_000_003_000,text:"same output",prompt:"same prompt" });
+    expect(responses[1]?.event).toMatchObject({ ts:1_800_000_003_000,text:"same output",prompt:"same prompt" });
+    expect(new Set(responses.map(item => item.eventId)).size).toBe(2);
   }, 10_000);
   test("changed history emits only new terminal turns and keeps the observed active turn", async () => {
     const home = makeHome("history-refresh-home");
@@ -673,8 +721,72 @@ describe("Codex app-server adapter", () => {
     await waitUntil(() => events.some(event => event.kind === "session_start" &&
       event.sessionId === session && event.codexControl?.activeTurnId === turnId));
     expect(hub.receipts.find(receipt => receipt.id === 930)).toMatchObject({ outcome:"accepted" });
-    expect(hub.receipts.find(receipt => receipt.id === 931)).toMatchObject({ outcome:"failed",reason:"turn_active" });
+    expect(hub.receipts.find(receipt => receipt.id === 931)).toMatchObject({ outcome:"failed",reason:"turn_start_pending" });
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
+  test("keeps a start reservation when an unrelated turn starts and completes", async () => {
+    const home = makeHome("unrelated-start-reservation-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "unrelated_start_reservation_thread", turnId = "unrelated_reservation_turn";
+    const turnsFile = join(home, "turns.json");
+    writeFileSync(turnsFile, "[]");
+    const { adapter, events } = startAdapter({
+      identities: [{ accountAlias:"UnrelatedReservation",codeHome:home }],
+      hub,
+      fixture: { profiles: { [basename(home)]: { threadId,title:"Unrelated reservation",turnsFile } } },
+      pollIntervalMs: 250,
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("UnrelatedReservation",threadId), target = sessionKey("codex-test-host",session);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session) &&
+      hub.waitSessions.has(session));
+    hub.enqueue(session,{ id:936,target,action:"turn/start",text:"reserved prompt" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 936 && receipt.outcome === "accepted"));
+
+    const unrelatedPrompt = "independent prompt";
+    writeFileSync(turnsFile, JSON.stringify([activeTurn(turnId, unrelatedPrompt)]));
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.activeTurnId === turnId));
+    writeFileSync(turnsFile, JSON.stringify([completedTurn(turnId, unrelatedPrompt, "unrelated output")]));
+    await waitUntil(() => events.some(event => event.kind === "response" && event.sessionId === session && event.text === "unrelated output") &&
+      events.some(event => event.kind === "session_start" && event.sessionId === session && event.codexControl?.activeTurnId === null));
+
+    hub.enqueue(session,{ id:937,target,action:"turn/start",text:"duplicate start after unrelated turn" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 937));
+    expect(hub.receipts.find(receipt => receipt.id === 937)).toMatchObject({
+      outcome:"failed",reason:"turn_start_pending",
+    });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
+
+  test("expired start reservations do not block a later start forever", async () => {
+    const home = makeHome("expired-start-reservation-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "expired_start_reservation_thread";
+    let currentTime = 1_800_000_000_000;
+    const { adapter, events } = startAdapter({
+      identities:[{accountAlias:"ExpiredReservation",codeHome:home}],
+      hub,
+      now:() => currentTime,
+      pollIntervalMs:250,
+      requestTimeoutMs:1_000,
+      fixture:{
+        profiles:{[basename(home)]:{threadId,title:"Expired start reservation"}},
+        timeoutMethods:["turn/start"],
+      },
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("ExpiredReservation",threadId), target = sessionKey("codex-test-host",session);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session) &&
+      hub.waitSessions.has(session));
+    hub.enqueue(session,{ id:934,target,action:"turn/start",text:"first uncertain start" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 934));
+    expect(hub.receipts.find(receipt => receipt.id === 934)).toMatchObject({ outcome:"unknown",reason:"request_timeout" });
+    currentTime += 60_001;
+    hub.enqueue(session,{ id:935,target,action:"turn/start",text:"start after reservation expiry" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 935));
+    expect(hub.receipts.find(receipt => receipt.id === 935)).toMatchObject({ outcome:"unknown",reason:"request_timeout" });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(2);
   }, 10_000);
   test("releases a start reservation after completion when its initial turns read failed", async () => {
     const home = makeHome("unknown-start-baseline-home"), hub = new FakeControlHub();
