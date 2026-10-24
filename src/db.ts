@@ -75,7 +75,7 @@ export const CARD_TTL_MS = 86_400_000;
 export type ReplyState = "queued" | "leased" | "delivered" | "expired" | "cancelled";
 export type ReplySource = "telegram" | "web" | "autopilot";
 export type ReplyAuditListener = "loopback" | "tailnet" | "telegram" | "internal";
-export type CodexControlStatus = "pending" | "accepted" | "unsupported" | "failed" | "stale" | "cancelled" | "unknown";
+export type CodexControlStatus = "pending" | "accepted" | "unsupported" | "failed" | "stale" | "cancelled" | "expired" | "unknown";
 export interface Reply {
   id: number; sessionKey: string; text: string; state: ReplyState; createdAt: number;
   expiresAt: number; leaseUntil: number | null; doneAt: number | null; tgMsgId: number | null; tgChatId: string | null;
@@ -568,7 +568,8 @@ export class DashDB {
     allowCommitted = false, receiptStatus?: CodexControlStatus, receiptReason?: string | null): Reply {
     const hasCodexControl = row.codex_action != null;
     const controlStatus = hasCodexControl ? receiptStatus ??
-      (state === "delivered" ? "accepted" : state === "cancelled" && cancelReason === "stale_turn" ? "stale" :
+      (state === "expired" ? "expired" : state === "delivered" ? "accepted" :
+        state === "cancelled" && cancelReason === "stale_turn" ? "stale" :
         state === "cancelled" && cancelReason === "owner_cancelled" ? "cancelled" : "failed") : undefined;
     const controlReason = hasCodexControl
       ? receiptReason === undefined ? cancelReason ?? (state === "expired" ? "expired" : null) : receiptReason

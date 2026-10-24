@@ -14,6 +14,8 @@ type Profile = {
 type FixtureConfig = {
   profiles?: Record<string, Profile>;
   unsupportedMethods?: string[];
+  unsupportedOnceMethods?: string[];
+  loadedThreads?: string[];
   failRequests?: string[];
   timeoutMethods?: string[];
   exitMethods?: string[];
@@ -36,6 +38,7 @@ const thread = {
   updatedAt: 1_800_000_000,
 };
 const failAfterInitialSync = new Set(config.failAfterInitialSync ?? []);
+const unsupportedOnceMethods = new Set(config.unsupportedOnceMethods ?? []);
 let initialSyncComplete = false;
 function currentThread(): Record<string, unknown> {
   if (!profile.threadMetadataFile || !existsSync(profile.threadMetadataFile)) return thread;
@@ -72,7 +75,7 @@ lines.on("line", line => {
     return;
   }
 
-  if (config.unsupportedMethods?.includes(method)) {
+  if (config.unsupportedMethods?.includes(method) || unsupportedOnceMethods.delete(method)) {
     respond({ id, error: { code: -32601, message: `Method not found: ${method}` } });
     return;
   }
@@ -92,7 +95,7 @@ lines.on("line", line => {
       break;
     case "thread/loaded/list":
       initialSyncComplete = true;
-      result = { data: [threadId] };
+      result = { data: config.loadedThreads ?? [threadId] };
       break;
     case "thread/read":
       result = { thread: currentThread() };

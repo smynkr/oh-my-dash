@@ -34,6 +34,8 @@ type RpcRecord = Record<string, unknown> & { method?: string; params?: Record<st
 type FakeServerConfig = {
   profiles: Record<string, FakeProfile>;
   unsupportedMethods?: string[];
+  unsupportedOnceMethods?: string[];
+  loadedThreads?: string[];
   failRequests?: string[];
   timeoutMethods?: string[];
   exitMethods?: string[];
@@ -426,6 +428,57 @@ describe("Codex app-server adapter", () => {
     expect(events.filter(event => event.kind === "response" && event.text === "existing output")).toHaveLength(1);
     expect(readRpc(home).filter(request => request.method === "thread/turns/list").length).toBeGreaterThanOrEqual(3);
   }, 10_000);
+  test("a completed empty-output turn refreshes the active-turn session snapshot", async () => {
+    const home = makeHome("empty-completion-home");
+    const threadId = "empty_completion_thread";
+    const turnsFile = join(home, "turns.json");
+    const threadMetadataFile = join(home, "thread.json");
+    const turnId = "empty_completion_active_turn";
+    writeFileSync(turnsFile, JSON.stringify([activeTurn(turnId, "still running")]));
+    const { adapter, events } = startAdapter({
+      identities: [{ accountAlias:"EmptyCompletion",codeHome:home }],
+      fixture: { profiles: { [basename(home)]: { threadId,title:"Empty completion",turnsFile,threadMetadataFile } } },
+      pollIntervalMs: 250,
+    });
+    await adapter.waitForReady(5_000);
+    await waitUntil(() => events.some(event => event.kind === "session_start" &&
+      event.codexControl?.activeTurnId === turnId));
+
+    writeFileSync(turnsFile, JSON.stringify([{
+      id:turnId,status:"completed",startedAt:1_800_000_001,completedAt:1_800_000_002,
+      items:[{type:"userMessage",content:[{type:"text",text:"still running"}]}],
+    }]));
+    writeFileSync(threadMetadataFile, JSON.stringify({ updatedAt:1_800_000_001 }));
+    await waitUntil(() => events.some(event => event.kind === "session_start" &&
+      event.codexControl?.activeTurnId === null && event.ts >= 1_800_000_001));
+    expect(events.filter(event => event.kind === "session_start" && event.codexControl?.activeTurnId === null))
+      .toHaveLength(1);
+    expect(events.some(event => event.kind === "response" && event.sessionId === sessionIdFor("EmptyCompletion",threadId)))
+      .toBe(false);
+  }, 10_000);
+
+  test("waitForReady resolves when one identity is ready and another remains offline", async () => {
+    const readyHome = makeHome("one-ready-home");
+    const missingHome = join(temporaryRoot,"missing-profile-home");
+    const threadId = "one_ready_thread";
+    const { adapter, events } = startAdapter({
+      identities: [
+        { accountAlias:"Ready",codeHome:readyHome },
+        { accountAlias:"Offline",codeHome:missingHome },
+      ],
+      fixture: { profiles: {
+        [basename(readyHome)]: { threadId,title:"Ready profile" },
+        [basename(missingHome)]: { threadId:"offline_thread",title:"Offline profile" },
+      } },
+      pollIntervalMs: 250,
+      retryDelayMs: 50,
+    });
+    await adapter.waitForReady(5_000);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === sessionIdFor("Ready",threadId)));
+    expect(adapter.health().enabled).toBe(true);
+    expect(adapter.health().identities[0]?.state).toBe("ready");
+    expect(adapter.health().identities[1]?.state).not.toBe("ready");
+  }, 10_000);
 
 
   test("thread-local read failures keep the identity process ready and use available summary metadata", async () => {
@@ -468,6 +521,64 @@ describe("Codex app-server adapter", () => {
     expect(hub.receipts.find(receipt => receipt.id === 905)).toMatchObject({ outcome:"unsupported",reason:"unsupported_method" });
     expect(events.find(event => event.kind === "error" && event.detail === "unsupported_method")?.codexControl?.turnStart).toBe(false);
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
+  test("a thread/resume unsupported response does not disable turn/start", async () => {
+    const home = makeHome("resume-unsupported-home");
+    const hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "resume_unsupported_thread";
+    const { adapter } = startAdapter({
+      identities: [{ accountAlias:"ResumeUnsupported",codeHome:home }],
+      hub,
+      fixture: {
+        profiles: { [basename(home)]: { threadId,title:"Resume unsupported" } },
+        loadedThreads: [],
+        unsupportedOnceMethods: ["thread/resume"],
+      },
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("ResumeUnsupported",threadId);
+    await waitUntil(() => hub.waitSessions.has(session));
+    const target = sessionKey("codex-test-host",session);
+
+    hub.enqueue(session,{ id:906,target,action:"turn/start",text:"retry after resume failure" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 906));
+    expect(hub.receipts.find(receipt => receipt.id === 906)).toMatchObject({
+      outcome:"failed",reason:"resume_unsupported",
+    });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(0);
+
+    hub.enqueue(session,{ id:907,target,action:"turn/start",text:"start after resume recovers" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 907));
+    expect(hub.receipts.find(receipt => receipt.id === 907)).toMatchObject({ outcome:"accepted" });
+    expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(2);
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
+
+  test("does not send turn/start while a Codex turn is already active", async () => {
+    const home = makeHome("active-start-guard-home");
+    const hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "active_start_guard_thread";
+    const turnId = "guarded_active_turn";
+    const { adapter, events } = startAdapter({
+      identities: [{ accountAlias:"ActiveGuard",codeHome:home }],
+      hub,
+      fixture: { profiles: { [basename(home)]: {
+        threadId,title:"Already active",turns:[activeTurn(turnId,"already running")],
+      } } },
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("ActiveGuard",threadId);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.activeTurnId === turnId) && hub.waitSessions.has(session));
+    const target = sessionKey("codex-test-host",session);
+    hub.enqueue(session,{ id:908,target,action:"turn/start",text:"do not start over active turn" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 908));
+    expect(hub.receipts.find(receipt => receipt.id === 908)).toMatchObject({
+      outcome:"failed",reason:"turn_active",
+    });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(0);
   }, 10_000);
 
   test("sends a Codex control only to its matching identity and records the accepted receipt", async () => {

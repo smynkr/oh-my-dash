@@ -928,9 +928,12 @@
       switch (reply.codexControlStatus || 'pending') {
         case 'accepted': return ['Codex accepted', `The local app-server accepted ${action} for ${identity}; execution or turn outcome is not confirmed.`];
         case 'unsupported': return ['Unsupported', `${action} is unsupported by this source or request.${reason}`];
-        case 'failed': return ['Failed', `${action} failed at the local app-server.${reason}`];
+        case 'failed': return reply.codexControlReason === 'turn_active'
+          ? ['Not sent', 'A Codex turn is already active; Dash did not send this control.']
+          : ['Failed', `${action} failed at the local app-server.${reason}`];
         case 'stale': return ['Stale turn', `${action} targeted an active turn that is no longer current.${reason}`];
         case 'cancelled': return ['Cancelled', `${action} was cancelled before an app-server receipt.${reason}`];
+        case 'expired': return ['Expired before dispatch', 'The queue deadline passed before Dash sent this Codex control; no Codex RPC was sent.'];
         case 'unknown': return ['Outcome unknown', `${action} did not receive a definitive local app-server response. It may or may not have been dispatched; Dash will not retry it automatically. Check the Codex session history before resubmitting.${reason}`];
         default: return ['Pending', `${action} is queued for ${identity}; delivery is not confirmed.`];
       }

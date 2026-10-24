@@ -201,6 +201,28 @@ test("a timed-out committed Codex control stores an expired unknown receipt", ()
     });
   } finally { db.close(); }
 });
+test("queued Codex controls that expire before dispatch keep an expired receipt", () => {
+  const db = new DashDB(":memory:");
+  const audit = createAudit(db);
+  const key = "synthetic-host|codex|queued_expiry_session";
+  const prepare = audit.prepare({
+    ts:2,sessionKey:key,source:"web",actor:"web:loopback",listener:"loopback",text:"synthetic queued control",
+  });
+  try {
+    db.applyEvent({ host:"synthetic-host",harness:"codex",sessionId:"queued_expiry_session",kind:"session_start",
+      detail:"history",ts:1,interactive:true,
+      codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null } });
+    const reply = db.enqueueCodexControl(key,"synthetic queued turn start","web","web:loopback","turn/start",undefined,
+      2,60_000,prepare);
+    const [expired] = db.expireReplies(60_002);
+    expect(expired).toMatchObject({
+      id:reply.id,state:"expired",codexControlStatus:"expired",codexControlReason:"expired",
+    });
+    expect(db.getReplies(key)[0]).toMatchObject({
+      id:reply.id,state:"expired",codexControlStatus:"expired",codexControlReason:"expired",committed:false,
+    });
+  } finally { db.close(); }
+});
 
 test("R1 cancellation includes queued and uncommitted leases but keeps committed replies", () => {
   const db = new DashDB(":memory:");

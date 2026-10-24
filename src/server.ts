@@ -685,10 +685,15 @@ export function createDashServer(options: ServerOptions = {}) {
           (rawCommit !== null && (path.endsWith("claude") || rawCommit !== "1")) ||
           (path.endsWith("codex") && (!codexEnabled || rawCommit !== "1"))) return json({ error: "bad request" }, 400);
         const label = request.headers.get("X-Dash-Host");
-        if (listener === "loopback" ? (label !== null && label !== localHost()) :
-          (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)))) return json({ error: "forbidden" }, 403);
         const harness = path.endsWith("claude") ? "claude" : path.endsWith("codex") ? "codex" : "omp";
-        const key = `${listener === "loopback" ? localHost() : label}|${harness}|${session}`;
+        const loopbackHostAllowed = harness === "codex"
+          ? label === null || hostLabel(label)
+          : label === null || label === localHost();
+        if (listener === "loopback" ? !loopbackHostAllowed :
+          (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer))))
+          return json({ error: "forbidden" }, 403);
+        const host = listener === "loopback" && harness !== "codex" ? localHost() : label ?? localHost();
+        const key = `${host}|${harness}|${session}`;
         disableTimeout();
         const result = harness === "claude"
           ? await replies.waitClaude(key, waiter, Number(rawStarted), waitSec * 1000, request.signal)
@@ -714,8 +719,11 @@ export function createDashServer(options: ServerOptions = {}) {
           (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 128))))
           return json({ error: "bad request" }, 400);
         const label = request.headers.get("X-Dash-Host");
-        if (listener === "loopback" ? (label !== null && label !== localHost()) :
-          (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)) || (reply && !reply.sessionKey.startsWith(`${label}|`)))) return json({ error: "forbidden" }, 403);
+        const replyHostMatches = !!reply && hostLabel(label) && reply.sessionKey.startsWith(`${label}|`);
+        if (listener === "loopback"
+          ? (codexControl ? !replyHostMatches : label !== null && label !== localHost())
+          : (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)) ||
+            (reply && !reply.sessionKey.startsWith(`${label}|`)))) return json({ error: "forbidden" }, 403);
         const leasePeer = listener === "loopback" ? "loopback" : peer;
         if (path === "/reply/commit") return (codexControl
           ? replies.commitCodex(Number(body.id), body.waiter, body.target as string, leasePeer)

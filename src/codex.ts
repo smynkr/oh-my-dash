@@ -155,7 +155,7 @@ export function codexIdentitiesFromEnv(env: NodeJS.ProcessEnv = process.env): Co
 }
 
 export class CodexRpcError extends Error {
-  constructor(readonly code: number | undefined, message = "Codex app-server request failed") {
+  constructor(readonly code: number | undefined, message = "Codex app-server request failed", readonly method?: string) {
     super(message.slice(0, 512));
     this.name = "CodexRpcError";
   }
@@ -293,7 +293,7 @@ class CodexAppServer {
       if (error) {
         const code = typeof error.code === "number" && Number.isInteger(error.code) ? error.code : undefined;
         const text = typeof error.message === "string" ? error.message : "Codex app-server rejected the request";
-        pending.reject(new CodexRpcError(code, text));
+        pending.reject(new CodexRpcError(code, text, pending.method));
       } else pending.resolve(message.result);
       return;
     }
@@ -544,6 +544,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     if (message.action === "turn/steer" && (!profile.features.turnSteer || !message.text?.trim())) return { outcome: "unsupported" };
     if (message.action === "turn/interrupt" && !profile.features.turnInterrupt) return { outcome: "unsupported" };
     if (message.action !== "turn/start" && (!message.expectedTurnId || profile.activeTurnByThread.get(threadId) !== message.expectedTurnId)) return { outcome: "failed" };
+    if (message.action === "turn/start" && profile.activeTurnByThread.has(threadId))
+      return { outcome: "failed", reason: "turn_active" };
     try {
       if (message.action === "turn/start" && !profile.loaded.has(threadId)) {
         await app.request("thread/resume", { threadId, excludeTurns: true });
@@ -562,14 +564,17 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         return { outcome: "unknown", reason: error.reason };
       }
       if (error instanceof CodexRpcError && error.code === -32601) {
-        if (message.action === "turn/start") profile.features.turnStart = false;
-        if (message.action === "turn/steer") profile.features.turnSteer = false;
-        if (message.action === "turn/interrupt") profile.features.turnInterrupt = false;
-        await emitEvent({ host: options.host, harness: "codex", sessionId: profile.sessionByThread.get(threadId)!,
-          kind: "error", ts: now(), interactive: true, accountAlias: profile.identity.accountAlias, responseSource: "backfill",
-          text: "The Codex app-server rejected this control method as unsupported.", detail: "unsupported_method",
-          codexControl: codexControlInfo("appServer", profile.version, profile.features, profile.activeTurnByThread.get(threadId) ?? null) });
-        return { outcome: "unsupported" };
+        if (error.method === "thread/resume") return { outcome: "failed", reason: "resume_unsupported" };
+        if (error.method === message.action) {
+          if (message.action === "turn/start") profile.features.turnStart = false;
+          if (message.action === "turn/steer") profile.features.turnSteer = false;
+          if (message.action === "turn/interrupt") profile.features.turnInterrupt = false;
+          await emitEvent({ host: options.host, harness: "codex", sessionId: profile.sessionByThread.get(threadId)!,
+            kind: "error", ts: now(), interactive: true, accountAlias: profile.identity.accountAlias, responseSource: "backfill",
+            text: "The Codex app-server rejected this control method as unsupported.", detail: "unsupported_method",
+            codexControl: codexControlInfo("appServer", profile.version, profile.features, profile.activeTurnByThread.get(threadId) ?? null) });
+          return { outcome: "unsupported" };
+        }
       }
       const reason = messageCode(error);
       report("codex control", reason);
@@ -733,15 +738,21 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         }
       }
       const meta = metadataFor(thread);
-      const sourceControl = codexControlInfo(meta.source, version, profile.features, profile.activeTurnByThread.get(threadId) ?? null);
-      const snapshot = JSON.stringify([meta.signature, sourceControl]);
-      if (previousSignature !== summaryMeta.signature || profile.controlSignature.get(threadId) !== snapshot) {
-        profile.metadataSignature.set(threadId, summaryMeta.signature);
-        profile.controlSignature.set(threadId, snapshot);
-        await emitEvent({ host: options.host, harness: "codex", sessionId, kind: "session_start", ts: meta.updatedAt,
-          cwd: meta.cwd, title: meta.title, accountAlias: profile.identity.accountAlias, detail: "history", interactive: true,
-          codexControl: sourceControl });
-      }
+      let sessionStartChecked = false;
+      const emitSessionStart = async () => {
+        sessionStartChecked = true;
+        const sourceControl = codexControlInfo(meta.source, version, profile.features, profile.activeTurnByThread.get(threadId) ?? null);
+        const snapshot = JSON.stringify([meta.signature, sourceControl]);
+        const metadataChanged = previousSignature !== summaryMeta.signature;
+        if (metadataChanged || profile.controlSignature.get(threadId) !== snapshot) {
+          profile.metadataSignature.set(threadId, summaryMeta.signature);
+          profile.controlSignature.set(threadId, snapshot);
+          await emitEvent({ host: options.host, harness: "codex", sessionId, kind: "session_start",
+            ts: metadataChanged ? meta.updatedAt : now(),
+            cwd: meta.cwd, title: meta.title, accountAlias: profile.identity.accountAlias, detail: "history", interactive: true,
+            codexControl: sourceControl });
+        }
+      };
       if (previousSignature !== summaryMeta.signature || !profile.turnSignature.has(threadId) ||
           profile.activeTurnByThread.has(threadId) || profile.failedTurnReads.has(threadId)) {
         let turns: Record<string, unknown>[] | undefined;
@@ -767,6 +778,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
             }
             if (activeTurnId) profile.activeTurnByThread.set(threadId, activeTurnId);
             else profile.activeTurnByThread.delete(threadId);
+            await emitSessionStart();
             let emittedTerminal = profile.emittedTerminalSignatureByThread.get(threadId);
             if (!emittedTerminal) profile.emittedTerminalSignatureByThread.set(threadId, emittedTerminal = new Map());
             for (const turnId of emittedTerminal.keys()) if (!turnIds.has(turnId)) emittedTerminal.delete(turnId);
@@ -810,6 +822,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           }
         }
       }
+      if (!sessionStartChecked) await emitSessionStart();
       profile.threadStatusById.set(threadId, threadStatus(thread));
       profile.threadBySessionMetadata.set(sessionId, { source: meta.source, title: meta.title, cwd: meta.cwd });
     }
@@ -955,7 +968,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     async waitForReady(timeoutMs = 15_000) {
       const expiresAt = Date.now() + timeoutMs;
       while (!closed && Date.now() < expiresAt) {
-        if (profiles.every(profile => profile.state === "ready")) return;
+        if (profiles.some(profile => profile.state === "ready")) return;
         const { promise, resolve } = Promise.withResolvers<void>();
         setTimeout(resolve, 20);
         await promise;

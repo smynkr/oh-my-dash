@@ -297,6 +297,41 @@ test("Codex request-timeout acknowledgements persist as expired unknown receipts
     state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
   });
 });
+test("Codex loopback control routes honor a configured source host label", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true), host = "codex-profile-host";
+  const session = app!.db.applyEvent({
+    host,harness:"codex",sessionId:"custom_host_session",kind:"session_start",ts:nowMs,interactive:true,
+    codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null },
+  });
+  const submitted = await apiJson(baseUrl + apiReplyPath(session.key), {
+    action:"turn/start",text:"Synthetic custom-host control",
+  });
+  expect(submitted.status).toBe(202);
+  const { replyId } = await submitted.json() as { replyId:number };
+  const waiterId = "codexhostwaiter01";
+  const waitUrl = new URL("/reply/wait/codex",baseUrl);
+  waitUrl.searchParams.set("session",session.sessionId);
+  waitUrl.searchParams.set("waiter",waiterId);
+  waitUrl.searchParams.set("started",String(nowMs));
+  waitUrl.searchParams.set("wait","1");
+  waitUrl.searchParams.set("commit","1");
+  const headers = { "X-Dash-Host":host };
+  const delivered = await fetch(waitUrl,{ headers });
+  expect(delivered.status).toBe(200);
+  expect(await delivered.json()).toMatchObject({ id:replyId,target:session.key });
+
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", {
+    id:replyId,waiter:waiterId,target:session.key,
+  },{ "X-Dash-Host":"other-codex-host" }),403,{ error:"forbidden" });
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", {
+    id:replyId,waiter:waiterId,target:session.key,
+  },headers),200,{ ok:true });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
+    id:replyId,waiter:waiterId,target:session.key,outcome:"accepted",
+  },headers),200,{ ok:true });
+  expect(app!.db.getReply(replyId)).toMatchObject({ state:"delivered",codexControlStatus:"accepted" });
+});
 
 test("submission snapshot guards reject malformed versions without queueing text", async () => {
   const baseUrl = setup(true), session = seed("omp");
