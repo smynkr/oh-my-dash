@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, basename } from "node:path";
-import type { AskQuestion, NormalizedEvent, Harness, PendingQuestion } from "./normalize.ts";
+import type { AskQuestion, NormalizedEvent, Harness, PendingQuestion, CodexAction, CodexControlInfo } from "./normalize.ts";
 import { clip, describePrompt, sessionKey, normalizeQuestions } from "./normalize.ts";
 import { reduceLiveness, reduceState, type SessionState, type Status } from "./state.ts";
 import type { BackfillSession } from "./backfill.ts";
@@ -33,6 +33,7 @@ export interface SessionDTO {
   interactive: boolean; alive: boolean; pid?: number; transcriptPath?: string; createdAt: number;
   lastActivity: number; unreadCount: number; lastResponses: ResponseDTO[]; sessionKind?: string; turnSeq: number;
   accountAlias?: string; reportedAccountAlias?: string; accountAliasOverride?: string; displayNameOverride?: string;
+  codexControl?: CodexControlInfo;
 }
 export interface ResponseDTO {
   id: number; sessionKey: string; ts: number; text: string; prompt?: string; seen: boolean; source: "hook" | "backfill";
@@ -74,11 +75,14 @@ export const CARD_TTL_MS = 86_400_000;
 export type ReplyState = "queued" | "leased" | "delivered" | "expired" | "cancelled";
 export type ReplySource = "telegram" | "web" | "autopilot";
 export type ReplyAuditListener = "loopback" | "tailnet" | "telegram" | "internal";
+export type CodexControlStatus = "pending" | "accepted" | "unsupported" | "failed" | "stale" | "cancelled" | "unknown";
 export interface Reply {
   id: number; sessionKey: string; text: string; state: ReplyState; createdAt: number;
   expiresAt: number; leaseUntil: number | null; doneAt: number | null; tgMsgId: number | null; tgChatId: string | null;
   source: ReplySource; actor: string | null; answersTurn: number | null; answersQuestion: string | null; cancelReason: string | null;
   committedAt: number | null; leaseCommit: boolean | null; kind: ReplyKind; ideaId: number | null;
+  codexAction?: CodexAction; codexExpectedTurnId?: string | null;
+  codexControlStatus?: CodexControlStatus | null; codexControlReason?: string | null;
   /** C4: set on an undelivered message's outcome to the idea it was saved to (new or reopened). */
   savedIdeaId?: number;
 }
@@ -100,6 +104,8 @@ export const DRAFT_TTL_MS = 30 * 60_000;
 export interface ReplyPublicDTO {
   id: number; state: ReplyState; source: ReplySource; createdAt: number; expiresAt: number;
   doneAt: number | null; cancelReason: string | null; answersTurn: number | null; committed: boolean;
+  codexAction?: CodexAction; codexExpectedTurnId?: string | null;
+  codexControlStatus?: CodexControlStatus | null; codexControlReason?: string | null;
 }
 export type ReplyTakeResult =
   | { kind: "taken" | "leased"; reply: Reply }
@@ -192,6 +198,8 @@ export class DashDB {
         background_pending INTEGER NOT NULL DEFAULT 0, interactive INTEGER NOT NULL DEFAULT 0,
         alive INTEGER NOT NULL DEFAULT 0, pid INTEGER, transcript_path TEXT,
         session_kind TEXT, last_hook_event_ts INTEGER, last_liveness_status TEXT, dead_since INTEGER,
+        codex_source TEXT, codex_app_server_owned INTEGER, codex_version TEXT, codex_turn_start INTEGER,
+        codex_turn_steer INTEGER, codex_turn_interrupt INTEGER, codex_active_turn_id TEXT,
         created_at INTEGER NOT NULL, last_activity INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS responses (
@@ -255,7 +263,8 @@ export class DashDB {
         done_at INTEGER,
         tg_msg_id INTEGER,
         tg_chat_id TEXT,
-        answers_question TEXT
+        answers_question TEXT,
+        codex_action TEXT, codex_expected_turn_id TEXT, codex_control_status TEXT, codex_control_reason TEXT
       );
       CREATE INDEX IF NOT EXISTS replies_session_state_id ON replies(session_key,state,id);
       CREATE TABLE IF NOT EXISTS reply_audit (
@@ -354,12 +363,14 @@ export class DashDB {
     const draftColumns = new Set((this.sqlite.query("PRAGMA table_info(tg_drafts)").all() as { name: string }[]).map(c => c.name));
     const responseColumns = new Set((this.sqlite.query("PRAGMA table_info(responses)").all() as { name: string }[]).map(c => c.name));
     this.sqlite.transaction(() => {
-      for (const [name, type] of [["session_kind", "TEXT"], ["last_hook_event_ts", "INTEGER"], ["last_liveness_status", "TEXT"], ["dead_since", "INTEGER"], ["turn_seq", "INTEGER NOT NULL DEFAULT 0"], ["account_alias", "TEXT"], ["account_alias_override", "TEXT"], ["display_name_override", "TEXT"], ["pending_question_id", "TEXT"]] as const) {
+      for (const [name, type] of [["session_kind", "TEXT"], ["last_hook_event_ts", "INTEGER"], ["last_liveness_status", "TEXT"], ["dead_since", "INTEGER"], ["turn_seq", "INTEGER NOT NULL DEFAULT 0"], ["account_alias", "TEXT"], ["account_alias_override", "TEXT"], ["display_name_override", "TEXT"], ["pending_question_id", "TEXT"],
+        ["codex_source", "TEXT"], ["codex_app_server_owned", "INTEGER"], ["codex_version", "TEXT"], ["codex_turn_start", "INTEGER"], ["codex_turn_steer", "INTEGER"], ["codex_turn_interrupt", "INTEGER"], ["codex_active_turn_id", "TEXT"]] as const) {
         if (!columns.has(name)) this.sqlite.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}`);
       }
       if (!replyColumns.has("tg_chat_id")) this.sqlite.exec("ALTER TABLE replies ADD COLUMN tg_chat_id TEXT");
       for (const [name, type] of [["source", "TEXT NOT NULL DEFAULT 'telegram'"], ["actor", "TEXT"], ["answers_turn", "INTEGER"], ["cancel_reason", "TEXT"], ["committed_at", "INTEGER"], ["lease_commit", "INTEGER"], ["answers_question", "TEXT"],
-        ["kind", "TEXT NOT NULL DEFAULT 'reply' CHECK (kind IN ('reply','message'))"], ["idea_id", "INTEGER"]] as const) {
+        ["kind", "TEXT NOT NULL DEFAULT 'reply' CHECK (kind IN ('reply','message'))"], ["idea_id", "INTEGER"], ["codex_action", "TEXT"], ["codex_expected_turn_id", "TEXT"],
+        ["codex_control_status", "TEXT"], ["codex_control_reason", "TEXT"]] as const) {
         if (!replyColumns.has(name)) this.sqlite.exec(`ALTER TABLE replies ADD COLUMN ${name} ${type}`);
       }
       this.sqlite.exec("UPDATE replies SET tg_chat_id=COALESCE((SELECT v FROM settings WHERE k='telegram.chat_id'),'') WHERE tg_msg_id IS NOT NULL AND tg_chat_id IS NULL");
@@ -433,6 +444,8 @@ export class DashDB {
   }
   private reply(row: Row | null): Reply | undefined {
     if (!row) return undefined;
+    const codexAction = row.codex_action === "turn/start" || row.codex_action === "turn/steer" || row.codex_action === "turn/interrupt"
+      ? row.codex_action : undefined;
     return { id:n(row.id), sessionKey:String(row.session_key), text:String(row.text), state:row.state as ReplyState,
       createdAt:n(row.created_at), expiresAt:n(row.expires_at), leaseUntil:row.lease_until == null ? null : n(row.lease_until),
       doneAt:row.done_at == null ? null : n(row.done_at), tgMsgId:row.tg_msg_id == null ? null : n(row.tg_msg_id),
@@ -441,7 +454,10 @@ export class DashDB {
       cancelReason:s(row.cancel_reason) ?? null,
       committedAt:row.committed_at == null ? null : n(row.committed_at),
       leaseCommit:row.lease_commit == null ? null : bool(row.lease_commit),
-      kind:row.kind === "message" ? "message" : "reply", ideaId:row.idea_id == null ? null : n(row.idea_id) };
+      kind:row.kind === "message" ? "message" : "reply", ideaId:row.idea_id == null ? null : n(row.idea_id),
+      ...(codexAction ? { codexAction, codexExpectedTurnId: s(row.codex_expected_turn_id) ?? null,
+        codexControlStatus: s(row.codex_control_status) as CodexControlStatus | undefined ?? null,
+        codexControlReason: s(row.codex_control_reason) ?? null } : {}) };
   }
   private insertAuditRow(entry: ReplyAuditInsert): number {
     const result = this.sqlite.query(`INSERT INTO reply_audit
@@ -507,15 +523,35 @@ export class DashDB {
     if (ideaId !== undefined) this.ideasChanged(true);
     return reply;
   }
+  enqueueCodexControl(key: string, text: string, source: ReplySource, actor: string, action: CodexAction,
+    expectedTurnId: string | undefined, now: number, ttlMs: number, auditContext: PreparedAuditContext): Reply {
+    if (auditContext.sessionKey !== key || auditContext.source !== source || auditContext.actor !== actor) {
+      throw new Error("reply audit context mismatch");
+    }
+    return this.sqlite.transaction(() => {
+      const result = this.sqlite.query(`INSERT INTO replies
+        (session_key,text,state,created_at,expires_at,source,actor,kind,codex_action,codex_expected_turn_id,codex_control_status)
+        VALUES(?,?,'queued',?,?,?,?,'reply',?,?,'pending')`)
+        .run(key,text,now,now+ttlMs,source,actor,action,value(expectedTurnId));
+      const id = Number(result.lastInsertRowid);
+      this.insertAuditRow(this.auditEntryFromContext(auditContext,id));
+      return this.getReply(id)!;
+    })();
+  }
   getReply(id: number): Reply | undefined { return this.reply(this.sqlite.query("SELECT * FROM replies WHERE id=?").get(id) as Row | null); }
   getReplies(key: string, limit = 20): ReplyPublicDTO[] {
     const bounded = Math.min(100, Math.max(1, Math.floor(Number.isFinite(limit) ? limit : 20)));
-    return (this.sqlite.query(`SELECT id,state,source,created_at,expires_at,done_at,cancel_reason,answers_turn,committed_at
+    return (this.sqlite.query(`SELECT id,state,source,created_at,expires_at,done_at,cancel_reason,answers_turn,committed_at,
+      codex_action,codex_expected_turn_id,codex_control_status,codex_control_reason
       FROM replies WHERE session_key=? ORDER BY id DESC LIMIT ?`).all(key,bounded) as Row[]).map(row => ({
         id:n(row.id), state:row.state as ReplyState, source:row.source as ReplySource, createdAt:n(row.created_at),
         expiresAt:n(row.expires_at), doneAt:row.done_at == null ? null : n(row.done_at),
         cancelReason:s(row.cancel_reason) ?? null, answersTurn:row.answers_turn == null ? null : n(row.answers_turn),
         committed:row.committed_at != null,
+        ...(row.codex_action ? { codexAction: row.codex_action as CodexAction,
+          codexExpectedTurnId: s(row.codex_expected_turn_id) ?? null,
+          codexControlStatus: s(row.codex_control_status) as CodexControlStatus | undefined ?? null,
+          codexControlReason: s(row.codex_control_reason) ?? null } : {}),
       }));
   }
   nextQueuedReply(key: string, includeAutopilot = true): Reply | undefined {
@@ -529,11 +565,22 @@ export class DashDB {
       WHERE reply_id=? AND outcome IS NULL AND outcome_ts IS NULL`).run(outcome,now,replyId);
   }
   private finishReply(row: Row, state: "delivered"|"expired"|"cancelled", now: number, cancelReason: string | null = null,
-    allowCommitted = false): Reply {
-    const changed = this.sqlite.query(`UPDATE replies SET state=?,text='',lease_until=NULL,done_at=?,cancel_reason=?
-      WHERE id=? AND state IN ('queued','leased') AND (?=1 OR committed_at IS NULL)`).run(state,now,value(cancelReason),row.id,allowCommitted ? 1 : 0).changes === 1;
+    allowCommitted = false, receiptStatus?: CodexControlStatus, receiptReason?: string | null): Reply {
+    const hasCodexControl = row.codex_action != null;
+    const controlStatus = hasCodexControl ? receiptStatus ??
+      (state === "delivered" ? "accepted" : state === "cancelled" && cancelReason === "stale_turn" ? "stale" :
+        state === "cancelled" && cancelReason === "owner_cancelled" ? "cancelled" : "failed") : undefined;
+    const controlReason = hasCodexControl
+      ? receiptReason === undefined ? cancelReason ?? (state === "expired" ? "expired" : null) : receiptReason
+      : undefined;
+    const changed = this.sqlite.query(`UPDATE replies SET state=?,text='',lease_until=NULL,done_at=?,cancel_reason=?,
+      codex_control_status=CASE WHEN codex_action IS NULL THEN codex_control_status ELSE ? END,
+      codex_control_reason=CASE WHEN codex_action IS NULL THEN codex_control_reason ELSE ? END
+      WHERE id=? AND state IN ('queued','leased') AND (?=1 OR committed_at IS NULL)`)
+      .run(state,now,value(cancelReason),value(controlStatus),value(controlReason),row.id,allowCommitted ? 1 : 0).changes === 1;
     this.auditOutcome(n(row.id), state === "cancelled" ? `cancelled:${cancelReason ?? "cancelled"}` : state, now);
-    const reply = this.reply({ ...row, state, text:"", lease_until:null, done_at:now, cancel_reason:cancelReason })!;
+    const reply = this.reply({ ...row, state, text:"", lease_until:null, done_at:now, cancel_reason:cancelReason,
+      codex_control_status:controlStatus, codex_control_reason:controlReason })!;
     // C4: an undelivered new message goes back to Ideas (its own idea reopens); owner cancels never do.
     if (changed && row.kind === "message" && (state === "expired" || (state === "cancelled" && cancelReason !== "owner_cancelled"))) {
       const ideaId = row.idea_id == null ? undefined : n(row.idea_id);
@@ -551,12 +598,24 @@ export class DashDB {
       .get(now - 60 * 60_000,now,exceptId,now) as Row;
     return n(row.count) >= AUTOPILOT_GLOBAL_REPLY_RATE_LIMIT;
   }
-  private takeQueued(key: string, id: number, turnSeq: number, now: number, mode: "claude"|"omp", waiterId?: string,
+  private takeQueued(key: string, id: number, turnSeq: number, now: number, mode: "claude"|"omp"|"codex", waiterId?: string,
     commitCapable = false): ReplyTakeResult {
     return this.sqlite.transaction(() => {
-      const row = this.sqlite.query(`SELECT r.*,s.turn_seq,s.status AS session_status,s.needs_reason,s.pending_question_id,s.harness AS session_harness
+      const row = this.sqlite.query(`SELECT r.*,s.turn_seq,s.status AS session_status,s.needs_reason,s.pending_question_id,s.harness AS session_harness,
+        s.codex_source,s.codex_app_server_owned,s.codex_active_turn_id
         FROM replies r JOIN sessions s ON s.key=r.session_key WHERE r.id=? AND r.session_key=?`).get(id,key) as Row | null;
       if (!row || row.state !== "queued" || n(row.expires_at) <= now) return { kind:"unavailable" } as const;
+      if (mode === "codex") {
+        const action = row.codex_action;
+        const activeTurnId = s(row.codex_active_turn_id);
+        const expectedTurnId = s(row.codex_expected_turn_id);
+        if (String(row.session_harness) !== "codex" || row.codex_source !== "appServer" || !bool(row.codex_app_server_owned) ||
+            row.source !== "web" || !commitCapable || waiterId === undefined ||
+            action !== "turn/start" && action !== "turn/steer" && action !== "turn/interrupt") return { kind:"not_ready" } as const;
+        if (action === "turn/start" ? activeTurnId !== undefined : !expectedTurnId || expectedTurnId !== activeTurnId) {
+          return { kind:"stale",reply:this.finishReply(row,"cancelled",now,"stale_turn") } as const;
+        }
+      }
       const currentTurn = n(row.turn_seq);
       if (row.answers_turn != null && (n(row.answers_turn) !== currentTurn || n(row.answers_turn) !== turnSeq)) {
         return { kind:"stale",reply:this.finishReply(row,"cancelled",now,"stale") } as const;
@@ -570,8 +629,10 @@ export class DashDB {
       const status = String(row.session_status), bound = row.answers_turn != null;
       const deliverable = mode === "claude"
         ? String(row.session_harness) === "claude" && status === "your_turn"
-        : String(row.session_harness) === "omp" && (bound ? status === "your_turn" :
-          status === "working" || status === "your_turn" || status === "needs_input" && ["question","waiting"].includes(String(row.needs_reason)));
+        : mode === "omp"
+          ? String(row.session_harness) === "omp" && (bound ? status === "your_turn" :
+            status === "working" || status === "your_turn" || status === "needs_input" && ["question","waiting"].includes(String(row.needs_reason)))
+          : String(row.session_harness) === "codex" && row.codex_source === "appServer" && bool(row.codex_app_server_owned) && status !== "ended";
       if (!deliverable || mode === "omp" && waiterId !== undefined && !commitCapable && row.source === "autopilot")
         return { kind:"not_ready" } as const;
       if (row.source === "autopilot" && this.autopilotReplyRateLimitReached(id,now)) return { kind:"not_ready" } as const;
@@ -595,6 +656,9 @@ export class DashDB {
   }
   leaseQueuedForOmp(key: string, id: number, waiterId: string, turnSeq: number, now: number, commitCapable = false): ReplyTakeResult {
     return this.takeQueued(key,id,turnSeq,now,"omp",waiterId,commitCapable);
+  }
+  leaseQueuedForCodex(key: string, id: number, waiterId: string, now: number, commitCapable = false): ReplyTakeResult {
+    return this.takeQueued(key,id,0,now,"codex",waiterId,commitCapable);
   }
   commitOmp(id: number, _waiterId: string, now: number): ReplyCommitResult {
     return this.sqlite.transaction(() => {
@@ -630,11 +694,48 @@ export class DashDB {
       return changes < 1 ? { ok:false,reason:"not_leased" } as const : { ok:true } as const;
     })();
   }
+  commitCodex(id: number, now: number): ReplyCommitResult {
+    return this.sqlite.transaction(() => {
+      const row = this.sqlite.query(`SELECT r.*,s.turn_seq,s.status AS session_status,s.harness AS session_harness,
+        s.codex_source,s.codex_app_server_owned,s.codex_active_turn_id
+        FROM replies r JOIN sessions s ON s.key=r.session_key WHERE r.id=?`).get(id) as Row | null;
+      if (!row) return { ok:false,reason:"not_found" } as const;
+      if (row.state !== "leased" || row.lease_until == null || n(row.lease_until) <= now) return { ok:false,reason:"not_leased" } as const;
+      if (!bool(row.lease_commit)) return { ok:false,reason:"not_commit_capable" } as const;
+      const action = row.codex_action;
+      const activeTurnId = s(row.codex_active_turn_id);
+      const expectedTurnId = s(row.codex_expected_turn_id);
+      const stale = action === "turn/start" ? activeTurnId !== undefined :
+        action === "turn/steer" || action === "turn/interrupt" ? !expectedTurnId || expectedTurnId !== activeTurnId : true;
+      const deliverable = String(row.session_harness) === "codex" && row.source === "web" &&
+        row.codex_source === "appServer" && bool(row.codex_app_server_owned) && String(row.session_status) !== "ended";
+      if (row.committed_at != null) return !stale && deliverable ? { ok:true } as const : { ok:false,reason:"not_ready" } as const;
+      if (stale) return { ok:false,reason:"stale",reply:this.finishReply(row,"cancelled",now,"stale_turn") } as const;
+      if (!deliverable) {
+        this.sqlite.query(`UPDATE replies SET state='queued',lease_until=NULL,lease_commit=NULL,committed_at=NULL
+          WHERE id=? AND state='leased' AND committed_at IS NULL`).run(id);
+        return { ok:false,reason:"not_ready" } as const;
+      }
+      const changes = this.sqlite.query(`UPDATE replies SET committed_at=? WHERE id=? AND state='leased'
+        AND lease_until>? AND lease_commit=1 AND committed_at IS NULL`).run(now,id,now).changes;
+      return changes < 1 ? { ok:false,reason:"not_leased" } as const : { ok:true } as const;
+    })();
+  }
   ackReply(id: number, now: number): Reply | undefined {
     return this.sqlite.transaction(() => {
       const row = this.sqlite.query("SELECT * FROM replies WHERE id=?").get(id) as Row | null;
       if (!row || row.state !== "leased" || bool(row.lease_commit) && row.committed_at == null) return undefined;
       return this.finishReply(row,"delivered",now,null,true);
+    })();
+  }
+  ackCodexControl(id: number, outcome: "accepted" | "unsupported" | "failed", reason: string | undefined, now: number): Reply | undefined {
+    return this.sqlite.transaction(() => {
+      const row = this.sqlite.query("SELECT * FROM replies WHERE id=?").get(id) as Row | null;
+      if (!row || row.state !== "leased" || !bool(row.lease_commit) || row.committed_at == null || row.codex_action == null) return undefined;
+      const status = outcome === "failed" && reason === "stale_turn" ? "stale" : outcome;
+      const cancelReason = outcome === "accepted" ? null : reason ?? outcome;
+      return this.finishReply(row, outcome === "accepted" ? "delivered" : "cancelled", now, cancelReason, true,
+        status, outcome === "accepted" ? null : reason ?? null);
     })();
   }
   deferReply(id: number, _now: number): Reply | undefined {
@@ -761,6 +862,9 @@ export class DashDB {
           this.sqlite.query(`UPDATE replies SET state='queued',lease_until=NULL,done_at=NULL,lease_commit=NULL
             WHERE id=? AND state='leased' AND committed_at IS NULL`).run(row.id);
           return this.reply({ ...row,state:"queued",lease_until:null,done_at:null,lease_commit:null })!;
+        }
+        if (row.codex_action != null && bool(row.lease_commit) && row.committed_at != null) {
+          return this.finishReply(row, "expired", now, "ack_timeout", true, "unknown", "ack_timeout");
         }
         return this.finishReply(row,"delivered",now,null,true);
       });
@@ -1187,17 +1291,34 @@ export class DashDB {
         : current.kind === "question_answered" && current.questionIdentity
           ? JSON.stringify({ questionIdentity: current.questionIdentity })
           : value(current.detail);
+      const codexControl = current.codexControl;
+      const hasCodexControl = codexControl !== undefined;
       this.sqlite.query(`UPDATE sessions SET cwd=COALESCE(?,cwd), title=COALESCE(?,title),
         interactive=?, transcript_path=COALESCE(?,transcript_path), session_kind=COALESCE(NULLIF(?,''),session_kind), account_alias=COALESCE(?,account_alias),
+        codex_source=CASE WHEN ?=1 THEN ? ELSE codex_source END,
+        codex_app_server_owned=CASE WHEN ?=1 THEN ? ELSE codex_app_server_owned END,
+        codex_version=CASE WHEN ?=1 THEN ? ELSE codex_version END,
+        codex_turn_start=CASE WHEN ?=1 THEN ? ELSE codex_turn_start END,
+        codex_turn_steer=CASE WHEN ?=1 THEN ? ELSE codex_turn_steer END,
+        codex_turn_interrupt=CASE WHEN ?=1 THEN ? ELSE codex_turn_interrupt END,
+        codex_active_turn_id=CASE WHEN ?=1 THEN ? ELSE codex_active_turn_id END,
         status=?, needs_reason=?, needs_text=?, pending_question_id=?, last_prompt=?, last_error=?, last_notification=?,
         background_pending=?, last_activity=?, last_hook_event_ts=?, turn_seq=turn_seq+? WHERE key=?`).run(
         value(current.cwd), value(current.title), current.interactive ? 1 : 0, value(current.transcriptPath), value(current.sessionKind), value(current.accountAlias),
+        hasCodexControl ? 1 : 0, value(codexControl?.source),
+        hasCodexControl ? 1 : 0, codexControl?.appServerOwned ? 1 : 0,
+        hasCodexControl ? 1 : 0, value(codexControl?.version),
+        hasCodexControl ? 1 : 0, codexControl?.turnStart ? 1 : 0,
+        hasCodexControl ? 1 : 0, codexControl?.turnSteer ? 1 : 0,
+        hasCodexControl ? 1 : 0, codexControl?.turnInterrupt ? 1 : 0,
+        hasCodexControl ? 1 : 0, value(codexControl?.activeTurnId),
         next.status, value(next.needsReason), value(next.needsText), value(next.pendingQuestionId), value(next.lastPrompt), value(next.lastError),
         value(next.lastNotification), next.backgroundPending ? 1 : 0, next.lastActivity, current.ts,
-        current.kind === "response" || current.kind === "error" ? 1 : 0, key);
+        (current.kind === "response" || current.kind === "error") && current.responseSource !== "backfill" ? 1 : 0, key);
       this.sqlite.query("INSERT INTO events(session_key,ts,kind,detail) VALUES(?,?,?,?)").run(key, current.ts, current.kind, questionDetail);
       if (current.kind === "response" && current.text?.trim()) {
-        this.insertResponse(key, clip(current.text)!, describePrompt(next.lastPrompt), current.ts, "hook", n(row.turn_seq) + 1);
+        this.insertResponse(key, clip(current.text)!, describePrompt(current.prompt ?? next.lastPrompt), current.ts,
+          current.responseSource ?? "hook", current.responseSource === "backfill" ? null : n(row.turn_seq) + 1);
       }
       this.sqlite.query("DELETE FROM events WHERE ts<?").run(Date.now() - 7 * 86400_000);
     })();
@@ -1355,11 +1476,22 @@ export class DashDB {
     const responses = this.sqlite.query("SELECT * FROM responses WHERE session_key=? ORDER BY ts DESC,id DESC LIMIT 3").all(key) as Row[];
     const unread = this.sqlite.query("SELECT COUNT(*) AS n FROM responses WHERE session_key=? AND seen=0").get(key) as Row;
     const cwd = s(row.cwd);
+    const codexSource = s(row.codex_source);
+    const codexControl = codexSource === undefined ? undefined : {
+      source: codexSource,
+      appServerOwned: bool(row.codex_app_server_owned),
+      ...(s(row.codex_version) ? { version: s(row.codex_version)! } : {}),
+      turnStart: bool(row.codex_turn_start),
+      turnSteer: bool(row.codex_turn_steer),
+      turnInterrupt: bool(row.codex_turn_interrupt),
+      activeTurnId: s(row.codex_active_turn_id) ?? null,
+    };
     return {
       key, host: String(row.host), harness: row.harness as Harness, sessionId: String(row.session_id),
       cwd, title: s(row.title), displayName: s(row.display_name_override) || s(row.display_name) || s(row.title) || (cwd ? basename(cwd) : String(row.session_id)),
       accountAlias: s(row.account_alias_override) ?? s(row.account_alias), reportedAccountAlias: s(row.account_alias),
       accountAliasOverride: s(row.account_alias_override), displayNameOverride: s(row.display_name_override),
+      ...(codexControl === undefined ? {} : { codexControl }),
       project: this.projectFor(cwd),
       status: row.status as Status, needsReason: s(row.needs_reason),
       needsText: s(row.needs_text), pendingQuestionId: s(row.pending_question_id), pendingQuestion: this.pendingQuestion(row), lastPrompt: s(row.last_prompt), lastError: s(row.last_error),

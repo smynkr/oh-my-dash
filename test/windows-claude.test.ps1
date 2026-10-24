@@ -547,6 +547,39 @@ exit $LASTEXITCODE
         'dialog opt-in installs the local fence helper'
     Assert-True (Test-Path -LiteralPath (Join-Path $fixture.InstallPath 'claude-autopilot-dialog.ps1')) `
         'dialog opt-in installs the blocking dialog helper'
+    $optInSettings = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fixture.SettingsPath, [System.Text.Encoding]::UTF8))
+    $autopilotFenceGroup = @($optInSettings.hooks.PreToolUse | Where-Object {
+        @($_.hooks | Where-Object { $_.args -contains 'claude-autopilot-fence.ps1' }).Count -gt 0
+    })[0]
+    Assert-Equal '.*' $autopilotFenceGroup.matcher `
+        'Windows fence covers every tool so unknown tool names fail closed'
+    $preToolCommands = @($optInSettings.hooks.PreToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_ })
+    Assert-True ($preToolCommands.Count -ge 3) 'explicit dialog opt-in adds both fenced tool hooks and the question helper'
+    $dialogPath = Join-Path $fixture.InstallPath 'claude-autopilot-dialog.ps1'
+    $dialogHookInput = ConvertTo-Json -InputObject ([ordered]@{
+        hook_event_name = 'PreToolUse'
+        session_id = 'synthetic-multi-select-session'
+        tool_use_id = 'synthetic-multi-select-tool'
+        tool_name = 'AskUserQuestion'
+        tool_input = [ordered]@{
+            questions = @([ordered]@{
+                question = 'Which checks?'
+                multiSelect = $true
+                options = @([ordered]@{ label = 'Build' }, [ordered]@{ label = 'Review' })
+            })
+        }
+    }) -Depth 10 -Compress
+    Set-WindowsClaudePlans $fixture.Server @{
+        '/hook/ask' = @(@{ StatusCode = 200; Body = '{"action":"release"}'; ContentType = 'application/json' })
+    }
+    $dialogHook = Invoke-WindowsClaudeScript -ScriptPath $dialogPath -Stdin $dialogHookInput -TimeoutSeconds 10
+    Assert-Equal 0 $dialogHook.ExitCode 'multi-select dialog registration safely releases to Claude'
+    $askRequest = @(Get-WindowsClaudeRequests $fixture.Server | Where-Object { $_.Path -eq '/hook/ask' }) | Select-Object -Last 1
+    $askQuestion = (ConvertFrom-Json -InputObject $askRequest.Body).questions[0]
+    Assert-Equal $true $askQuestion.multiSelect 'Windows dialog helper preserves multiSelect in /hook/ask payloads'
+    Assert-True ($null -eq $askQuestion.PSObject.Properties['multi']) 'Windows helper does not rename multiSelect in /hook/ask payloads'
+    Set-WindowsClaudePlans $fixture.Server $plans
+
     $fencePath = Join-Path $fixture.InstallPath 'claude-autopilot-fence.ps1'
     $coldFenceInput = ConvertTo-Json -InputObject ([ordered]@{
         session_id = 'synthetic-cold-offline-session'
@@ -590,15 +623,6 @@ exit $LASTEXITCODE
         $offlineFenceResult.hookSpecificOutput.permissionDecisionReason `
         'an inactive cache cannot confirm the current remote goal state'
     Set-WindowsClaudePlans $fixture.Server $plans
-
-    $optInSettings = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($fixture.SettingsPath, [System.Text.Encoding]::UTF8))
-    $autopilotFenceGroup = @($optInSettings.hooks.PreToolUse | Where-Object {
-        @($_.hooks | Where-Object { $_.args -contains 'claude-autopilot-fence.ps1' }).Count -gt 0
-    })[0]
-    Assert-Equal '.*' $autopilotFenceGroup.matcher `
-        'Windows fence covers every tool so unknown tool names fail closed'
-    $preToolCommands = @($optInSettings.hooks.PreToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_ })
-    Assert-True ($preToolCommands.Count -ge 3) 'explicit dialog opt-in adds both fenced tool hooks and the question helper'
     $autopilotReplySession = 'synthetic-autopilot-reply-session'
     $autopilotExpiry = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 60000
     $autopilotEnvelope = ConvertTo-Json -InputObject ([ordered]@{

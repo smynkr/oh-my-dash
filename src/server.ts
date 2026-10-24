@@ -6,7 +6,7 @@ import { createTelegram, type TelegramOptions } from "./telegram.ts";
 import { createReplies, cleanMessageText, MAX_MESSAGE_CHARS, messageTtlFromEnv, type AutopilotDelivery } from "./replies.ts";
 import { createJudge, type Judge } from "./judge.ts";
 import { createExtraction } from "./extraction.ts";
-import { normalizeClaude, normalizeOmp, normalizeAccountAlias, localHost, type EventKind, type Harness } from "./normalize.ts";
+import { normalizeClaude, normalizeOmp, normalizeCodex, normalizeAccountAlias, localHost, type EventKind, type Harness } from "./normalize.ts";
 import { scanBackfill, parseClaudeTranscript, findClaudeTranscript } from "./backfill.ts";
 import { parseClaudeAgents, pollClaudeAgents, pollOmpPresence, type LivenessRecord } from "./liveness.ts";
 import { resolveProject, ruleErrors, type ProjectRule } from "./projects.ts";
@@ -122,7 +122,7 @@ function parseSearchOptions(params: URLSearchParams): SearchOptions | null {
   const repositoryHost = params.get("repositoryHost");
   const rawHarness = params.get("harness");
   const account = params.get("account");
-  if (rawHarness !== null && rawHarness !== "" && rawHarness !== "claude" && rawHarness !== "omp") return null;
+  if (rawHarness !== null && rawHarness !== "" && rawHarness !== "claude" && rawHarness !== "omp" && rawHarness !== "codex") return null;
   const rawHeadless = params.get("headless");
   const rawEnded = params.get("ended");
   if (rawHeadless !== null && rawHeadless !== "0" && rawHeadless !== "1") return null;
@@ -141,6 +141,7 @@ function parseSearchOptions(params: URLSearchParams): SearchOptions | null {
 export function createDashServer(options: ServerOptions = {}) {
   const topicsEnabled = process.env.DASH_TG_TOPICS === "1";
   const decisionsEnabled = process.env.DASH_REPLIES === "1";
+  const codexEnabled = process.env.DASH_CODEX === "1";
   const judgeEnabled = decisionsEnabled && process.env.DASH_JUDGE === "1";
   const dataDir = options.dataPath && options.dataPath !== ":memory:" ? dirname(resolve(options.dataPath)) : resolve(process.env.DASH_DATA ?? join(root,"data"));
   const db = new DashDB(options.dataPath ?? join(dataDir, "dash.sqlite"), { topicsEnabled, decisionsEnabled, judgeEnabled });
@@ -221,7 +222,7 @@ export function createDashServer(options: ServerOptions = {}) {
   let replies: ReturnType<typeof createReplies> | undefined;
   const withCapabilities = (dto: SessionDTO): SessionWithCapabilities => ({
     ...dto,
-    capabilities: sessionCapabilities(dto, decisionsEnabled, replies?.deliveryObservation(dto.key), now()),
+    capabilities: sessionCapabilities(dto, decisionsEnabled, replies?.deliveryObservation(dto.key), now(), codexEnabled),
   });
   const emitSession = (dto: SessionDTO, force = false) => {
     const session = withCapabilities(dto);
@@ -249,6 +250,11 @@ export function createDashServer(options: ServerOptions = {}) {
   };
   const hookRegistrationsInProgress = new Set<string>();
   const send = (dto: SessionDTO, eventKind?: EventKind, force = false) => {
+    if (dto.harness === "codex") {
+      replies?.observe(dto);
+      emitSession(dto, force);
+      return;
+    }
     // An error event can have the same DTO as an earlier liveness/update event.
     // Let Telegram see the actual event before DTO dedupe, without inferring
     // errors from a DTO's potentially stale lastError field.
@@ -285,9 +291,8 @@ export function createDashServer(options: ServerOptions = {}) {
     for (const client of [...clients]) try { client.enqueue(message); } catch { clients.delete(client); }
   };
   if (process.env.DASH_REPLIES === "1") db.onIdeasChange = emitIdeas;
-  if (process.env.DASH_REPLIES === "1") replies = createReplies({ db, now, ttlMs: ttlMin * 60_000,
-    messageTtlMs: messageTtlFromEnv(process.env.DASH_MESSAGE_TTL_MS), send,
-    autopilotDelivery, autopilotAllowed,
+  if (process.env.DASH_REPLIES === "1") replies = createReplies({ db, now, codexEnabled, ttlMs: ttlMin * 60_000,
+    messageTtlMs: messageTtlFromEnv(process.env.DASH_MESSAGE_TTL_MS), send, autopilotDelivery, autopilotAllowed,
     onQueued: reply => emitReply(reply, "queued"),
     onOutcome: (reply, outcome, dto) => { telegram?.replyOutcome(reply, outcome, dto, ttlMin); emitReply(reply, outcome); },
     onQuestionOutcome: (source,questionId) => {
@@ -478,7 +483,8 @@ export function createDashServer(options: ServerOptions = {}) {
     const url = new URL(request.url);
     const path = url.pathname;
     const ingestPath = path.startsWith("/ingest/");
-    const ingest = request.method === "POST" && (path === "/ingest/claude" || path === "/ingest/omp" || path === "/ingest/liveness/claude");
+    const ingest = request.method === "POST" && (path === "/ingest/claude" || path === "/ingest/omp" || path === "/ingest/liveness/claude" ||
+      (codexEnabled && (path === "/ingest/codex" || path === "/ingest/liveness/codex")));
     const loopbackHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
     const extraHosts = new Set((process.env.DASH_ALLOWED_HOSTS ?? "").split(",").map(h => h.trim().toLowerCase()).filter(Boolean));
     const host = request.headers.get("host")?.toLowerCase() ?? "";
@@ -665,7 +671,7 @@ export function createDashServer(options: ServerOptions = {}) {
       }
       return json({ error:"not found" },404);
     }
-    if (path === "/reply/wait/claude" || path === "/reply/wait/omp" || path === "/reply/ack" || path === "/reply/commit") {
+    if (path === "/reply/wait/claude" || path === "/reply/wait/omp" || path === "/reply/wait/codex" || path === "/reply/ack" || path === "/reply/commit") {
       if (!replies) return json({ error: "not found" }, 404);
       if (request.method === "GET" && path.startsWith("/reply/wait/")) {
         if (["session", "waiter", "started", "wait", "commit"].some(name => url.searchParams.getAll(name).length > 1)) return json({ error: "bad request" }, 400);
@@ -676,34 +682,49 @@ export function createDashServer(options: ServerOptions = {}) {
         if (!session || !/^[A-Za-z0-9_-]{1,128}$/.test(session) || !waiter || !/^[A-Za-z0-9_-]{8,64}$/.test(waiter) ||
           !rawStarted || !/^-?\d+$/.test(rawStarted) || !Number.isSafeInteger(Number(rawStarted)) ||
           (rawWait !== null && !/^\d+$/.test(rawWait)) || !Number.isInteger(waitSec) || waitSec < 1 || waitSec > 55 ||
-          (rawCommit !== null && (path.endsWith("claude") || rawCommit !== "1"))) return json({ error: "bad request" }, 400);
+          (rawCommit !== null && (path.endsWith("claude") || rawCommit !== "1")) ||
+          (path.endsWith("codex") && (!codexEnabled || rawCommit !== "1"))) return json({ error: "bad request" }, 400);
         const label = request.headers.get("X-Dash-Host");
         if (listener === "loopback" ? (label !== null && label !== localHost()) :
           (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)))) return json({ error: "forbidden" }, 403);
-        const key = `${listener === "loopback" ? localHost() : label}|${path.endsWith("claude") ? "claude" : "omp"}|${session}`;
+        const harness = path.endsWith("claude") ? "claude" : path.endsWith("codex") ? "codex" : "omp";
+        const key = `${listener === "loopback" ? localHost() : label}|${harness}|${session}`;
         disableTimeout();
-        const result = path.endsWith("claude")
+        const result = harness === "claude"
           ? await replies.waitClaude(key, waiter, Number(rawStarted), waitSec * 1000, request.signal)
-          : await replies.waitOmp(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, rawCommit === "1", listener === "loopback" ? "loopback" : peer);
+          : harness === "codex"
+            ? await replies.waitCodex(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, listener === "loopback" ? "loopback" : peer)
+            : await replies.waitOmp(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, rawCommit === "1", listener === "loopback" ? "loopback" : peer);
         if (result.status !== 200) return new Response(null, { status: result.status, headers: headers() });
-        return path.endsWith("claude")
+        return harness === "claude"
           ? new Response(result.reply as string, { headers: headers({ "Content-Type": "text/plain; charset=utf-8" }) })
           : json(result.reply);
       }
       if (request.method === "POST" && (path === "/reply/ack" || path === "/reply/commit")) {
         if (!jsonContentType(request.headers.get("content-type"))) return json({ error: "bad request" }, 400);
         const body = await boundedJson(request) as Record<string, unknown> | null;
-        if (!body || typeof body !== "object" || !Number.isSafeInteger(body.id) || Number(body.id) < 1 ||
-          typeof body.waiter !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(body.waiter) ||
-          (path === "/reply/ack" && body.outcome !== "sent" && body.outcome !== "deferred")) return json({ error: "bad request" }, 400);
+        if (!body || typeof body !== "object" || Array.isArray(body) || !Number.isSafeInteger(body.id) || Number(body.id) < 1 ||
+          typeof body.waiter !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(body.waiter)) return json({ error: "bad request" }, 400);
         const reply = db.getReply(Number(body.id));
+        const codexControl = !!reply?.codexAction;
+        if (path === "/reply/ack" && (codexControl
+          ? (body.outcome !== "accepted" && body.outcome !== "unsupported" && body.outcome !== "failed")
+          : (body.outcome !== "sent" && body.outcome !== "deferred"))) return json({ error: "bad request" }, 400);
+        if (codexControl && (!codexEnabled || typeof body.target !== "string" || body.target !== reply!.sessionKey ||
+          (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 128))))
+          return json({ error: "bad request" }, 400);
         const label = request.headers.get("X-Dash-Host");
         if (listener === "loopback" ? (label !== null && label !== localHost()) :
           (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)) || (reply && !reply.sessionKey.startsWith(`${label}|`)))) return json({ error: "forbidden" }, 403);
         const leasePeer = listener === "loopback" ? "loopback" : peer;
-        if (path === "/reply/commit") return replies.commitOmp(Number(body.id), body.waiter, leasePeer)
+        if (path === "/reply/commit") return (codexControl
+          ? replies.commitCodex(Number(body.id), body.waiter, body.target as string, leasePeer)
+          : replies.commitOmp(Number(body.id), body.waiter, leasePeer))
           ? json({ ok: true }) : json({ error: "not deliverable" }, 409);
-        return replies.ackOmp(Number(body.id), body.waiter, body.outcome as "sent" | "deferred", leasePeer)
+        return (codexControl
+          ? replies.ackCodex(Number(body.id), body.waiter, body.outcome as "accepted" | "unsupported" | "failed",
+            body.target as string, typeof body.reason === "string" ? body.reason : undefined, leasePeer)
+          : replies.ackOmp(Number(body.id), body.waiter, body.outcome as "sent" | "deferred", leasePeer))
           ? json({ ok: true }) : json({ error: "not found" }, 404);
       }
       return json({ error: "not found" }, 404);
@@ -730,14 +751,46 @@ export function createDashServer(options: ServerOptions = {}) {
           lastRemoteLiveness.set(remoteHost, acceptedAt);
           return ack();
         }
+        if (path === "/ingest/liveness/codex") {
+          const data = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
+          const sourceHost = data?.host;
+          const items = data?.sessions;
+          const host = typeof sourceHost === "string" && hostLabel(sourceHost) ? sourceHost : null;
+          if (!data || Object.keys(data).some(field => field !== "host" && field !== "sessions") ||
+              !host || request.headers.get("X-Dash-Host") !== host ||
+              !Array.isArray(items) || items.length > 10_000 ||
+              (listener === "tailnet" && host === localHost())) { malformed++; return ack(); }
+          const records: LivenessRecord[] = [];
+          for (const item of items) {
+            const record = item && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : null;
+            if (!record || Object.keys(record).some(field => !["sessionId", "cwd", "name", "detail"].includes(field)) ||
+                typeof record.sessionId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(record.sessionId) ||
+                (record.cwd !== undefined && (typeof record.cwd !== "string" || record.cwd.length > 4096)) ||
+                (record.name !== undefined && (typeof record.name !== "string" || record.name.length > 4096)) ||
+                (record.detail !== undefined && (typeof record.detail !== "string" || record.detail.length > 4096))) {
+              malformed++; return ack();
+            }
+            records.push({ host, harness: "codex", sessionId: record.sessionId,
+              ...(typeof record.cwd === "string" ? { cwd: record.cwd } : {}),
+              ...(typeof record.name === "string" ? { name: record.name } : {}),
+              ...(typeof record.detail === "string" ? { detail: record.detail } : {}) });
+          }
+          const acceptedAt = now();
+          db.recordSourceReport(host, acceptedAt, true);
+          emitSources();
+          for (const dto of db.markLiveness("codex", records, host, acceptedAt, () => false, true)) send(dto);
+          if (listener === "tailnet") lastRemoteLiveness.set(host, acceptedAt);
+          return ack();
+        }
         const receivedAt = now();
-        const event = path.endsWith("claude") ? normalizeClaude(body, request.headers, receivedAt) : normalizeOmp(body, receivedAt);
+        const event = path.endsWith("claude") ? normalizeClaude(body, request.headers, receivedAt) :
+          path.endsWith("codex") ? normalizeCodex(body, request.headers, receivedAt) : normalizeOmp(body, receivedAt);
         if (event) {
           const dto = db.applyEvent(event);
           db.recordSourceReport(event.host, receivedAt);
           emitSources();
           send(dto, event.kind);
-          if (event.kind === "response") extraction?.schedule(dto.key, dto.turnSeq);
+          if (event.kind === "response" && event.harness !== "codex") extraction?.schedule(dto.key, dto.turnSeq);
         } else malformed++;
       } catch (error) { malformed++; reportError("ingest", error); }
       return ack();
@@ -1174,10 +1227,29 @@ export function createDashServer(options: ServerOptions = {}) {
       try { key = decodeURIComponent(replyRoute[1]); } catch { return json({ error: "invalid key" }, 400); }
       if (replyRoute[2] === "reply") {
         const body = await boundedJson(request) as Record<string, unknown> | null;
+        const dto = db.getSession(key);
+        const codexControlRoute = dto?.harness === "codex";
+        const allowedFields = codexControlRoute
+          ? ["action", "text", "expectedTurnId"]
+          : ["text", "answersTurn", "expectedTurn", "answersQuestion"];
         if (!body || typeof body !== "object" || Array.isArray(body) ||
-          Object.keys(body).some(field => field !== "text" && field !== "answersTurn" && field !== "expectedTurn" && field !== "answersQuestion")) return json({ error: "bad request" }, 400);
+          Object.keys(body).some(field => !allowedFields.includes(field)) ||
+          (codexControlRoute && (typeof body.action !== "string" ||
+            (body.text !== undefined && typeof body.text !== "string") ||
+            (body.expectedTurnId !== undefined && typeof body.expectedTurnId !== "string"))))
+          return json({ error: "bad request" }, 400);
         const actor = listener === "loopback" ? "web:loopback" :
           `web:${peers.get(peer) === "*" ? `tailnet-peer-${peer.replace(/[^A-Za-z0-9_-]/g, "-")}` : peers.get(peer)}`;
+        if (codexControlRoute) {
+          const result = replies.submitCodexControl({ key, action: body.action as "turn/start" | "turn/steer" | "turn/interrupt",
+            ...(typeof body.text === "string" ? { text: body.text } : {}),
+            ...(typeof body.expectedTurnId === "string" ? { expectedTurnId: body.expectedTurnId } : {}),
+            source: "web", actor, listener });
+          if ("ok" in result) return json(result, 202);
+          const status = result.reason === "session_not_found" || result.reason === "disabled" || result.reason === "codex_disabled" ? 404 :
+            result.reason === "invalid_text" || result.reason === "too_long" || result.reason === "empty_text" ? 400 : 409;
+          return json(result, status);
+        }
         const result = replies.submit({ key, text: body.text as string, source: "web", actor,
           answersTurn: body.answersTurn as number | undefined, expectedTurn: body.expectedTurn as number | undefined,
           answersQuestion: body.answersQuestion as string | undefined, listener });

@@ -1,7 +1,18 @@
 import { hostname } from "node:os";
 
-export type Harness = "claude" | "omp";
+export type Harness = "claude" | "omp" | "codex";
+export type CodexAction = "turn/start" | "turn/steer" | "turn/interrupt";
 export type EventKind = "session_start" | "prompt" | "question" | "question_answered" | "permission" | "notification" | "response" | "error" | "session_end";
+
+export interface CodexControlInfo {
+  source: string;
+  appServerOwned: boolean;
+  version?: string;
+  turnStart: boolean;
+  turnSteer: boolean;
+  turnInterrupt: boolean;
+  activeTurnId?: string | null;
+}
 export interface NormalizedEvent {
   host: string;
   harness: Harness;
@@ -20,6 +31,9 @@ export interface NormalizedEvent {
   transcriptPath?: string;
   backgroundTasks?: number;
   sessionKind?: string;
+  prompt?: string;
+  responseSource?: "backfill";
+  codexControl?: CodexControlInfo;
 }
 
 export interface AskOption {
@@ -300,5 +314,53 @@ export function normalizeOmp(payload: unknown, ts = Date.now()): NormalizedEvent
     accountAlias: normalizeAccountAlias(data.accountAlias),
     ...questionFields,
     ...(answerIdentity ? { questionIdentity: answerIdentity } : {}),
+  };
+}
+export function normalizeCodex(payload: unknown, headers: Headers, ts = Date.now()): NormalizedEvent | null {
+  const data = obj(payload);
+  if (!data || data.harness !== "codex" || typeof data.host !== "string" ||
+      !/^[A-Za-z0-9_-]{1,64}$/.test(data.host) || typeof data.sessionId !== "string" ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(data.sessionId) || !Object.hasOwn(kinds, data.kind as EventKind) ||
+      typeof data.interactive !== "boolean") return null;
+  const boundHost = headers.get("X-Dash-Host");
+  if (boundHost !== null && boundHost !== data.host) return null;
+  const rawControl = obj(data.codexControl);
+  let codexControl: CodexControlInfo | undefined;
+  if (rawControl && typeof rawControl.source === "string" && rawControl.source.length <= 64 &&
+      typeof rawControl.appServerOwned === "boolean" && typeof rawControl.turnStart === "boolean" &&
+      typeof rawControl.turnSteer === "boolean" && typeof rawControl.turnInterrupt === "boolean") {
+    const version = typeof rawControl.version === "string" && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(rawControl.version)
+      ? rawControl.version : undefined;
+    const activeTurnId = rawControl.activeTurnId === null ? null
+      : typeof rawControl.activeTurnId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(rawControl.activeTurnId)
+        ? rawControl.activeTurnId : undefined;
+    codexControl = {
+      source: rawControl.source,
+      appServerOwned: rawControl.appServerOwned,
+      turnStart: rawControl.turnStart,
+      turnSteer: rawControl.turnSteer,
+      turnInterrupt: rawControl.turnInterrupt,
+      ...(version ? { version } : {}),
+      ...(activeTurnId !== undefined ? { activeTurnId } : {}),
+    };
+  }
+  const accountAlias = normalizeAccountAlias(data.accountAlias);
+  if (data.accountAlias !== undefined && accountAlias === undefined) return null;
+  const eventTs = typeof data.ts === "number" && Number.isSafeInteger(data.ts) && data.ts >= 0 ? data.ts : ts;
+  return {
+    host: data.host,
+    harness: "codex",
+    sessionId: data.sessionId,
+    kind: data.kind as EventKind,
+    ts: eventTs,
+    cwd: clip(data.cwd, 4096),
+    title: clip(data.title, 4096),
+    ...(accountAlias ? { accountAlias } : {}),
+    text: clip(data.text),
+    prompt: clip(data.prompt),
+    detail: clip(data.detail, detailLimit),
+    interactive: data.interactive,
+    responseSource: data.responseSource === "backfill" ? "backfill" : undefined,
+    ...(codexControl ? { codexControl } : {}),
   };
 }

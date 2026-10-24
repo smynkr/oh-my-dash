@@ -186,6 +186,7 @@ describe("autopilot scheduler", () => {
     expect(metrics.judge.p95Ms).not.toBeNull();
     controller.close();
   });
+
   test("replaces a grace wake when extraction changes decisions for the same response", async () => {
     process.env.DASH_AUTOPILOT_GRACE_S = "2";
     const f = makeFixture();
@@ -210,10 +211,16 @@ describe("autopilot scheduler", () => {
     };
     expect(f.db.setDecisionsIfPending(response.id, extracted, "luna")).toBe(1);
     controller.wake(seeded.key);
-    await f.timers.advanceBy(2_000);
+    await f.timers.advanceBy(999);
+    expect(judged.calls).toHaveLength(0);
+    await f.timers.advanceBy(1);
+    expect(judged.calls).toHaveLength(0);
+    await f.timers.advanceBy(999);
+    expect(judged.calls).toHaveLength(0);
+    await f.timers.advanceBy(1);
     expect(judged.calls).toHaveLength(1);
+    controller.close();
   });
-
 
   test("keeps the current response in the bounded judge history", async () => {
     const f = makeFixture();
@@ -505,7 +512,6 @@ describe("autopilot scheduler", () => {
     expect(neverAction).toMatchObject({ status: "pending", executionMethod: "suggestion", gateRule: "never" });
     expect(suggestions).toMatchObject([{ kind: "send_now", templateText: expect.stringContaining("Goal: Complete never") }]);
     expect(f.db.sqlite.query("SELECT id FROM replies WHERE session_key=? AND source='autopilot'").all(never.key)).toEqual([]);
-
     expect(neverController.sendNow(neverAction.id)).toMatchObject({ ok: true, decision: { status: "sent" } });
 
     expect(afterRestart.metrics().pendingOutcomes).toMatchObject({ pending: 0, deferred: 0, timeout: 1, sendNow: 2, veto: 1 });

@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { normalizeClaude, normalizeOmp, claudeInteractive, describePrompt, normalizeRecommendedQuestionAnswers, type NormalizedEvent } from "../src/normalize.ts";
+import { normalizeClaude, normalizeCodex, normalizeOmp, claudeInteractive, describePrompt, normalizeRecommendedQuestionAnswers, type NormalizedEvent } from "../src/normalize.ts";
 import { reduceLiveness, reduceState, type SessionState } from "../src/state.ts";
 
 const headers = new Headers({ "X-Dash-Host": "test-host", "X-Dash-Entrypoint": "cli", "X-Dash-Attended": "1" });
@@ -60,6 +60,12 @@ describe("Claude normalization", () => {
     expect(noIdentity?.questionData).toBeUndefined();
   });
 });
+test("Codex normalization preserves validated source timestamps", () => {
+  const event = { host:"test-host",harness:"codex",sessionId:"codex_session",kind:"response",interactive:true,ts:1234 };
+  expect(normalizeCodex(event, headers, 9000)?.ts).toBe(1234);
+  expect(normalizeCodex({ ...event, ts:-1 }, headers, 9000)?.ts).toBe(9000);
+  expect(normalizeCodex({ ...event, ts:"1234" }, headers, 9000)?.ts).toBe(9000);
+});
 
 test("autopilot question answers must be exactly each indexed recommendation", () => {
   const questions = [
@@ -100,6 +106,9 @@ describe("pure status reducer", () => {
     expect(reduceState(asked,event("notification",{detail:"permission_prompt",text:"synthetic raw prompt"}))).toMatchObject({status:"needs_input",needsReason:"question",needsText:"synthetic question"});
     expect(reduceState(initial,event("notification",{detail:"idle_prompt"})).status).toBe("unknown");
     expect(reduceState(initial,event("response",{backgroundTasks:2}))).toMatchObject({status:"your_turn",backgroundPending:true});
+    const activeControl = { source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:"active_turn" };
+    expect(reduceState(initial,event("response",{harness:"codex",responseSource:"backfill",codexControl:activeControl})).status).toBe("working");
+    expect(reduceState(initial,event("error",{harness:"codex",responseSource:"backfill",codexControl:activeControl})).status).toBe("working");
     expect(reduceState(initial,event("error",{text:"synthetic error"}))).toMatchObject({status:"your_turn",lastError:"synthetic error"});
     expect(reduceState(initial,event("session_end")).status).toBe("ended");
     expect(reduceState(initial,event("prompt")).lastActivity).toBe(100);

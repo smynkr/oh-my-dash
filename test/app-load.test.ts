@@ -31,6 +31,34 @@ test("app.js initialises without a synchronous error", () => {
   const run = new Function(...globals, "fetch", script);
   expect(() => run(...globals.map(() => stub()), never)).not.toThrow();
 });
+test("browser validator accepts persisted Codex harness filters", () => {
+  const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");
+  const start = script.indexOf("  const consoleConfigKeys =");
+  const end = script.indexOf("  function validateConsolePreferences(", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const valid = new Function(`${script.slice(start, end)} return validConsoleConfig;`)() as (config: unknown) => boolean;
+  expect(valid({
+    search: "", host: "", project: null, account: null, harness: "codex", status: "", headless: false,
+    ended: false, group: "", density: "comfortable", columns: [],
+  })).toBe(true);
+});
+test("Codex controls with an expired receipt are shown as outcome unknown", () => {
+  const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");
+  const start = script.indexOf("  function replyDeliveryLabel(");
+  const end = script.indexOf("  async function submitReply(", start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const label = new Function(`${script.slice(start, end)} return replyDeliveryLabel;`)() as
+    (reply: Record<string, unknown>) => [string,string];
+  const result = label({
+    codexAction:"turn/start",codexControlStatus:"unknown",codexControlReason:"ack_timeout",state:"expired",
+  });
+  expect(result[0]).toBe("Outcome unknown");
+  expect(result[1]).toContain("may or may not have been dispatched");
+  expect(result[1]).toContain("will not retry it automatically");
+});
+
 
 test("dashboard starts a replacement goal instead of editing an escalated goal", () => {
   const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");

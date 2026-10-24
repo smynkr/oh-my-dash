@@ -142,7 +142,7 @@ Selecting a session (either from the table or by clicking a session name in any 
 
 - **Sources** shows the unfiltered inventory of configured peer labels, the local hub, retained session hosts and accepted report receipts, grouped by account alias. **Last hub report**, **Last heartbeat** and session activity are shown separately.
 - Freshness uses a two-minute window. **Reporting** means a receipt falls inside it. **Stale** means the last receipt is older; this alone does not end a session. **Unreported** means no receipt exists. **Unknown** means freshness cannot be evaluated, for example when a receipt is ahead of the hub clock. Retained output never establishes freshness. Account aliases are labels, not evidence of account login or quota.
-- **Controls** reports whether viewing output, queueing a message, answering structured questions, approvals, interruption, remote resume and launch are **supported**, **unavailable** or **unknown**, with a reason. **Delivery** reflects only a presently pending reply poll. Copying a resume command does not resume a session remotely.
+- **Controls** reports whether viewing output, queueing a message, answering structured questions, approvals, interruption, remote resume and launch are **supported**, **unavailable** or **unknown**, with a reason. For Codex, only the locally app-server-owned thread controls in [Codex source adapter](#codex-source-adapter) may be supported; approvals, user-input answers, standalone-session attachment/resume and launch are not exposed. **Delivery** reflects only a presently pending reply poll, not source liveness or delivery confirmation. Copying a resume command does not resume a session remotely.
 
 ### Console API routes
 
@@ -197,7 +197,7 @@ Retention:
 
 ## Optional feature flags
 
-Feature flags live in `EnvironmentVariables` in the collector plist. Leave them empty unless needed. After any plist edit, run `plutil -lint`, then reload with `launchctl bootout` and `launchctl bootstrap` as above.
+Collector flags live in `EnvironmentVariables` in the collector plist. Codex source-runner settings listed here belong in that runner's process environment, not the collector plist. Leave flags empty unless needed. After any plist edit, run `plutil -lint`, then reload with `launchctl bootout` and `launchctl bootstrap` as above.
 
 | Setting | Effect |
 |---|---|
@@ -205,12 +205,14 @@ Feature flags live in `EnvironmentVariables` in the collector plist. Leave them 
 | `DASH_DATA` | Private directory for SQLite and judge scratch data; template default is the checkout's `data/`. |
 | `DASH_BACKFILL_HOURS` | Transcript backfill window; default `12` hours. |
 | `DASH_TELEGRAM=1` | Enables optional Telegram alerts. The bot token is read from the logged-in user's Keychain. |
-| `DASH_REPLIES=1` | Enables the reply broker, dashboard and Telegram replies, decision cards, new messages and the Ideas inbox. |
+| `DASH_REPLIES=1` | Enables the collector's reply broker, dashboard and Telegram replies, decision cards, new messages and Ideas inbox. Codex turn controls also require this flag in the source runner. |
+| `DASH_CODEX=1` | Enables Codex event/liveness intake and control support on the collector; off by default. Set it in the source runner too to start the adapter. |
 | `DASH_TG_TOPICS=1` | Enables the project-rules panel and Telegram project/topic routing. |
 | `DASH_TG_URGENT_AFTER_MIN` | Topic-mode overdue-input threshold in whole minutes; default `30`. |
 | `DASH_REPLY_TTL_MIN` | Reply expiry in minutes; default `15`, accepted range `1`–`1440`. |
 | `DASH_MESSAGE_TTL_MS` | How long a new message (not a reply) waits for delivery, in milliseconds; default `14400000` (4 hours), clamped to `60000`–`21600000`. |
-| `DASH_CODEX_BIN` | Path to the `codex` executable used by `DASH_JUDGE`; default `codex` from the LaunchAgent `PATH`. |
+| `DASH_CODEX_BIN` | Path to the `codex` executable used by the Codex source adapter and `DASH_JUDGE`; each process defaults to `codex` from its `PATH`. |
+| `DASH_CODEX_IDENTITIES` | Source-runner-only JSON array of 1–16 local Codex profiles; each explicit entry has an absolute `codeHome`. Multiple profiles require unique paths and distinct non-secret aliases; see [Codex source adapter](#codex-source-adapter). |
 | `DASH_TELEGRAM_SNIPPET_CHARS` | Optional Telegram text cap; unset sends full captured redacted text, a positive value caps it, and `0` sends labels only. |
 | `DASH_JUDGE=1` | Optional Codex-assisted decision extraction; has an effect only with `DASH_REPLIES=1`. Leave off unless the exact canary below proves tool isolation. |
 | `DASH_AUTOPILOT=1` | Runtime goals require this, `DASH_REPLIES=1`, and the stored `settings.autopilot.enabled` switch ON (it starts OFF); this environment flag is a hard veto. |
@@ -221,6 +223,43 @@ Feature flags live in `EnvironmentVariables` in the collector plist. Leave them 
 | `DASH_DIALOGS_E4_PASS=1` | Owner attestation after the E4 scratch test described below; unset by default. |
 | `DASH_DIALOGS_E5_MAX_HOLD_MS` | Owner-measured E5 synchronous hold budget in milliseconds; required range `1000`–`600000`. |
 | `DASH_ASK_HOLD_MIN` | Maximum question hold in minutes; default `10`, accepted `1`–`10`. |
+
+### Codex source adapter
+
+Codex ingestion is disabled by default. Set `DASH_CODEX=1` in the collector's environment and reload it using the procedure above. On the source machine, start the runner from a Dash checkout with Bun and the Codex CLI available:
+
+```sh
+DASH_CODEX=1 \
+DASH_URL="http://127.0.0.1:4777" \
+CODEX_HOME="$HOME/.codex" \
+DASH_ACCOUNT_ALIAS="personal" \
+bun run codex:source
+```
+
+`DASH_URL` is the existing hub's base URL. `DASH_HOST` defaults to the short local hostname; when using a remote hub, set it to the host label accepted by that hub and use its existing HTTPS/Tailscale route and peer allowlist. See [Optional Tailscale access](#optional-tailscale-access). The source runner is a foreground process; Ctrl-C or SIGTERM stops it. It starts a local `codex app-server` for each profile and forwards thread metadata, recent turns and turn-state updates exposed by that server, plus liveness. It does not install a service or configure Codex login.
+
+Without `DASH_CODEX_IDENTITIES`, the runner uses one profile from `CODEX_HOME` (default `~/.codex`) and `DASH_ACCOUNT_ALIAS`. An explicit value is a JSON array of 1–16 objects containing only `accountAlias` and `codeHome`; each `codeHome` is an absolute local path. If you configure multiple profiles, each must have a distinct non-secret alias as well as a unique path:
+
+```sh
+export DASH_CODEX_IDENTITIES='[{"accountAlias":"work","codeHome":"/absolute/path/to/work-codex-home"},{"accountAlias":"personal","codeHome":"/absolute/path/to/personal-codex-home"}]'
+```
+
+The source runner reads Codex profile and login state locally. It does not send the configured `codeHome` path or credentials as profile settings; normal thread metadata, including a thread's working-directory path when present, is forwarded to the hub. Account aliases are display labels, not authenticated identities.
+
+#### Codex control matrix
+
+| Action | Availability |
+|---|---|
+| View retained output | Supported when the app-server exposes the thread. Viewing output does not establish that its source is currently connected. |
+| Start a turn | Available only for an app-server-owned thread with no observed active turn, when `DASH_CODEX=1` and `DASH_REPLIES=1` are set on both collector and source runner, and the local app-server is version `0.160.x`. Queue acceptance is not a delivery guarantee. |
+| Steer an active turn | Available only for an app-server-owned thread with an observed active turn and the same collector/source flags and app-server version requirement. |
+| Interrupt an active turn | Available only for an app-server-owned thread with an observed active turn and the same collector/source flags and app-server version requirement. |
+| Answer a structured user-input request | Unsupported. Requests may be surfaced in Dash, but no answer is submitted; respond in the Codex session. |
+| Approve a request | Unsupported. Dash never grants Codex approval requests; respond in the Codex session. |
+| Attach to or remotely resume a standalone CLI/Desktop session | Unsupported. Existing thread history may be readable if the app-server exposes it, but only threads marked as owned by this app-server can be controlled. Dash does not attach to standalone sessions. |
+| Launch a session | Unsupported. Dash does not launch Codex sessions. |
+
+Capabilities describe the local app-server's observed methods and active turn; they are not proof of source liveness. A pending Codex reply waiter is only a delivery-path observation, not proof the action reached Codex. If a committed control times out before its acknowledgement, the receipt becomes `expired` with `codexControlStatus: unknown` and reason `ack_timeout`. The action may or may not have been dispatched. Dash does not retry committed Codex controls automatically; inspect the target Codex thread before deciding whether to submit again.
 
 ### Optional Telegram
 

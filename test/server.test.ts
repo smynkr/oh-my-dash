@@ -328,7 +328,7 @@ describe("output search API", () => {
     expect(await getJson("/api/search")).toEqual({ results: [], nextCursor: null });
     expect(await getJson(`/api/search?${new URLSearchParams({ q: "   " })}`)).toEqual({ results: [], nextCursor: null });
     const invalid = [
-      "limit=0", "limit=101", "limit=1.5", "harness=codex", "headless=true", "ended=",
+      "limit=0", "limit=101", "limit=1.5", "harness=invalid", "headless=true", "ended=",
       "cursor=not-a-cursor", "q=x&q=y", "cwd=x&cwd=y", "repositoryHost=x&repositoryHost=y", "unknown=value",
     ];
     for (const query of invalid) expect((await fetch(`${base}/api/search?${query}`)).status).toBe(400);
