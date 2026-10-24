@@ -288,6 +288,7 @@ function startAdapter(options: {
     requestTimeoutMs: options.requestTimeoutMs ?? 1_000,
     restartDelayMs: options.restartDelayMs ?? 50,
     onEvent: event => { events.push(event); changes.notify(); },
+    onLiveness: records => { liveness.push(records); changes.notify(); },
   });
   activeAdapter = adapter;
   adapter.start();
