@@ -390,10 +390,12 @@ function threadStatus(thread: Record<string, unknown>): "busy" | "idle" | "unkno
   return "unknown";
 }
 
-function codexControlInfo(source: string, version: string | undefined, features: { turnStart: boolean; turnSteer: boolean; turnInterrupt: boolean }, activeTurnId?: string | null): CodexControlInfo {
+function codexControlInfo(source: string, version: string | undefined,
+  features: { turnStart: boolean; turnSteer: boolean; turnInterrupt: boolean },
+  activeTurnId: string | null | undefined, appServerOwned: boolean): CodexControlInfo {
   return {
     source,
-    appServerOwned: source === "appServer",
+    appServerOwned,
     ...(version ? { version } : {}),
     turnStart: features.turnStart,
     turnSteer: features.turnSteer,
@@ -402,8 +404,10 @@ function codexControlInfo(source: string, version: string | undefined, features:
   };
 }
 
-function messageCode(error: unknown): "unsupported_method" | "stale_turn" | "codex_error" {
+function messageCode(error: unknown): "unsupported_method" | "stale_turn" | "thread_active_elsewhere" | "codex_error" {
   if (error instanceof CodexRpcError && error.code === -32601) return "unsupported_method";
+  if (error instanceof CodexRpcError && /(?:thread|conversation).*(?:active|open|locked|owned).*(?:another|different|other)\s+(?:client|app[- ]?server|app(?:lication)?|server|process|instance)|(?:another|different)\s+(?:client|app[- ]?server|app(?:lication)?|server|process|instance).*(?:thread|conversation).*(?:active|open|locked|owned)/i.test(error.message))
+    return "thread_active_elsewhere";
   if (error instanceof CodexRpcError && /turn.*(not active|does not match|stale)|expected.*turn/i.test(error.message)) return "stale_turn";
   return "codex_error";
 }
@@ -428,7 +432,6 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     app: undefined as CodexAppServer | undefined,
     version: undefined as string | undefined,
     features: { turnStart: false, turnSteer: false, turnInterrupt: false },
-    resumeSupported: true,
     sessionByThread: new Map<string, string>(),
     threadBySession: new Map<string, string>(),
     metadataSignature: new Map<string, string>(),
@@ -443,6 +446,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     turnIdsByThread: new Map<string, Set<string>>(),
     startingTurnByThread: new Map<string, TurnStartReservation>(),
     loaded: new Set<string>(),
+    adapterOwnedThreads: new Set<string>(),
     pollers: new Map<string, AbortController>(),
     syncing: false,
     syncAgain: false,
@@ -458,6 +462,9 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
   let lastLivenessKey = "";
   let lastLivenessAt = Number.NEGATIVE_INFINITY;
   let forwardInterval: ReturnType<typeof setInterval> | undefined;
+
+  const appServerOwned = (profile: typeof profiles[number], threadId: string) =>
+    profile.loaded.has(threadId) || profile.adapterOwnedThreads.has(threadId);
 
   const report = (area: string, code: string) => {
     const key = `${area}:${code}`;
@@ -583,13 +590,21 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     }
     let keepStartReservation = false;
     try {
-      if (starting && !profile.loaded.has(threadId) && profile.resumeSupported) {
+      if (starting && !profile.loaded.has(threadId)) {
         try { await app.request("thread/resume", { threadId, excludeTurns: true }); }
         catch (error) {
-          if (!(error instanceof CodexRpcError && error.code === -32601 && error.method === "thread/resume")) throw error;
-          profile.resumeSupported = false;
-          profile.loaded.add(threadId);
+          if (error instanceof CodexRpcUnknownError && error.method === "thread/resume") {
+            report("codex control", error.reason);
+            return { outcome: "unknown", reason: error.reason };
+          }
+          if (error instanceof CodexRpcError && error.code === -32601 && error.method === "thread/resume")
+            return { outcome: "unsupported", reason: "resume_unsupported" };
+          const reason = messageCode(error);
+          report("codex thread resume", reason);
+          return { outcome: "failed", reason: reason === "thread_active_elsewhere" ? reason : "thread_resume_failed" };
         }
+        profile.loaded.add(threadId);
+        profile.adapterOwnedThreads.add(threadId);
       }
       if (starting) {
         const reservation = profile.startingTurnByThread.get(threadId);
@@ -598,6 +613,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           reservation.expiresAt = reservation.requestedAt + turnStartReservationMs;
         }
         await app.request("turn/start", { threadId, input: [{ type: "text", text: message.text! }], clientUserMessageId: `dash-${message.id}` });
+        profile.adapterOwnedThreads.add(threadId);
         keepStartReservation = true;
       } else if (message.action === "turn/steer") {
         await app.request("turn/steer", { threadId, input: [{ type: "text", text: message.text! }], expectedTurnId: message.expectedTurnId!, clientUserMessageId: `dash-${message.id}` });
@@ -619,13 +635,14 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           await emitEvent({ host: options.host, harness: "codex", sessionId: profile.sessionByThread.get(threadId)!,
             kind: "error", ts: now(), interactive: true, accountAlias: profile.identity.accountAlias, responseSource: "backfill",
             text: "The Codex app-server rejected this control method as unsupported.", detail: "unsupported_method",
-            codexControl: codexControlInfo("appServer", profile.version, profile.features, profile.activeTurnByThread.get(threadId) ?? null) });
+            codexControl: codexControlInfo(profile.threadBySessionMetadata.get(profile.sessionByThread.get(threadId)!)?.source ?? "unknown",
+              profile.version, profile.features, profile.activeTurnByThread.get(threadId) ?? null, appServerOwned(profile, threadId)) });
           return { outcome: "unsupported" };
         }
       }
       const reason = messageCode(error);
       report("codex control", reason);
-      if (reason === "stale_turn") return { outcome: "failed", reason };
+      if (reason === "stale_turn" || reason === "thread_active_elsewhere") return { outcome: "failed", reason };
       return { outcome: "failed" };
     } finally {
       if (starting && !keepStartReservation) profile.startingTurnByThread.delete(threadId);
@@ -698,10 +715,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       stopPollers(profile); return;
     }
     const desired = new Map<string, string>();
-    for (const [threadId, sessionId] of profile.sessionByThread) {
-      const metadata = profile.threadBySessionMetadata.get(sessionId);
-      if (metadata?.source === "appServer") desired.set(sessionId, threadId);
-    }
+    for (const [threadId, sessionId] of profile.sessionByThread) desired.set(sessionId, threadId);
     for (const sessionId of [...profile.pollers.keys()]) if (!desired.has(sessionId)) stopPoller(profile, sessionId);
     for (const [sessionId, threadId] of desired) {
       if (profile.pollers.has(sessionId)) continue;
@@ -762,6 +776,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
   };
 
   const syncRaw = async (profile: typeof profiles[number], app: CodexAppServer) => {
+    profile.loaded = await listLoaded(app);
     const summaries = await listThreads(app);
     const seen = new Set<string>();
     const version = profile.version;
@@ -790,7 +805,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       let sessionStartChecked = false;
       const emitSessionStart = async () => {
         sessionStartChecked = true;
-        const sourceControl = codexControlInfo(meta.source, version, profile.features, profile.activeTurnByThread.get(threadId) ?? null);
+        const sourceControl = codexControlInfo(meta.source, version, profile.features,
+          profile.activeTurnByThread.get(threadId) ?? null, appServerOwned(profile, threadId));
         const snapshot = JSON.stringify([meta.signature, sourceControl]);
         const metadataChanged = previousSignature !== summaryMeta.signature;
         if (metadataChanged || profile.controlSignature.get(threadId) !== snapshot) {
@@ -860,7 +876,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                   await emitEvent({ host: options.host, harness: "codex", sessionId, kind: "prompt",
                     ts: asSeconds(turn.startedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                     accountAlias: profile.identity.accountAlias, text: prompt, interactive: true,
-                    codexControl: codexControlInfo(meta.source, version, profile.features, turnId) }, { threadId, turnId });
+                    codexControl: codexControlInfo(meta.source, version, profile.features, turnId, appServerOwned(profile, threadId)) }, { threadId, turnId });
                 }
               } else if (turn.status === "completed") {
                 const text = turnOutput(turn);
@@ -872,7 +888,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                   ts: asSeconds(turn.completedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                   accountAlias: profile.identity.accountAlias, text, prompt, interactive: true,
                   ...(previousActiveTurnId === turnId || submittedTurnId === turnId ? {} : { responseSource: "backfill" as const }),
-                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) }, { threadId, turnId });
+                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null, appServerOwned(profile, threadId)) }, { threadId, turnId });
                 emittedTerminal.set(turnId, signature);
               } else if (turn.status === "interrupted" || turn.status === "failed") {
                 const error = record(turn.error);
@@ -884,7 +900,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                   ts: asSeconds(turn.completedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                   accountAlias: profile.identity.accountAlias, text, detail: turn.status, interactive: true,
                   ...(previousActiveTurnId === turnId || submittedTurnId === turnId ? {} : { responseSource: "backfill" as const }),
-                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) }, { threadId, turnId});
+                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null, appServerOwned(profile, threadId)) }, { threadId, turnId});
                 emittedTerminal.set(turnId, signature);
               }
             }
@@ -903,6 +919,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       if (seen.has(threadId)) continue;
       const sessionId = profile.sessionByThread.get(threadId)!;
       profile.sessionByThread.delete(threadId);
+      profile.adapterOwnedThreads.delete(threadId);
       profile.threadBySession.delete(sessionId);
       profile.metadataSignature.delete(threadId);
       profile.failedTurnReads.delete(threadId);
@@ -917,7 +934,6 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       profile.threadBySessionMetadata.delete(sessionId);
       stopPoller(profile, sessionId);
     }
-    profile.loaded = await listLoaded(app);
     reconcilePollers(profile);
   };
 
@@ -966,7 +982,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       accountAlias: profile.identity.accountAlias, title: profile.threadBySessionMetadata.get(sessionId)?.title,
       cwd: profile.threadBySessionMetadata.get(sessionId)?.cwd, text, detail: method.slice(0, detailLimit),
       interactive: true, codexControl: codexControlInfo(source, profile.version, profile.features,
-        profile.activeTurnByThread.get(threadId) ?? null) })
+        profile.activeTurnByThread.get(threadId) ?? null, appServerOwned(profile, threadId)) })
       .catch(() => report("codex app-server request", "event_delivery_failed"));
   };
 
@@ -985,7 +1001,6 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       });
       profile.app = app;
       profile.state = "starting";
-      profile.resumeSupported = true;
       profile.metadataSignature.clear();
       profile.controlSignature.clear();
       profile.turnSignature.clear();

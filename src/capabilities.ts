@@ -1,4 +1,5 @@
 import type { SessionDTO } from "./db.ts";
+import type { CodexAction } from "./normalize.ts";
 
 export type CapabilityStatus = "supported" | "unavailable" | "unknown";
 export type CapabilityAction = { status: CapabilityStatus; reason: string; code?: string };
@@ -36,14 +37,15 @@ export function isReplyKey(value: unknown): value is string {
 }
 
 /** The single source of truth for queueing refusals and the corresponding message capability. */
-export function messageRefusalReason(session: CapabilitySession | null | undefined, enabled: boolean, codexEnabled = false): MessageRefusalReason | undefined {
+export function messageRefusalReason(session: CapabilitySession | null | undefined, enabled: boolean, codexEnabled = false,
+  codexAction?: CodexAction): MessageRefusalReason | undefined {
   if (!enabled) return "disabled";
   if (!session) return undefined;
   if (!isReplyKey(session.key)) return "invalid_key";
   if (session.status === "ended") return "session_ended";
   if (session.harness === "codex") {
     if (!codexEnabled) return "codex_disabled";
-    if (!session.codexControl?.appServerOwned || session.codexControl.source !== "appServer") return "codex_not_owned";
+    if (!session.codexControl || !session.codexControl.appServerOwned && codexAction !== "turn/start") return "codex_not_owned";
   }
   if (session.harness === "claude" && session.status === "needs_input" && claudeDialogs[session.needsReason ?? ""] === true) return "claude_dialog";
   if (session.harness === "omp" && session.status === "needs_input" && session.needsReason === "permission") return "omp_approval";
@@ -58,8 +60,8 @@ function codexControlCapability(session: CapabilitySession, codexEnabled: boolea
   if (!repliesEnabled) return unavailable("Replies are disabled; Dash will not accept Codex controls.", "disabled");
   if (!codexEnabled) return unavailable("Codex controls are disabled; DASH_CODEX must be enabled on the Dash console server.", "codex_disabled");
   const control = session.codexControl;
-  if (!control?.appServerOwned || control.source !== "appServer")
-    return unavailable("Only threads owned by this Codex app-server can be controlled; standalone CLI and desktop sessions are read-only.", "codex_not_owned");
+  if (!control?.appServerOwned)
+    return unavailable("Steer and interrupt require a thread loaded or resumed by this Codex app-server; standalone sessions are read-only.", "codex_not_owned");
   if (!control.activeTurnId) return unavailable("No active Codex turn is observed; steer and interrupt require a target turn.", "no_active_turn");
   if (action === "turn/steer" && !control.turnSteer)
     return unavailable("The installed Codex app-server does not advertise turn/steer support.", "unsupported_control");
@@ -70,7 +72,7 @@ function codexControlCapability(session: CapabilitySession, codexEnabled: boolea
 
 export function sessionCapabilities(session: CapabilitySession, enabled: boolean, observation: DeliveryObservation | undefined, now: number,
   codexEnabled = false): SessionCapabilities {
-  const refusal = messageRefusalReason(session, enabled, codexEnabled);
+  const refusal = messageRefusalReason(session, enabled, codexEnabled, session.harness === "codex" ? "turn/start" : undefined);
   const message: CapabilityAction = refusal ? {
     status: "unavailable",
     code: refusal,
@@ -80,14 +82,14 @@ export function sessionCapabilities(session: CapabilitySession, enabled: boolean
       : refusal === "claude_dialog" ? "Claude's native dialog must be answered in Claude Code or Remote Control; Dash refuses queued text here."
       : refusal === "omp_approval" ? "OMP's native approval must be answered in the session; Dash refuses queued text here."
       : refusal === "codex_disabled" ? "Codex control is disabled; enable DASH_CODEX on the Dash console server."
-      : "This Codex thread is not owned by this app-server; standalone sessions are read-only.",
+      : "This Codex thread is not owned by this app-server; only a listed thread's turn/start may attempt to resume it.",
   } : session.harness === "codex"
     ? session.status === "ended"
       ? unavailable("The session has ended; Dash will not accept Codex controls.", "session_ended")
       : session.codexControl?.activeTurnId
         ? unavailable("A Codex turn is active; use steer or interrupt instead of starting another turn.", "turn_active")
         : session.codexControl?.turnStart
-          ? { status: "supported", reason: "Dash accepts a message into this Codex app-server's bounded turn/start queue; acceptance does not guarantee delivery." }
+          ? { status: "supported", reason: "Dash queues `turn/start`; if this listed thread is not loaded, its source first attempts `thread/resume`. Queue acceptance does not guarantee a resume or turn start." }
           : unavailable("The installed Codex app-server does not advertise turn/start support.", "unsupported_control")
     : {
       status: "supported",

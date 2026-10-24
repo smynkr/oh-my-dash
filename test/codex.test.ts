@@ -348,6 +348,8 @@ describe("Codex app-server adapter", () => {
     await waitUntil(() =>
       events.some(event => event.kind === "session_start" && event.accountAlias === "Alpha") &&
       events.some(event => event.kind === "session_start" && event.accountAlias === "Beta") &&
+      events.some(event => event.kind === "prompt" && event.accountAlias === "Alpha") &&
+      events.some(event => event.kind === "prompt" && event.accountAlias === "Beta") &&
       events.some(event => event.kind === "response" && event.accountAlias === "Alpha") &&
       events.some(event => event.kind === "response" && event.accountAlias === "Beta") &&
       liveness.some(records => records.some(record => record.sessionId === alphaSession) &&
@@ -357,11 +359,11 @@ describe("Codex app-server adapter", () => {
     const betaStart = events.find(event => event.kind === "session_start" && event.accountAlias === "Beta");
     expect(alphaStart).toMatchObject({
       host: "codex-test-host", harness: "codex", sessionId: alphaSession, title: "Alpha history", cwd: "/fake/alpha",
-      accountAlias: "Alpha", codexControl: { source: "appServer", appServerOwned: true, turnStart: true, turnInterrupt: true },
+      accountAlias: "Alpha", codexControl: { source: "vscode", appServerOwned: true, turnStart: true, turnInterrupt: true },
     });
     expect(betaStart).toMatchObject({
       host: "codex-test-host", harness: "codex", sessionId: betaSession, title: "Beta history", cwd: "/fake/beta",
-      accountAlias: "Beta", codexControl: { source: "appServer", appServerOwned: true, turnStart: true, turnInterrupt: true },
+      accountAlias: "Beta", codexControl: { source: "vscode", appServerOwned: true, turnStart: true, turnInterrupt: true },
     });
     expect(alphaSession).not.toBe(betaSession);
     const alphaPrompt = events.find(event => event.kind === "prompt" && event.accountAlias === "Alpha");
@@ -632,42 +634,81 @@ describe("Codex app-server adapter", () => {
     expect(events.find(event => event.kind === "error" && event.detail === "unsupported_method")?.codexControl?.turnStart).toBe(false);
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
   }, 10_000);
-  test("a thread/resume -32601 is treated as loaded and does not disable turn/start", async () => {
-    const home = makeHome("resume-unsupported-home");
+
+
+  test("resumes a listed unloaded vscode-source thread before starting and then marks it owned", async () => {
+    const home = makeHome("resume-unloaded-home");
     const hub = new FakeControlHub();
     activeHub = hub;
-    const threadId = "resume_unsupported_thread";
-    const turnsFile = join(home,"resume-unsupported-turns.json");
-    writeFileSync(turnsFile,"[]");
+    const threadId = "resume_unloaded_thread";
     const { adapter, events } = startAdapter({
-      identities: [{ accountAlias:"ResumeUnsupported",codeHome:home }],
+      identities: [{ accountAlias:"ResumeUnloaded",codeHome:home }],
       hub,
       fixture: {
-        profiles: { [basename(home)]: {
-          threadId,title:"Resume unsupported",turnsFile,
-          turnAfterStart:completedTurn("resume_fallback_turn","start after resume unsupported","resume fallback output"),
-        } },
+        profiles: { [basename(home)]: { threadId,title:"Resume unloaded",turns:[] } },
         loadedThreads: [],
-        unsupportedOnceMethods: ["thread/resume"],
       },
     });
     await adapter.waitForReady(5_000);
-    const session = sessionIdFor("ResumeUnsupported",threadId);
-    await waitUntil(() => hub.waitSessions.has(session));
+    const session = sessionIdFor("ResumeUnloaded",threadId);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.source === "vscode" && event.codexControl.appServerOwned === false) && hub.waitSessions.has(session));
     const target = sessionKey("codex-test-host",session);
-
-    hub.enqueue(session,{ id:906,target,action:"turn/start",text:"start after resume unsupported" });
+    hub.enqueue(session,{ id:906,target,action:"turn/start",text:"start after resume" });
     await waitUntil(() => hub.receipts.some(receipt => receipt.id === 906));
     expect(hub.receipts.find(receipt => receipt.id === 906)).toMatchObject({ outcome:"accepted" });
-    await waitUntil(() => events.some(event => event.kind === "response" && event.sessionId === session));
-    expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(1);
-    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.appServerOwned === true));
+    const requests = readRpc(home);
+    const resumeIndex = requests.findIndex(request => request.method === "thread/resume");
+    const startIndex = requests.findIndex(request => request.method === "turn/start");
+    expect(resumeIndex).toBeGreaterThanOrEqual(0);
+    expect(resumeIndex).toBeLessThan(startIndex);
+    expect(requests.filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
 
-    hub.enqueue(session,{ id:907,target,action:"turn/start",text:"start after resume recovers" });
+
+  test("resume rejection returns an honest failure without starting or claiming ownership", async () => {
+    const home = makeHome("resume-rejected-home");
+    const hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "resume_rejected_thread";
+    const { adapter, events } = startAdapter({
+      identities: [{ accountAlias:"ResumeRejected",codeHome:home }],
+      hub,
+      fixture: {
+        profiles: { [basename(home)]: { threadId,title:"Resume rejected",turns:[] } },
+        loadedThreads: [],
+        failRequests: ["thread/resume"],
+        failRequestMessages: { "thread/resume":"Thread is currently active in another app-server" },
+      },
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("ResumeRejected",threadId);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.appServerOwned === false) && hub.waitSessions.has(session));
+    hub.enqueue(session,{ id:907,target:sessionKey("codex-test-host",session),action:"turn/start",text:"must not start" });
     await waitUntil(() => hub.receipts.some(receipt => receipt.id === 907));
-    expect(hub.receipts.find(receipt => receipt.id === 907)).toMatchObject({ outcome:"accepted" });
+    expect(hub.receipts.find(receipt => receipt.id === 907)).toMatchObject({
+      outcome:"failed",reason:"thread_active_elsewhere",
+    });
     expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(1);
-    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(2);
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(0);
+    expect(events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.appServerOwned === true)).toBe(false);
+  }, 10_000);
+
+  test("a loaded vscode-source thread is owned immediately", async () => {
+    const home = makeHome("loaded-vscode-home");
+    const { adapter, events } = startAdapter({
+      identities: [{ accountAlias:"LoadedVscode",codeHome:home }],
+      fixture: { profiles: { [basename(home)]: { threadId:"loaded_vscode_thread",title:"Loaded vscode" } } },
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("LoadedVscode","loaded_vscode_thread");
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session));
+    expect(events.find(event => event.kind === "session_start" && event.sessionId === session)?.codexControl)
+      .toMatchObject({ source:"vscode",appServerOwned:true });
   }, 10_000);
 
   test("does not send turn/start while a Codex turn is already active", async () => {
@@ -841,7 +882,7 @@ describe("Codex app-server adapter", () => {
       fixture: { profiles: {
         [basename(alphaHome)]: { threadId, title: "Alpha control", turns: [] },
         [basename(betaHome)]: { threadId, title: "Beta control", turns: [] },
-      } },
+      }, loadedThreads: [] },
     });
     await adapter.waitForReady(5_000);
 
@@ -865,6 +906,8 @@ describe("Codex app-server adapter", () => {
     expect(alphaStarts[0]?.params).toEqual({
       threadId, input: [{ type: "text", text: "send only to Alpha" }], clientUserMessageId: "dash-901",
     });
+    expect(readRpc(alphaHome).filter(request => request.method === "thread/resume")).toHaveLength(1);
+    expect(readRpc(betaHome).filter(request => request.method === "thread/resume")).toHaveLength(0);
     expect(betaStarts).toHaveLength(0);
   }, 10_000);
 

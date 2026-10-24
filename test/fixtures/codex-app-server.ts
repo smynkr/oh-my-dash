@@ -39,10 +39,11 @@ const thread = {
   id: threadId,
   name: profile.title ?? `Fake ${basename(codeHome)}`,
   cwd: profile.cwd ?? `/tmp/${basename(codeHome)}`,
-  source: "appServer",
+  source: "vscode",
   status: { type: "active" },
   updatedAt: 1_800_000_000,
 };
+const loadedThreads = new Set(config.loadedThreads ?? [threadId]);
 const failAfterInitialSync = new Set(config.failAfterInitialSync ?? []);
 const failOnceMethods = new Set(config.failOnceMethods ?? []);
 const unsupportedOnceMethods = new Set(config.unsupportedOnceMethods ?? []);
@@ -104,14 +105,18 @@ lines.on("line", line => {
       result = { data: params.archived === true ? [] : [currentThread("list")] };
       break;
     case "thread/loaded/list":
-      initialSyncComplete = true;
-      result = { data: config.loadedThreads ?? [threadId] };
+      result = { data: [...loadedThreads] };
       break;
     case "thread/read":
       result = { thread: currentThread("read") };
       break;
+    case "thread/resume":
+      loadedThreads.add(typeof params.threadId === "string" ? params.threadId : threadId);
+      result = { thread: currentThread("read") };
+      break;
     case "thread/turns/list":
       result = { data: profile.turnsFile ? JSON.parse(readFileSync(profile.turnsFile, "utf8")) : profile.turns ?? [] };
+      initialSyncComplete = true;
       if (profile.turnsDelayMs) {
         setTimeout(() => respond({ id, result }), profile.turnsDelayMs);
         return;
