@@ -15,8 +15,10 @@ import type { NormalizedEvent } from "../src/normalize.ts";
 const fixturePath = fileURLToPath(new URL("./fixtures/codex-app-server.ts", import.meta.url));
 type FakeProfile = {
   threadId: string;
+  threadIds?: string[];
   title?: string;
   cwd?: string;
+  turnsByThread?: Record<string, unknown[]>;
   turns?: unknown[];
   turnsFile?: string;
   turnsDelayMs?: number;
@@ -67,6 +69,11 @@ let changes: ChangeSignal;
 
 class FakeControlHub {
   readonly waitSessions = new Set<string>();
+  readonly activeWaitSessions = new Set<string>();
+  readonly activeWaitsAtCommit: number[] = [];
+  readonly activeWaitsAtAck: number[] = [];
+  activeWaits = 0;
+  maxActiveWaits = 0;
   readonly commits: Record<string, unknown>[] = [];
   readonly receipts: Record<string, unknown>[] = [];
   readonly receiptAttempts: Record<string, unknown>[] = [];
@@ -108,22 +115,32 @@ class FakeControlHub {
     if (request.method === "GET" && url.pathname === "/reply/wait/codex") {
       const session = url.searchParams.get("session") ?? "";
       this.waitSessions.add(session);
+      this.activeWaitSessions.add(session);
+      this.activeWaits++;
+      this.maxActiveWaits = Math.max(this.maxActiveWaits, this.activeWaits);
       changes.notify();
-      const ready = this.take(session);
-      if (ready) return Response.json(ready);
-      await this.waitForControl(request, session);
-      changes.notify();
-      const delivery = this.take(session);
-      return delivery ? Response.json(delivery) : new Response(null, { status: 204 });
+      try {
+        const ready = this.take(session);
+        if (ready) return Response.json(ready);
+        await this.waitForControl(request, session);
+        changes.notify();
+        const delivery = this.take(session);
+        return delivery ? Response.json(delivery) : new Response(null, { status: 204 });
+      } finally {
+        this.activeWaits--;
+        this.activeWaitSessions.delete(session);
+      }
     }
     if (request.method === "POST" && url.pathname === "/reply/commit") {
       this.commits.push(await request.json() as Record<string, unknown>);
+      this.activeWaitsAtCommit.push(this.activeWaits);
       changes.notify();
       return Response.json({ ok: true });
     }
     if (request.method === "POST" && url.pathname === "/reply/ack") {
       const receipt = await request.json() as Record<string, unknown>;
       this.receiptAttempts.push(receipt);
+      this.activeWaitsAtAck.push(this.activeWaits);
       changes.notify();
       if (this.ackFailuresRemaining > 0) {
         this.ackFailuresRemaining--;
@@ -345,15 +362,17 @@ describe("Codex app-server adapter", () => {
 
     const alphaSession = sessionIdFor("Alpha", threadId);
     const betaSession = sessionIdFor("Beta", threadId);
-    await waitUntil(() =>
+    await waitUntil(() => Boolean(
       events.some(event => event.kind === "session_start" && event.accountAlias === "Alpha") &&
       events.some(event => event.kind === "session_start" && event.accountAlias === "Beta") &&
       events.some(event => event.kind === "prompt" && event.accountAlias === "Alpha") &&
       events.some(event => event.kind === "prompt" && event.accountAlias === "Beta") &&
       events.some(event => event.kind === "response" && event.accountAlias === "Alpha") &&
       events.some(event => event.kind === "response" && event.accountAlias === "Beta") &&
-      liveness.some(records => records.some(record => record.sessionId === alphaSession) &&
-        records.some(record => record.sessionId === betaSession)));
+      liveness.at(-1)?.some(record => record.sessionId === alphaSession && record.cwd === "/fake/alpha" &&
+        record.name === "Alpha history" && record.detail === "busy") &&
+      liveness.at(-1)?.some(record => record.sessionId === betaSession && record.cwd === "/fake/beta" &&
+        record.name === "Beta history" && record.detail === "busy")));
 
     const alphaStart = events.find(event => event.kind === "session_start" && event.accountAlias === "Alpha");
     const betaStart = events.find(event => event.kind === "session_start" && event.accountAlias === "Beta");
@@ -752,6 +771,47 @@ describe("Codex app-server adapter", () => {
       outcome:"failed",reason:"codex_not_owned",
     });
     expect(readRpc(home).filter(request => request.method === "turn/steer")).toHaveLength(0);
+  }, 10_000);
+
+  test("bounds Codex waits and rotates queued controls through the remaining sessions", async () => {
+    const home = makeHome("poll-admission-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadIds = Array.from({ length:68 },(_, index) => `poll_admission_thread_${String(index).padStart(2,"0")}`);
+    const { adapter } = startAdapter({
+      identities:[{accountAlias:"PollAdmission",codeHome:home}],
+      hub,
+      fixture:{profiles:{[basename(home)]:{
+        threadId:threadIds[0]!,threadIds,title:"Poll admission",
+        turnsByThread:{[threadIds[1]!]:[activeTurn("poll_priority_active","active polling thread")]},
+      }},loadedThreads:[threadIds[0]!] },
+    });
+    await adapter.waitForReady(5_000);
+    await waitUntil(() => hub.activeWaits === 64);
+    expect(hub.activeWaits).toBe(64);
+    expect(hub.maxActiveWaits).toBeLessThanOrEqual(64);
+
+    const admittedThread = threadIds[67]!;
+    const queuedThread = threadIds[5]!;
+    const admittedSession = sessionIdFor("PollAdmission",admittedThread);
+    const queuedSession = sessionIdFor("PollAdmission",queuedThread);
+    const admittedTarget = sessionKey("codex-test-host",admittedSession);
+    const queuedTarget = sessionKey("codex-test-host",queuedSession);
+    expect(hub.activeWaitSessions.has(sessionIdFor("PollAdmission",threadIds[0]!))).toBe(true);
+    expect(hub.activeWaitSessions.has(sessionIdFor("PollAdmission",threadIds[1]!))).toBe(true);
+    expect(hub.activeWaitSessions.has(queuedSession)).toBe(false);
+    hub.enqueue(queuedSession,{ id:960,target:queuedTarget,action:"turn/start",text:"queued session control" });
+    expect(hub.receipts.some(receipt => receipt.id === 960)).toBe(false);
+    hub.enqueue(admittedSession,{ id:961,target:admittedTarget,action:"turn/start",text:"admitted session control" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 960) &&
+      hub.receipts.some(receipt => receipt.id === 961));
+
+    expect(hub.receipts.find(receipt => receipt.id === 960)).toMatchObject({ outcome:"accepted" });
+    expect(hub.receipts.find(receipt => receipt.id === 961)).toMatchObject({ outcome:"accepted" });
+    expect(hub.waitSessions.has(queuedSession)).toBe(true);
+    expect(hub.maxActiveWaits).toBeLessThanOrEqual(64);
+    expect(hub.activeWaitsAtCommit.some(count => count >= 63 && count <= 64)).toBe(true);
+    expect(hub.activeWaitsAtAck.some(count => count >= 63 && count <= 64)).toBe(true);
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(2);
   }, 10_000);
 
   test("does not send turn/start while a Codex turn is already active", async () => {

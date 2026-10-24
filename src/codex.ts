@@ -451,6 +451,86 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     syncing: false,
     syncAgain: false,
   }));
+  const maxConcurrentControlWaiters = 64;
+  type ControlWaitRequest = {
+    profile: typeof profiles[number];
+    threadId: string;
+    key: string;
+    first: boolean;
+    order: number;
+    controller: AbortController;
+    resolve: (release: (() => void) | undefined) => void;
+    onAbort: () => void;
+  };
+  const pendingControlWaits: ControlWaitRequest[] = [];
+  const admittedControlSessions = new Set<string>();
+  let activeControlWaits = 0;
+  let controlWaitOrder = 0;
+  let controlWaitPumpQueued = false;
+  const controlPollerKey = (profile: typeof profiles[number], sessionId: string) =>
+    `${profile.identity.accountAlias}\0${sessionId}`;
+  const controlWaitPriority = (request: ControlWaitRequest): [number, number] => {
+    const profile = request.profile;
+    const owned = profile.loaded.has(request.threadId) || profile.adapterOwnedThreads.has(request.threadId);
+    const active = profile.activeTurnByThread.has(request.threadId);
+    return [owned ? 0 : active ? 1 : 2, -(profile.metadataByThread.get(request.threadId)?.updatedAt ?? 0)];
+  };
+  const compareControlWaits = (left: ControlWaitRequest, right: ControlWaitRequest) => {
+    if (left.first !== right.first) return left.first ? -1 : 1;
+    if (left.first) {
+      const [leftRank, leftUpdatedAt] = controlWaitPriority(left);
+      const [rightRank, rightUpdatedAt] = controlWaitPriority(right);
+      if (leftRank !== rightRank) return leftRank - rightRank;
+      if (leftUpdatedAt !== rightUpdatedAt) return leftUpdatedAt - rightUpdatedAt;
+    }
+    return left.order - right.order;
+  };
+  const pumpControlWaits = () => {
+    pendingControlWaits.sort(compareControlWaits);
+    while (activeControlWaits < maxConcurrentControlWaiters && pendingControlWaits.length) {
+      const request = pendingControlWaits.shift()!;
+      request.controller.signal.removeEventListener("abort", request.onAbort);
+      if (request.controller.signal.aborted) { request.resolve(undefined); continue; }
+      if (request.first) admittedControlSessions.add(request.key);
+      activeControlWaits++;
+      let released = false;
+      request.resolve(() => {
+        if (released) return;
+        released = true;
+        activeControlWaits--;
+        queueControlWaitPump();
+      });
+    }
+  };
+  const queueControlWaitPump = () => {
+    if (controlWaitPumpQueued) return;
+    controlWaitPumpQueued = true;
+    queueMicrotask(() => {
+      controlWaitPumpQueued = false;
+      pumpControlWaits();
+    });
+  };
+  const acquireControlWait = (profile: typeof profiles[number], sessionId: string, threadId: string,
+    controller: AbortController): Promise<(() => void) | undefined> => new Promise(resolve => {
+    if (controller.signal.aborted) { resolve(undefined); return; }
+    const key = controlPollerKey(profile, sessionId);
+    let request: ControlWaitRequest;
+    const onAbort = () => {
+      const index = pendingControlWaits.indexOf(request);
+      if (index < 0) return;
+      pendingControlWaits.splice(index, 1);
+      controller.signal.removeEventListener("abort", onAbort);
+      resolve(undefined);
+    };
+    request = {
+      profile, threadId, key, first: !admittedControlSessions.has(key),
+      order: controlWaitOrder++, controller, resolve, onAbort,
+    };
+    pendingControlWaits.push(request);
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    if (controller.signal.aborted) onAbort();
+    else queueControlWaitPump();
+  });
   const pendingForward = new Map<string, NormalizedEvent>();
   const sessionStartEventNamespace = randomBytes(16).toString("hex");
   let sessionStartEventSequence = 0;
@@ -544,6 +624,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     const controller = profile.pollers.get(sessionId);
     if (!controller) return;
     profile.pollers.delete(sessionId);
+    admittedControlSessions.delete(controlPollerKey(profile, sessionId));
     controller.abort();
   };
 
@@ -658,20 +739,31 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     const waiter = randomBytes(16).toString("base64url");
     const startedAt = now();
     while (!closed && !controller.signal.aborted && profile.app && profile.state === "ready") {
+      const release = await acquireControlWait(profile, sessionId, threadId, controller);
+      if (!release) return;
       const url = new URL("/reply/wait/codex", hub);
       url.searchParams.set("session", sessionId);
       url.searchParams.set("waiter", waiter);
       url.searchParams.set("started", String(startedAt));
       url.searchParams.set("wait", "55");
       url.searchParams.set("commit", "1");
-      let response: Response;
+      let response: Response | undefined;
+      let raw: unknown;
+      let invalidDelivery = false;
+      let requestFailed = false;
       try {
         response = await fetcher(url, { headers: { "X-Dash-Host": options.host }, signal: controller.signal });
-      } catch {
+        if (response.status === 200) {
+          try { raw = await response.json(); } catch { invalidDelivery = true; }
+        }
+      } catch { requestFailed = true; }
+      finally { release(); }
+      if (requestFailed) {
         if (controller.signal.aborted) return;
         await new Promise(resolvePromise => setTimeout(resolvePromise, retryDelayMs));
         continue;
       }
+      if (!response) continue;
       if (response.status === 204) continue;
       if (response.status === 410) return;
       if (response.status === 409) { await new Promise(resolvePromise => setTimeout(resolvePromise, 500)); continue; }
@@ -680,8 +772,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         await new Promise(resolvePromise => setTimeout(resolvePromise, retryDelayMs));
         continue;
       }
-      let raw: unknown;
-      try { raw = await response.json(); } catch { report("codex control", "invalid_delivery"); continue; }
+      if (invalidDelivery) { report("codex control", "invalid_delivery"); continue; }
       const item = record(raw);
       if (!item || !Number.isSafeInteger(item.id) || Number(item.id) < 1 || item.target !== sessionKey(options.host, sessionId) ||
           (item.action !== "turn/start" && item.action !== "turn/steer" && item.action !== "turn/interrupt") ||
