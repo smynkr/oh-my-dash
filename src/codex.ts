@@ -160,15 +160,21 @@ export class CodexRpcError extends Error {
     this.name = "CodexRpcError";
   }
 }
-class CodexRpcTimeoutError extends Error {
-  constructor(readonly method: string) {
-    super("Codex app-server request timed out");
+class CodexRpcUnknownError extends Error {
+  constructor(readonly method: string, readonly reason: "request_timeout" | "request_interrupted", message: string) {
+    super(message.slice(0, 512));
+    this.name = "CodexRpcUnknownError";
+  }
+}
+class CodexRpcTimeoutError extends CodexRpcUnknownError {
+  constructor(method: string) {
+    super(method, "request_timeout", "Codex app-server request timed out");
     this.name = "CodexRpcTimeoutError";
   }
 }
 
 type RpcId = number | string;
-type PendingRpc = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+type PendingRpc = { method: string; resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 type AppServerNotification = (method: string, params: Record<string, unknown>) => void;
 type AppServerRequest = (method: string, params: Record<string, unknown>) => void;
 
@@ -242,7 +248,7 @@ class CodexAppServer {
         this.pending.delete(String(id));
         rejectPromise(new CodexRpcTimeoutError(method));
       }, timeoutMs);
-      this.pending.set(String(id), { resolve: resolvePromise, reject: rejectPromise, timer });
+      this.pending.set(String(id), { method, resolve: resolvePromise, reject: rejectPromise, timer });
       try { this.child!.stdin!.write(`${JSON.stringify({ method, id, params })}\n`); }
       catch {
         clearTimeout(timer); this.pending.delete(String(id));
@@ -305,7 +311,10 @@ class CodexAppServer {
   }
 
   private failPending(error: Error): void {
-    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new CodexRpcUnknownError(pending.method, "request_interrupted", error.message));
+    }
     this.pending.clear();
   }
 
@@ -524,14 +533,17 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     }
   };
 
-  const dispatchControl = async (profile: typeof profiles[number], threadId: string, message: CodexControlMessage): Promise<"accepted" | "unsupported" | "failed" | "unknown"> => {
+  type DispatchControlResult =
+    | { outcome: "accepted" | "unsupported" | "failed"; reason?: never }
+    | { outcome: "unknown"; reason: "request_timeout" | "request_interrupted" };
+  const dispatchControl = async (profile: typeof profiles[number], threadId: string, message: CodexControlMessage): Promise<DispatchControlResult> => {
     const app = profile.app;
-    if (!app || profile.state !== "ready") return "failed";
-    if (message.action !== "turn/start" && message.action !== "turn/steer" && message.action !== "turn/interrupt") return "unsupported";
-    if (message.action === "turn/start" && (!profile.features.turnStart || !message.text?.trim())) return "unsupported";
-    if (message.action === "turn/steer" && (!profile.features.turnSteer || !message.text?.trim())) return "unsupported";
-    if (message.action === "turn/interrupt" && !profile.features.turnInterrupt) return "unsupported";
-    if (message.action !== "turn/start" && (!message.expectedTurnId || profile.activeTurnByThread.get(threadId) !== message.expectedTurnId)) return "failed";
+    if (!app || profile.state !== "ready") return { outcome: "failed" };
+    if (message.action !== "turn/start" && message.action !== "turn/steer" && message.action !== "turn/interrupt") return { outcome: "unsupported" };
+    if (message.action === "turn/start" && (!profile.features.turnStart || !message.text?.trim())) return { outcome: "unsupported" };
+    if (message.action === "turn/steer" && (!profile.features.turnSteer || !message.text?.trim())) return { outcome: "unsupported" };
+    if (message.action === "turn/interrupt" && !profile.features.turnInterrupt) return { outcome: "unsupported" };
+    if (message.action !== "turn/start" && (!message.expectedTurnId || profile.activeTurnByThread.get(threadId) !== message.expectedTurnId)) return { outcome: "failed" };
     try {
       if (message.action === "turn/start" && !profile.loaded.has(threadId)) {
         await app.request("thread/resume", { threadId, excludeTurns: true });
@@ -543,11 +555,11 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       } else {
         await app.request("turn/interrupt", { threadId, turnId: message.expectedTurnId! });
       }
-      return "accepted";
+      return { outcome: "accepted" };
     } catch (error) {
-      if (error instanceof CodexRpcTimeoutError && error.method !== "thread/resume") {
-        report("codex control", "request_timeout");
-        return "unknown";
+      if (error instanceof CodexRpcUnknownError && error.method !== "thread/resume") {
+        report("codex control", error.reason);
+        return { outcome: "unknown", reason: error.reason };
       }
       if (error instanceof CodexRpcError && error.code === -32601) {
         if (message.action === "turn/start") profile.features.turnStart = false;
@@ -557,12 +569,12 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           kind: "error", ts: now(), interactive: true, accountAlias: profile.identity.accountAlias, responseSource: "backfill",
           text: "The Codex app-server rejected this control method as unsupported.", detail: "unsupported_method",
           codexControl: codexControlInfo("appServer", profile.version, profile.features, profile.activeTurnByThread.get(threadId) ?? null) });
-        return "unsupported";
+        return { outcome: "unsupported" };
       }
       const reason = messageCode(error);
       report("codex control", reason);
-      if (reason === "stale_turn") return "failed";
-      return "failed";
+      if (reason === "stale_turn") return { outcome: "failed" };
+      return { outcome: "failed" };
     } finally {
       if (profile.app === app && !app.isExited) syncInBackground(profile, app);
     }
@@ -620,10 +632,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         continue;
       }
       if (!committed.ok) { report("codex control", `commit_http_${committed.status}`); continue; }
-      const outcome = await dispatchControl(profile, threadId, message);
-      const reason = outcome === "unknown" ? "request_timeout" : outcome === "unsupported" ? "unsupported_method" : outcome === "failed" ?
+      const result = await dispatchControl(profile, threadId, message);
+      const reason = result.outcome === "unknown" ? result.reason : result.outcome === "unsupported" ? "unsupported_method" : result.outcome === "failed" ?
         message.action !== "turn/start" && profile.activeTurnByThread.get(threadId) !== message.expectedTurnId ? "stale_turn" : "codex_error" : undefined;
-      await ackControl(profile, waiter, message, outcome, reason);
+      await ackControl(profile, waiter, message, result.outcome, reason);
     }
   };
 

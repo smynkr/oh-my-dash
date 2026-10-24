@@ -36,6 +36,7 @@ type FakeServerConfig = {
   unsupportedMethods?: string[];
   failRequests?: string[];
   timeoutMethods?: string[];
+  exitMethods?: string[];
   failAfterInitialSync?: string[];
   crashFirstLaunch?: boolean;
   crashDelayMs?: number;
@@ -669,6 +670,29 @@ describe("Codex app-server adapter", () => {
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
   }, 10_000);
 
+  test("an app-server exit after a sent control RPC reports unknown without replay", async () => {
+    const home = makeHome("control-exit-home");
+    const hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "control_exit_thread";
+    const { adapter } = startAdapter({
+      identities: [{ accountAlias:"Interrupted",codeHome:home }],
+      hub,
+      fixture: { profiles: { [basename(home)]: { threadId,title:"Interrupted control" } }, exitMethods:["turn/start"] },
+      requestTimeoutMs:5_000,
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("Interrupted", threadId), target = sessionKey("codex-test-host", session);
+    await waitUntil(() => hub.waitSessions.has(session));
+    hub.enqueue(session, { id:923,target,action:"turn/start",text:"possibly dispatched" });
+    await waitUntil(() => readRpc(home).some(request => request.method === "turn/start"));
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 923));
+
+    expect(hub.receipts.find(receipt => receipt.id === 923)).toMatchObject({
+      id:923,target,outcome:"unknown",reason:"request_interrupted",
+    });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
 
   test("control poller survives commit transport failure without replaying a possibly committed action", async () => {
     const home = makeHome("commit-retry-home");
