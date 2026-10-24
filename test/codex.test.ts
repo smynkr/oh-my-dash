@@ -34,6 +34,7 @@ type RpcRecord = Record<string, unknown> & { method?: string; params?: Record<st
 type FakeServerConfig = {
   profiles: Record<string, FakeProfile>;
   unsupportedMethods?: string[];
+  failRequests?: string[];
   timeoutMethods?: string[];
   failAfterInitialSync?: string[];
   crashFirstLaunch?: boolean;
