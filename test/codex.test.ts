@@ -288,7 +288,6 @@ function startAdapter(options: {
     requestTimeoutMs: options.requestTimeoutMs ?? 1_000,
     restartDelayMs: options.restartDelayMs ?? 50,
     onEvent: event => { events.push(event); changes.notify(); },
-    onLiveness: records => { liveness.push(records); changes.notify(); },
   });
   activeAdapter = adapter;
   adapter.start();
@@ -575,16 +574,21 @@ describe("Codex app-server adapter", () => {
     expect(events.find(event => event.kind === "error" && event.detail === "unsupported_method")?.codexControl?.turnStart).toBe(false);
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
   }, 10_000);
-  test("a thread/resume unsupported response does not disable turn/start", async () => {
+  test("a thread/resume -32601 is treated as loaded and does not disable turn/start", async () => {
     const home = makeHome("resume-unsupported-home");
     const hub = new FakeControlHub();
     activeHub = hub;
     const threadId = "resume_unsupported_thread";
-    const { adapter } = startAdapter({
+    const turnsFile = join(home,"resume-unsupported-turns.json");
+    writeFileSync(turnsFile,"[]");
+    const { adapter, events } = startAdapter({
       identities: [{ accountAlias:"ResumeUnsupported",codeHome:home }],
       hub,
       fixture: {
-        profiles: { [basename(home)]: { threadId,title:"Resume unsupported" } },
+        profiles: { [basename(home)]: {
+          threadId,title:"Resume unsupported",turnsFile,
+          turnAfterStart:completedTurn("resume_fallback_turn","start after resume unsupported","resume fallback output"),
+        } },
         loadedThreads: [],
         unsupportedOnceMethods: ["thread/resume"],
       },
@@ -594,18 +598,18 @@ describe("Codex app-server adapter", () => {
     await waitUntil(() => hub.waitSessions.has(session));
     const target = sessionKey("codex-test-host",session);
 
-    hub.enqueue(session,{ id:906,target,action:"turn/start",text:"retry after resume failure" });
+    hub.enqueue(session,{ id:906,target,action:"turn/start",text:"start after resume unsupported" });
     await waitUntil(() => hub.receipts.some(receipt => receipt.id === 906));
-    expect(hub.receipts.find(receipt => receipt.id === 906)).toMatchObject({
-      outcome:"failed",reason:"resume_unsupported",
-    });
-    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(0);
+    expect(hub.receipts.find(receipt => receipt.id === 906)).toMatchObject({ outcome:"accepted" });
+    await waitUntil(() => events.some(event => event.kind === "response" && event.sessionId === session));
+    expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(1);
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
 
     hub.enqueue(session,{ id:907,target,action:"turn/start",text:"start after resume recovers" });
     await waitUntil(() => hub.receipts.some(receipt => receipt.id === 907));
     expect(hub.receipts.find(receipt => receipt.id === 907)).toMatchObject({ outcome:"accepted" });
-    expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(2);
-    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+    expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(1);
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(2);
   }, 10_000);
 
   test("does not send turn/start while a Codex turn is already active", async () => {
@@ -1019,16 +1023,22 @@ describe("Codex app-server adapter", () => {
     activeHub = hub;
     hub.ackStatus = 404;
     const threadId = "ack_terminal_thread";
-    const { adapter } = startAdapter({
+    const turnsFile = join(home,"ack-terminal-turns.json");
+    writeFileSync(turnsFile,"[]");
+    const { adapter, events } = startAdapter({
       identities: [{ accountAlias:"AckTerminal",codeHome:home }],
       hub,
-      fixture: { profiles: { [basename(home)]: { threadId,title:"Terminal ack" } } },
+      fixture: { profiles: { [basename(home)]: {
+        threadId,title:"Terminal ack",turnsFile,
+        turnAfterStart:completedTurn("ack_terminal_turn_1","first terminal receipt","first completed output"),
+      } } },
     });
     await adapter.waitForReady(5_000);
     const session = sessionIdFor("AckTerminal", threadId), target = sessionKey("codex-test-host", session);
     await waitUntil(() => hub.waitSessions.has(session));
     hub.enqueue(session, { id:920,target,action:"turn/start",text:"first terminal receipt" });
     await waitUntil(() => hub.receiptAttempts.some(receipt => receipt.id === 920));
+    await waitUntil(() => events.some(event => event.kind === "response" && event.sessionId === session));
     hub.enqueue(session, { id:921,target,action:"turn/start",text:"poller keeps working" });
     await waitUntil(() => hub.receiptAttempts.some(receipt => receipt.id === 921));
     expect(hub.receiptAttempts.map(receipt => receipt.id)).toEqual([920,921]);

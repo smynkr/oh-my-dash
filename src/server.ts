@@ -797,7 +797,7 @@ export function createDashServer(options: ServerOptions = {}) {
         const event = path.endsWith("claude") ? normalizeClaude(body, request.headers, receivedAt) :
           path.endsWith("codex") ? normalizeCodex(body, request.headers, receivedAt) : normalizeOmp(body, receivedAt);
         if (event) {
-          const dto = db.applyEvent(event, eventId ?? undefined);
+          const dto = db.applyEvent(event, eventId ?? undefined, receivedAt);
           db.recordSourceReport(event.host, receivedAt);
           emitSources();
           send(dto, event.kind);

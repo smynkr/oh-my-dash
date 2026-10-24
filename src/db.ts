@@ -212,7 +212,7 @@ export class DashDB {
       CREATE INDEX IF NOT EXISTS responses_hash ON responses(session_key, text_sha1);
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY, session_key TEXT NOT NULL REFERENCES sessions(key) ON DELETE CASCADE,
-        ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT, event_id TEXT
+        ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT, event_id TEXT, event_id_seen_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
       CREATE INDEX IF NOT EXISTS events_session_kind ON events(session_key, kind);
@@ -382,7 +382,9 @@ export class DashDB {
       }
       this.sqlite.exec("CREATE INDEX IF NOT EXISTS responses_decision_pending ON responses(decision_state,id)");
       if (!eventColumns.has("event_id")) this.sqlite.exec("ALTER TABLE events ADD COLUMN event_id TEXT");
+      if (!eventColumns.has("event_id_seen_at")) this.sqlite.exec("ALTER TABLE events ADD COLUMN event_id_seen_at INTEGER");
       this.sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS events_session_event_id ON events(session_key,event_id) WHERE event_id IS NOT NULL");
+      this.sqlite.exec("CREATE INDEX IF NOT EXISTS events_event_id_seen_at ON events(event_id_seen_at) WHERE event_id_seen_at IS NOT NULL");
     this.invalidateInterruptedQuestions(Date.now());
     })();
     const alertColumns = new Set((this.sqlite.query("PRAGMA table_info(tg_alerts)").all() as { name: string }[]).map(c => c.name));
@@ -1275,7 +1277,7 @@ export class DashDB {
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(key, event.host, event.harness, event.sessionId, value(event.cwd), value(event.title), event.interactive ? 1 : 0, value(event.transcriptPath), value(event.sessionKind), event.ts, event.ts);
     return this.getRow(key)!;
   }
-  applyEvent(event: NormalizedEvent, eventId?: string): SessionDTO {
+  applyEvent(event: NormalizedEvent, eventId?: string, receivedAt = Date.now()): SessionDTO {
     const key = sessionKey(event);
     const invocation = event.harness === "claude" && event.toolUseId ? this.questionForToolUse(key,event.toolUseId) : undefined;
     const current = invocation ? { ...event, questionIdentity: invocation.id } : event;
@@ -1297,8 +1299,8 @@ export class DashDB {
           ? JSON.stringify({ questionIdentity: current.questionIdentity })
           : value(current.detail);
       if (eventId !== undefined) {
-        const inserted = this.sqlite.query("INSERT OR IGNORE INTO events(session_key,ts,kind,detail,event_id) VALUES(?,?,?,?,?)")
-          .run(key, current.ts, current.kind, questionDetail, eventId);
+        const inserted = this.sqlite.query("INSERT OR IGNORE INTO events(session_key,ts,kind,detail,event_id,event_id_seen_at) VALUES(?,?,?,?,?,?)")
+          .run(key, current.ts, current.kind, questionDetail, eventId, receivedAt);
         if (inserted.changes === 0) return;
       }
       const codexControl = current.codexControl;
@@ -1331,7 +1333,9 @@ export class DashDB {
         this.insertResponse(key, clip(current.text)!, describePrompt(current.prompt ?? next.lastPrompt), current.ts,
           current.responseSource ?? "hook", current.responseSource === "backfill" ? null : n(row.turn_seq) + 1);
       }
-      this.sqlite.query("DELETE FROM events WHERE ts<?").run(Date.now() - 7 * 86400_000);
+      const eventCutoff = receivedAt - 7 * 86400_000;
+      this.sqlite.query("DELETE FROM events WHERE (event_id_seen_at IS NULL AND ts<?) OR event_id_seen_at<?")
+        .run(eventCutoff, eventCutoff);
     })();
     return this.getSession(key)!;
   }

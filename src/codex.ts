@@ -425,6 +425,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     app: undefined as CodexAppServer | undefined,
     version: undefined as string | undefined,
     features: { turnStart: false, turnSteer: false, turnInterrupt: false },
+    resumeSupported: true,
     sessionByThread: new Map<string, string>(),
     threadBySession: new Map<string, string>(),
     metadataSignature: new Map<string, string>(),
@@ -564,8 +565,13 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     }
     let keepStartReservation = false;
     try {
-      if (starting && !profile.loaded.has(threadId)) {
-        await app.request("thread/resume", { threadId, excludeTurns: true });
+      if (starting && !profile.loaded.has(threadId) && profile.resumeSupported) {
+        try { await app.request("thread/resume", { threadId, excludeTurns: true }); }
+        catch (error) {
+          if (!(error instanceof CodexRpcError && error.code === -32601 && error.method === "thread/resume")) throw error;
+          profile.resumeSupported = false;
+          profile.loaded.add(threadId);
+        }
       }
       if (starting) {
         await app.request("turn/start", { threadId, input: [{ type: "text", text: message.text! }], clientUserMessageId: `dash-${message.id}` });
@@ -583,7 +589,6 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         return { outcome: "unknown", reason: error.reason };
       }
       if (error instanceof CodexRpcError && error.code === -32601) {
-        if (error.method === "thread/resume") return { outcome: "failed", reason: "resume_unsupported" };
         if (error.method === message.action) {
           if (message.action === "turn/start") profile.features.turnStart = false;
           if (message.action === "turn/steer") profile.features.turnSteer = false;
@@ -848,6 +853,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           }
         }
       }
+      if (!sessionStartChecked) await emitSessionStart();
       if (previousSignature !== summaryMeta.signature || !profile.threadStatusById.has(threadId))
         profile.threadStatusById.set(threadId, threadStatus(thread));
       profile.threadBySessionMetadata.set(sessionId, { source: meta.source, title: meta.title, cwd: meta.cwd });
@@ -939,7 +945,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       });
       profile.app = app;
       profile.state = "starting";
-      profile.loaded.clear();
+      profile.resumeSupported = true;
       profile.metadataSignature.clear();
       profile.controlSignature.clear();
       profile.turnSignature.clear();
