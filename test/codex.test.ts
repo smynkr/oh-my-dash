@@ -488,7 +488,7 @@ describe("Codex app-server adapter", () => {
     expect(events.some(event => event.kind === "response" && event.sessionId === sessionIdFor("EmptyCompletion",threadId)))
       .toBe(false);
   }, 10_000);
-  test("retains hydrated thread metadata when list summaries stay unchanged", async () => {
+  test("retains hydrated metadata and publishes updates with unchanged turns", async () => {
     const home = makeHome("hydrated-metadata-home"), threadId = "hydrated_metadata_thread";
     const summaryPath = join(home,"summary.json"), hydratedPath = join(home,"hydrated.json");
     writeFileSync(summaryPath,JSON.stringify({ name:"List summary title",cwd:"/summary",updatedAt:1_800_000_000 }));
@@ -505,9 +505,17 @@ describe("Codex app-server adapter", () => {
     await waitUntil(() => events.some(event => event.kind === "session_start" &&
       event.sessionId === sessionId && event.title === "Hydrated thread title"));
     await waitUntil(() => readRpc(home).filter(request => request.method === "thread/list").length >= 4);
-    const starts = events.filter(event => event.kind === "session_start" && event.sessionId === sessionId);
-    expect(starts).toHaveLength(1);
-    expect(starts[0]).toMatchObject({ title:"Hydrated thread title",cwd:"/hydrated" });
+    const initialStarts = events.filter(event => event.kind === "session_start" && event.sessionId === sessionId);
+    expect(initialStarts).toHaveLength(1);
+    expect(initialStarts[0]).toMatchObject({ title:"Hydrated thread title",cwd:"/hydrated" });
+
+    writeFileSync(summaryPath,JSON.stringify({ name:"Updated list title",cwd:"/updated-summary",updatedAt:1_800_000_001 }));
+    writeFileSync(hydratedPath,JSON.stringify({ name:"Updated hydrated title",cwd:"/updated-hydrated",updatedAt:1_800_000_001 }));
+    await waitUntil(() => events.some(event => event.kind === "session_start" &&
+      event.sessionId === sessionId && event.title === "Updated hydrated title"));
+    const updatedStarts = events.filter(event => event.kind === "session_start" && event.sessionId === sessionId);
+    expect(updatedStarts).toHaveLength(2);
+    expect(updatedStarts[1]).toMatchObject({ title:"Updated hydrated title",cwd:"/updated-hydrated" });
   }, 10_000);
 
   test("waitForReady resolves when one identity is ready and another remains offline", async () => {
