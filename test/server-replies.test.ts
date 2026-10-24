@@ -18,7 +18,7 @@ let originalEnv: Record<string, string | undefined>;
 const sid = "synthetic_session";
 const waiter = "waiteraaaaaaaaaa";
 const remoteHeaders = { Host: "dash.tailnet.test", "X-Forwarded-For": "192.0.2.10" };
-const envNames = ["DASH_REPLIES", "DASH_CODEX", "DASH_ALLOWED_HOSTS", "DASH_ALLOWED_PEERS", "DASH_TAILNET_PORT", "DASH_TG_TOPICS", "DASH_TELEGRAM", "DASH_TELEGRAM_API_BASE", "DASH_JUDGE", "DASH_CODEX_BIN"];
+const envNames = ["DASH_REPLIES", "DASH_CODEX", "DASH_ALLOWED_HOSTS", "DASH_ALLOWED_PEERS", "DASH_TAILNET_PORT", "DASH_TG_TOPICS", "DASH_TELEGRAM", "DASH_TELEGRAM_API_BASE", "DASH_JUDGE", "DASH_CODEX_BIN", "DASH_HOST", "DASH_CODEX_IDENTITIES"];
 
 beforeEach(() => {
   originalEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
@@ -32,6 +32,8 @@ beforeEach(() => {
   process.env.DASH_TELEGRAM_API_BASE = "";
   process.env.DASH_JUDGE = "";
   process.env.DASH_CODEX_BIN = "";
+  process.env.DASH_HOST = "";
+  process.env.DASH_CODEX_IDENTITIES = "";
   nowMs = 1_000_000;
 });
 
@@ -297,9 +299,11 @@ test("Codex request-timeout acknowledgements persist as expired unknown receipts
     state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
   });
 });
-test("Codex loopback control routes honor a configured source host label", async () => {
+test("Codex loopback control routes honor only a configured source host label", async () => {
   process.env.DASH_CODEX = "1";
-  const baseUrl = setup(true), host = "codex-profile-host";
+  const host = "codex-profile-host";
+  process.env.DASH_HOST = host;
+  const baseUrl = setup(true);
   const session = app!.db.applyEvent({
     host,harness:"codex",sessionId:"custom_host_session",kind:"session_start",ts:nowMs,interactive:true,
     codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null },
@@ -317,6 +321,8 @@ test("Codex loopback control routes honor a configured source host label", async
   waitUrl.searchParams.set("wait","1");
   waitUrl.searchParams.set("commit","1");
   const headers = { "X-Dash-Host":host };
+  const unconfiguredWait = await fetch(waitUrl,{ headers:{ "X-Dash-Host":"other-codex-host" } });
+  await expectExactJson(unconfiguredWait,403,{ error:"forbidden" });
   const delivered = await fetch(waitUrl,{ headers });
   expect(delivered.status).toBe(200);
   expect(await delivered.json()).toMatchObject({ id:replyId,target:session.key });
@@ -329,8 +335,42 @@ test("Codex loopback control routes honor a configured source host label", async
   },headers),200,{ ok:true });
   await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
     id:replyId,waiter:waiterId,target:session.key,outcome:"accepted",
+  },{ "X-Dash-Host":"other-codex-host" }),403,{ error:"forbidden" });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
+    id:replyId,waiter:waiterId,target:session.key,outcome:"accepted",
   },headers),200,{ ok:true });
   expect(app!.db.getReply(replyId)).toMatchObject({ state:"delivered",codexControlStatus:"accepted" });
+});
+
+test("loopback Codex rejects unconfigured labels even when they match the target host", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true), host = "remote-codex-host";
+  const session = app!.db.applyEvent({
+    host,harness:"codex",sessionId:"remote_target_session",kind:"session_start",ts:nowMs,interactive:true,
+    codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null },
+  });
+  const submitted = await apiJson(baseUrl + apiReplyPath(session.key), {
+    action:"turn/start",text:"Synthetic remote-source control",
+  });
+  expect(submitted.status).toBe(202);
+  const { replyId } = await submitted.json() as { replyId:number };
+  const waitUrl = new URL("/reply/wait/codex",baseUrl);
+  waitUrl.searchParams.set("session",session.sessionId);
+  waitUrl.searchParams.set("waiter","codexunconfiguredwaiter1");
+  waitUrl.searchParams.set("started",String(nowMs));
+  waitUrl.searchParams.set("wait","1");
+  waitUrl.searchParams.set("commit","1");
+  const hostHeaders = { "X-Dash-Host":host };
+
+  await expectExactJson(await fetch(waitUrl,{ headers:hostHeaders }),403,{ error:"forbidden" });
+  expect(app!.db.getReply(replyId)?.state).toBe("queued");
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", {
+    id:replyId,waiter:"codexunconfiguredwaiter1",target:session.key,
+  },hostHeaders),403,{ error:"forbidden" });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
+    id:replyId,waiter:"codexunconfiguredwaiter1",target:session.key,outcome:"accepted",
+  },hostHeaders),403,{ error:"forbidden" });
+  expect(app!.db.getReply(replyId)).toMatchObject({ state:"queued",codexControlStatus:"pending" });
 });
 
 test("submission snapshot guards reject malformed versions without queueing text", async () => {

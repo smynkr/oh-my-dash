@@ -54,6 +54,7 @@ const textLimit = 100 * 1024;
 const detailLimit = 4 * 1024;
 const pageLimit = 100;
 const turnStartClockSkewMs = 5_000;
+const turnStartReservationMs = 60_000; // Match the bounded Codex control lease.
 const maxThreadPages = 100;
 const sessionKey = (host: string, sessionId: string) => `${host}|codex|${sessionId}`;
 const record = (value: unknown): Record<string, unknown> | null =>
@@ -179,7 +180,7 @@ type PendingRpc = { method: string; resolve: (value: unknown) => void; reject: (
 type CodexControlDispatchResult =
   | { outcome: "accepted" | "unsupported" | "failed"; reason?: string }
   | { outcome: "unknown"; reason: "request_timeout" | "request_interrupted" };
-type TurnStartReservation = { baselineTurnIds: Set<string> | null; prompt: string; requestedAt: number };
+type TurnStartReservation = { baselineTurnIds: Set<string> | null; prompt: string; requestedAt: number; expiresAt: number };
 type AppServerNotification = (method: string, params: Record<string, unknown>) => void;
 type AppServerRequest = (method: string, params: Record<string, unknown>) => void;
 
@@ -447,6 +448,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     syncAgain: false,
   }));
   const pendingForward = new Map<string, NormalizedEvent>();
+  const sessionStartEventNamespace = randomBytes(16).toString("hex");
+  let sessionStartEventSequence = 0;
   const identityErrors = new Set<string>();
   let closed = false;
   const { promise: closedSignal, resolve: signalClosed } = Promise.withResolvers<void>();
@@ -492,11 +495,16 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     } finally { forwarding = false; }
   };
 
-  const emitEvent = async (event: NormalizedEvent) => {
+  const emitEvent = async (event: NormalizedEvent, turnIdentity?: { threadId: string; turnId: string }) => {
     await options.onEvent(event);
     if (!shouldForward) return;
-    const digest = createHash("sha256").update(JSON.stringify(event)).digest("hex");
-    if (!pendingForward.has(digest)) pendingForward.set(digest, event);
+    const digest = createHash("sha256");
+    if (turnIdentity) digest.update(turnIdentity.threadId).update("\0").update(turnIdentity.turnId).update("\0");
+    else if (event.kind === "session_start") {
+      digest.update(sessionStartEventNamespace).update("\0").update(String(++sessionStartEventSequence)).update("\0");
+    }
+    const eventId = digest.update(JSON.stringify(event)).digest("hex");
+    if (!pendingForward.has(eventId)) pendingForward.set(eventId, event);
     if (pendingForward.size > 2_000) pendingForward.delete(pendingForward.keys().next().value!);
     void flushForward();
   };
@@ -559,14 +567,18 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     if (message.action === "turn/interrupt" && !profile.features.turnInterrupt) return { outcome: "unsupported" };
     if (message.action !== "turn/start" && (!message.expectedTurnId || profile.activeTurnByThread.get(threadId) !== message.expectedTurnId)) return { outcome: "failed" };
     const starting = message.action === "turn/start";
-    if (starting && (profile.activeTurnByThread.has(threadId) || profile.startingTurnByThread.has(threadId)))
-      return { outcome: "failed", reason: "turn_active" };
     if (starting) {
+      const previous = profile.startingTurnByThread.get(threadId);
+      if (previous && now() >= previous.expiresAt) profile.startingTurnByThread.delete(threadId);
+      if (profile.activeTurnByThread.has(threadId)) return { outcome: "failed", reason: "turn_active" };
+      if (profile.startingTurnByThread.has(threadId)) return { outcome: "failed", reason: "turn_start_pending" };
       const known = profile.turnIdsByThread.get(threadId);
+      const requestedAt = now();
       profile.startingTurnByThread.set(threadId, {
         baselineTurnIds: known ? new Set(known) : null,
         prompt: message.text!,
-        requestedAt: now(),
+        requestedAt,
+        expiresAt: requestedAt + turnStartReservationMs,
       });
     }
     let keepStartReservation = false;
@@ -581,7 +593,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       }
       if (starting) {
         const reservation = profile.startingTurnByThread.get(threadId);
-        if (reservation) reservation.requestedAt = now();
+        if (reservation) {
+          reservation.requestedAt = now();
+          reservation.expiresAt = reservation.requestedAt + turnStartReservationMs;
+        }
         await app.request("turn/start", { threadId, input: [{ type: "text", text: message.text! }], clientUserMessageId: `dash-${message.id}` });
         keepStartReservation = true;
       } else if (message.action === "turn/steer") {
@@ -812,28 +827,20 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
             }
             const startReservation = profile.startingTurnByThread.get(threadId);
             let submittedTurnId: string | undefined;
-            let observedStartedTurn = Boolean(activeTurnId);
+            let observedStartedTurn = false;
             if (startReservation) {
-              if (startReservation.baselineTurnIds) {
-                for (const turnId of turnIds) if (!startReservation.baselineTurnIds.has(turnId)) {
-                  observedStartedTurn = true;
-                  submittedTurnId = turnId;
-                  break;
-                }
-              } else {
-                const startedAfter = startReservation.requestedAt - turnStartClockSkewMs;
-                for (const turn of turns) {
-                  const turnId = string(turn.id);
-                  if (!turnId || !threadIdPattern.test(turnId)) continue;
-                  if (turn.status !== "completed" && turn.status !== "interrupted" && turn.status !== "failed") continue;
-                  if (turnPrompt(turn) !== startReservation.prompt) continue;
-                  const turnStartedAt = asSeconds(turn.startedAt);
-                  if (turnStartedAt !== undefined && turnStartedAt >= startedAfter) {
-                    observedStartedTurn = true;
-                    submittedTurnId = turnId;
-                    break;
-                  }
-                }
+              const startedAfter = startReservation.requestedAt - turnStartClockSkewMs;
+              for (const turn of turns) {
+                const turnId = string(turn.id);
+                if (!turnId || !threadIdPattern.test(turnId) || startReservation.baselineTurnIds?.has(turnId)) continue;
+                const status = string(turn.status);
+                if (status !== "inProgress" && status !== "completed" && status !== "interrupted" && status !== "failed") continue;
+                if (turnPrompt(turn) !== startReservation.prompt) continue;
+                const turnStartedAt = asSeconds(turn.startedAt);
+                if (turnStartedAt === undefined || turnStartedAt < startedAfter) continue;
+                observedStartedTurn = true;
+                submittedTurnId = turnId;
+                break;
               }
             }
             if (observedStartedTurn) profile.startingTurnByThread.delete(threadId);
@@ -853,7 +860,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                   await emitEvent({ host: options.host, harness: "codex", sessionId, kind: "prompt",
                     ts: asSeconds(turn.startedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                     accountAlias: profile.identity.accountAlias, text: prompt, interactive: true,
-                    codexControl: codexControlInfo(meta.source, version, profile.features, turnId) });
+                    codexControl: codexControlInfo(meta.source, version, profile.features, turnId) }, { threadId, turnId });
                 }
               } else if (turn.status === "completed") {
                 const text = turnOutput(turn);
@@ -865,7 +872,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                   ts: asSeconds(turn.completedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                   accountAlias: profile.identity.accountAlias, text, prompt, interactive: true,
                   ...(previousActiveTurnId === turnId || submittedTurnId === turnId ? {} : { responseSource: "backfill" as const }),
-                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) });
+                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) }, { threadId, turnId });
                 emittedTerminal.set(turnId, signature);
               } else if (turn.status === "interrupted" || turn.status === "failed") {
                 const error = record(turn.error);
@@ -877,13 +884,15 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
                   ts: asSeconds(turn.completedAt) ?? meta.updatedAt, cwd: meta.cwd, title: meta.title,
                   accountAlias: profile.identity.accountAlias, text, detail: turn.status, interactive: true,
                   ...(previousActiveTurnId === turnId || submittedTurnId === turnId ? {} : { responseSource: "backfill" as const }),
-                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) });
+                  codexControl: codexControlInfo(meta.source, version, profile.features, activeTurnId ?? null) }, { threadId, turnId});
                 emittedTerminal.set(turnId, signature);
               }
             }
           }
         }
       }
+      const reservation = profile.startingTurnByThread.get(threadId);
+      if (reservation && now() >= reservation.expiresAt) profile.startingTurnByThread.delete(threadId);
       if (!sessionStartChecked) await emitSessionStart();
       if (previousSignature !== summaryMeta.signature || !profile.threadStatusById.has(threadId))
         profile.threadStatusById.set(threadId, threadStatus(thread));
