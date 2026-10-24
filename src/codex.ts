@@ -53,6 +53,7 @@ const sessionIdPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const textLimit = 100 * 1024;
 const detailLimit = 4 * 1024;
 const pageLimit = 100;
+const turnStartClockSkewMs = 5_000;
 const maxThreadPages = 100;
 const sessionKey = (host: string, sessionId: string) => `${host}|codex|${sessionId}`;
 const record = (value: unknown): Record<string, unknown> | null =>
@@ -178,6 +179,7 @@ type PendingRpc = { method: string; resolve: (value: unknown) => void; reject: (
 type CodexControlDispatchResult =
   | { outcome: "accepted" | "unsupported" | "failed"; reason?: string }
   | { outcome: "unknown"; reason: "request_timeout" | "request_interrupted" };
+type TurnStartReservation = { baselineTurnIds: Set<string> | null; prompt: string; requestedAt: number };
 type AppServerNotification = (method: string, params: Record<string, unknown>) => void;
 type AppServerRequest = (method: string, params: Record<string, unknown>) => void;
 
@@ -438,7 +440,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     threadBySessionMetadata: new Map<string, { title?: string; cwd?: string; source: string }>(),
     metadataByThread: new Map<string, { source: string; title: string; cwd: string | undefined; updatedAt: number; signature: string }>(),
     turnIdsByThread: new Map<string, Set<string>>(),
-    startingTurnByThread: new Map<string, Set<string> | null>(),
+    startingTurnByThread: new Map<string, TurnStartReservation>(),
     loaded: new Set<string>(),
     pollers: new Map<string, AbortController>(),
     syncing: false,
@@ -561,7 +563,11 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       return { outcome: "failed", reason: "turn_active" };
     if (starting) {
       const known = profile.turnIdsByThread.get(threadId);
-      profile.startingTurnByThread.set(threadId, known ? new Set(known) : null);
+      profile.startingTurnByThread.set(threadId, {
+        baselineTurnIds: known ? new Set(known) : null,
+        prompt: message.text!,
+        requestedAt: now(),
+      });
     }
     let keepStartReservation = false;
     try {
@@ -574,6 +580,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         }
       }
       if (starting) {
+        const reservation = profile.startingTurnByThread.get(threadId);
+        if (reservation) reservation.requestedAt = now();
         await app.request("turn/start", { threadId, input: [{ type: "text", text: message.text! }], clientUserMessageId: `dash-${message.id}` });
         keepStartReservation = true;
       } else if (message.action === "turn/steer") {
@@ -802,9 +810,27 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
               turnIds.add(turnId);
               if (turn.status === "inProgress") activeTurnId = turnId;
             }
-            const startBaseline = profile.startingTurnByThread.get(threadId);
-            const observedStartedTurn = Boolean(activeTurnId) || startBaseline !== undefined && startBaseline !== null &&
-              [...turnIds].some(turnId => !startBaseline.has(turnId));
+            const startReservation = profile.startingTurnByThread.get(threadId);
+            let observedStartedTurn = Boolean(activeTurnId);
+            if (!observedStartedTurn && startReservation) {
+              if (startReservation.baselineTurnIds) {
+                for (const turnId of turnIds) if (!startReservation.baselineTurnIds.has(turnId)) {
+                  observedStartedTurn = true;
+                  break;
+                }
+              } else {
+                const startedAfter = startReservation.requestedAt - turnStartClockSkewMs;
+                for (const turn of turns) {
+                  if (turn.status !== "completed" && turn.status !== "interrupted" && turn.status !== "failed") continue;
+                  if (turnPrompt(turn) !== startReservation.prompt) continue;
+                  const turnStartedAt = asSeconds(turn.startedAt);
+                  if (turnStartedAt !== undefined && turnStartedAt >= startedAfter) {
+                    observedStartedTurn = true;
+                    break;
+                  }
+                }
+              }
+            }
             if (observedStartedTurn) profile.startingTurnByThread.delete(threadId);
             profile.turnIdsByThread.set(threadId, turnIds);
             if (activeTurnId) profile.activeTurnByThread.set(threadId, activeTurnId);

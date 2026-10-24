@@ -42,6 +42,7 @@ type FakeServerConfig = {
   unsupportedOnceMethods?: string[];
   loadedThreads?: string[];
   failRequests?: string[];
+  failOnceMethods?: string[];
   failRequestMessages?: Record<string, string>;
   timeoutMethods?: string[];
   exitMethods?: string[];
@@ -674,6 +675,36 @@ describe("Codex app-server adapter", () => {
     expect(hub.receipts.find(receipt => receipt.id === 930)).toMatchObject({ outcome:"accepted" });
     expect(hub.receipts.find(receipt => receipt.id === 931)).toMatchObject({ outcome:"failed",reason:"turn_active" });
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
+  test("releases a start reservation after completion when its initial turns read failed", async () => {
+    const home = makeHome("unknown-start-baseline-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "unknown_start_baseline_thread";
+    const turnsFile = join(home,"turns.json");
+    writeFileSync(turnsFile,"[]");
+    const { adapter, events } = startAdapter({
+      identities:[{accountAlias:"UnknownBaseline",codeHome:home}],
+      hub,
+      now:() => 1_800_000_000_000,
+      fixture:{profiles:{[basename(home)]:{
+        threadId,title:"Unknown baseline",turnsFile,
+        turnAfterStart:completedTurn("unknown_baseline_turn","start after unknown baseline","completed answer"),
+      }},failOnceMethods:["thread/turns/list"]},
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("UnknownBaseline",threadId), target = sessionKey("codex-test-host",session);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session) &&
+      hub.waitSessions.has(session));
+
+    hub.enqueue(session,{ id:932,target,action:"turn/start",text:"start after unknown baseline" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 932));
+    expect(hub.receipts.find(receipt => receipt.id === 932)).toMatchObject({ outcome:"accepted" });
+    await waitUntil(() => events.some(event => event.kind === "response" && event.sessionId === session));
+
+    hub.enqueue(session,{ id:933,target,action:"turn/start",text:"start again after completion" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 933));
+    expect(hub.receipts.find(receipt => receipt.id === 933)).toMatchObject({ outcome:"accepted" });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(2);
   }, 10_000);
 
   test("sends a Codex control only to its matching identity and records the accepted receipt", async () => {

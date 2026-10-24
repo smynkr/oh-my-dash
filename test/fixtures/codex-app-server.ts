@@ -21,6 +21,7 @@ type FixtureConfig = {
   unsupportedOnceMethods?: string[];
   loadedThreads?: string[];
   failRequests?: string[];
+  failOnceMethods?: string[];
   failRequestMessages?: Record<string, string>;
   timeoutMethods?: string[];
   exitMethods?: string[];
@@ -43,6 +44,7 @@ const thread = {
   updatedAt: 1_800_000_000,
 };
 const failAfterInitialSync = new Set(config.failAfterInitialSync ?? []);
+const failOnceMethods = new Set(config.failOnceMethods ?? []);
 const unsupportedOnceMethods = new Set(config.unsupportedOnceMethods ?? []);
 let initialSyncComplete = false;
 function currentThread(kind: "list" | "read" = "list"): Record<string, unknown> {
@@ -78,7 +80,7 @@ lines.on("line", line => {
     return;
   }
   if (config.timeoutMethods?.includes(method)) return;
-  if (config.failRequests?.includes(method) || (initialSyncComplete && failAfterInitialSync.delete(method))) {
+  if (failOnceMethods.delete(method) || config.failRequests?.includes(method) || (initialSyncComplete && failAfterInitialSync.delete(method))) {
     respond({ id, error: { code: -32000, message: config.failRequestMessages?.[method] ?? `Synthetic fixture failure: ${method}` } });
     return;
   }
