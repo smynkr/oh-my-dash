@@ -710,6 +710,49 @@ describe("Codex app-server adapter", () => {
     expect(events.find(event => event.kind === "session_start" && event.sessionId === session)?.codexControl)
       .toMatchObject({ source:"vscode",appServerOwned:true });
   }, 10_000);
+  test("restart clears adapter ownership before steering an unowned thread", async () => {
+    const home = makeHome("owned-restart-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "owned_restart_thread", turnId = "owned_restart_turn";
+    const turnsFile = join(home,"turns.json");
+    writeFileSync(turnsFile,"[]");
+    const children: ChildProcess[] = [];
+    const { adapter, events } = startAdapter({
+      identities:[{accountAlias:"OwnedRestart",codeHome:home}],
+      hub,
+      fixture:{profiles:{[basename(home)]:{
+        threadId,title:"Restart ownership",turnsFile,
+        turnAfterStart:activeTurn(turnId,"turn before restart"),
+      }},loadedThreads:[]},
+      spawnImpl:(command,args,spawnOptions) => {
+        const child = spawn(command,args,spawnOptions);
+        children.push(child);
+        return child;
+      },
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("OwnedRestart",threadId), target = sessionKey("codex-test-host",session);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.appServerOwned === false) && hub.waitSessions.has(session));
+    hub.enqueue(session,{ id:950,target,action:"turn/start",text:"turn before restart" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 950));
+    expect(hub.receipts.find(receipt => receipt.id === 950)).toMatchObject({ outcome:"accepted" });
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session &&
+      event.codexControl?.appServerOwned === true));
+    expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(1);
+    expect(children).toHaveLength(1);
+
+    const eventCount = events.length;
+    children[0]!.kill("SIGTERM");
+    await waitUntil(() => children.length > 1 && events.slice(eventCount).some(event => event.kind === "session_start" &&
+      event.sessionId === session && event.codexControl?.appServerOwned === false));
+    hub.enqueue(session,{ id:951,target,action:"turn/steer",text:"must not steer after restart",expectedTurnId:turnId });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 951));
+    expect(hub.receipts.find(receipt => receipt.id === 951)).toMatchObject({
+      outcome:"failed",reason:"codex_not_owned",
+    });
+    expect(readRpc(home).filter(request => request.method === "turn/steer")).toHaveLength(0);
+  }, 10_000);
 
   test("does not send turn/start while a Codex turn is already active", async () => {
     const home = makeHome("active-start-guard-home");

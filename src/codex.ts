@@ -572,6 +572,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     if (message.action === "turn/start" && (!profile.features.turnStart || !message.text?.trim())) return { outcome: "unsupported" };
     if (message.action === "turn/steer" && (!profile.features.turnSteer || !message.text?.trim())) return { outcome: "unsupported" };
     if (message.action === "turn/interrupt" && !profile.features.turnInterrupt) return { outcome: "unsupported" };
+    if (message.action !== "turn/start" && !appServerOwned(profile, threadId))
+      return { outcome: "failed", reason: "codex_not_owned" };
     if (message.action !== "turn/start" && (!message.expectedTurnId || profile.activeTurnByThread.get(threadId) !== message.expectedTurnId)) return { outcome: "failed" };
     const starting = message.action === "turn/start";
     if (starting) {
@@ -777,6 +779,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
 
   const syncRaw = async (profile: typeof profiles[number], app: CodexAppServer) => {
     profile.loaded = await listLoaded(app);
+    for (const threadId of profile.adapterOwnedThreads) if (!profile.loaded.has(threadId)) profile.adapterOwnedThreads.delete(threadId);
     const summaries = await listThreads(app);
     const seen = new Set<string>();
     const version = profile.version;
@@ -1005,6 +1008,8 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       profile.controlSignature.clear();
       profile.turnSignature.clear();
       profile.activeTurnByThread.clear();
+      profile.loaded.clear();
+      profile.adapterOwnedThreads.clear();
       profile.threadStatusById.clear();
       try {
         await app.start();
@@ -1028,6 +1033,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         profile.state = "offline";
         stopPollers(profile);
         profile.loaded.clear();
+        profile.adapterOwnedThreads.clear();
         profile.app = undefined;
         await publishLiveness(true);
         const code = error instanceof CodexRpcError ? `rpc_${error.code ?? "unknown"}` : processErrorCode(error);
