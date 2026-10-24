@@ -251,7 +251,7 @@ The source runner reads Codex profile and login state locally. It does not send 
 | Action | Availability |
 |---|---|
 | View retained output | Supported when the app-server exposes the thread. Viewing output does not establish that its source is currently connected. |
-| Start a turn | Available only for an app-server-owned thread with no observed active turn, when `DASH_CODEX=1` and `DASH_REPLIES=1` are set on both collector and source runner, and the local app-server is version `0.160.x`. Queue acceptance is not a delivery guarantee. |
+| Start a turn | Available only for an app-server-owned thread with no observed active turn and no earlier accepted start awaiting turn synchronization, when `DASH_CODEX=1` and `DASH_REPLIES=1` are set on both collector and source runner, and the local app-server is version `0.160.x`. Queue acceptance is not a delivery guarantee. |
 | Steer an active turn | Available only for an app-server-owned thread with an observed active turn and the same collector/source flags and app-server version requirement. |
 | Interrupt an active turn | Available only for an app-server-owned thread with an observed active turn and the same collector/source flags and app-server version requirement. |
 | Answer a structured user-input request | Unsupported. Requests may be surfaced in Dash, but no answer is submitted; respond in the Codex session. |

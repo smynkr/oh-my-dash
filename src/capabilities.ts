@@ -55,6 +55,7 @@ function codexControlCapability(session: CapabilitySession, codexEnabled: boolea
   action: "turn/steer" | "turn/interrupt"): CapabilityAction {
   if (session.harness !== "codex") return unavailable("This control is available only for Codex app-server sessions.", "unsupported_control");
   if (session.status === "ended") return unavailable("The session has ended; Dash will not accept Codex controls.", "session_ended");
+  if (!repliesEnabled) return unavailable("Replies are disabled; Dash will not accept Codex controls.", "disabled");
   if (!codexEnabled) return unavailable("Codex controls are disabled; DASH_CODEX must be enabled on the Dash console server.", "codex_disabled");
   const control = session.codexControl;
   if (!control?.appServerOwned || control.source !== "appServer")

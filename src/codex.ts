@@ -216,6 +216,14 @@ class CodexAppServer {
     if (!child.stdin || !child.stdout) throw new Error("Codex app-server stdio was unavailable");
     this.lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     this.lines.on("line", line => this.onLine(line));
+    child.stdin.once("error", error => {
+      if (this.exited || this.closing) return;
+      this.protocolError = new Error("Codex app-server stdin failed");
+      this.options.onError?.(processErrorCode(error));
+      this.failPending(this.protocolError);
+      this.markExited();
+      try { child.kill("SIGTERM"); } catch {}
+    });
     child.once("error", error => {
       this.protocolError = new Error("Codex app-server process failed");
       this.options.onError?.(processErrorCode(error));
@@ -427,6 +435,9 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     activeTurnByThread: new Map<string, string>(),
     threadStatusById: new Map<string, "busy" | "idle" | "unknown">(),
     threadBySessionMetadata: new Map<string, { title?: string; cwd?: string; source: string }>(),
+    metadataByThread: new Map<string, { source: string; title: string; cwd: string | undefined; updatedAt: number; signature: string }>(),
+    turnIdsByThread: new Map<string, Set<string>>(),
+    startingTurnByThread: new Map<string, Set<string> | null>(),
     loaded: new Set<string>(),
     pollers: new Map<string, AbortController>(),
     syncing: false,
@@ -449,14 +460,14 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     options.onError?.(area, code);
   };
 
-  const post = async (path: string, body: unknown, timeoutMs = 5_000): Promise<Response> => {
+  const post = async (path: string, body: unknown, timeoutMs = 5_000, eventId?: string): Promise<Response> => {
     if (!hub) throw new Error("Codex relay URL is not configured");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await fetcher(`${hub}${path}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Dash-Host": options.host },
+        headers: { "Content-Type": "application/json", "X-Dash-Host": options.host, ...(eventId ? { "X-Dash-Event-Id": eventId } : {}) },
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -470,7 +481,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       while (pendingForward.size && !closed) {
         const [key, event] = pendingForward.entries().next().value as [string, NormalizedEvent];
         let response: Response;
-        try { response = await post("/ingest/codex", event); }
+        try { response = await post("/ingest/codex", event, 5_000, key); }
         catch { report("codex ingest", "transport_error"); break; }
         if (!response.ok) { report("codex ingest", `http_${response.status}`); break; }
         pendingForward.delete(key);
@@ -544,14 +555,21 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     if (message.action === "turn/steer" && (!profile.features.turnSteer || !message.text?.trim())) return { outcome: "unsupported" };
     if (message.action === "turn/interrupt" && !profile.features.turnInterrupt) return { outcome: "unsupported" };
     if (message.action !== "turn/start" && (!message.expectedTurnId || profile.activeTurnByThread.get(threadId) !== message.expectedTurnId)) return { outcome: "failed" };
-    if (message.action === "turn/start" && profile.activeTurnByThread.has(threadId))
+    const starting = message.action === "turn/start";
+    if (starting && (profile.activeTurnByThread.has(threadId) || profile.startingTurnByThread.has(threadId)))
       return { outcome: "failed", reason: "turn_active" };
+    if (starting) {
+      const known = profile.turnIdsByThread.get(threadId);
+      profile.startingTurnByThread.set(threadId, known ? new Set(known) : null);
+    }
+    let keepStartReservation = false;
     try {
-      if (message.action === "turn/start" && !profile.loaded.has(threadId)) {
+      if (starting && !profile.loaded.has(threadId)) {
         await app.request("thread/resume", { threadId, excludeTurns: true });
       }
-      if (message.action === "turn/start") {
+      if (starting) {
         await app.request("turn/start", { threadId, input: [{ type: "text", text: message.text! }], clientUserMessageId: `dash-${message.id}` });
+        keepStartReservation = true;
       } else if (message.action === "turn/steer") {
         await app.request("turn/steer", { threadId, input: [{ type: "text", text: message.text! }], expectedTurnId: message.expectedTurnId!, clientUserMessageId: `dash-${message.id}` });
       } else {
@@ -559,6 +577,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       }
       return { outcome: "accepted" };
     } catch (error) {
+      if (error instanceof CodexRpcUnknownError && error.method === "turn/start") keepStartReservation = true;
       if (error instanceof CodexRpcUnknownError && error.method !== "thread/resume") {
         report("codex control", error.reason);
         return { outcome: "unknown", reason: error.reason };
@@ -578,9 +597,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       }
       const reason = messageCode(error);
       report("codex control", reason);
-      if (reason === "stale_turn") return { outcome: "failed" };
+      if (reason === "stale_turn") return { outcome: "failed", reason };
       return { outcome: "failed" };
     } finally {
+      if (starting && !keepStartReservation) profile.startingTurnByThread.delete(threadId);
       if (profile.app === app && !app.isExited) syncInBackground(profile, app);
     }
   };
@@ -726,6 +746,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       profile.sessionByThread.set(threadId, sessionId);
       profile.threadBySession.set(sessionId, threadId);
       const previousSignature = profile.metadataSignature.get(threadId);
+      const previousMetadata = profile.metadataByThread.get(threadId);
       let thread = summary;
       const summaryMeta = metadataFor(summary);
       if (previousSignature !== summaryMeta.signature) {
@@ -737,7 +758,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           report("codex thread read", error instanceof CodexRpcError ? `rpc_${error.code ?? "unknown"}` : "request_failed");
         }
       }
-      const meta = metadataFor(thread);
+      const meta = previousSignature === summaryMeta.signature && previousMetadata ? previousMetadata : metadataFor(thread);
       let sessionStartChecked = false;
       const emitSessionStart = async () => {
         sessionStartChecked = true;
@@ -754,7 +775,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         }
       };
       if (previousSignature !== summaryMeta.signature || !profile.turnSignature.has(threadId) ||
-          profile.activeTurnByThread.has(threadId) || profile.failedTurnReads.has(threadId)) {
+          profile.activeTurnByThread.has(threadId) || profile.failedTurnReads.has(threadId) || profile.startingTurnByThread.has(threadId)) {
         let turns: Record<string, unknown>[] | undefined;
         try {
           turns = await readTurns(app, threadId);
@@ -776,6 +797,11 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
               turnIds.add(turnId);
               if (turn.status === "inProgress") activeTurnId = turnId;
             }
+            const startBaseline = profile.startingTurnByThread.get(threadId);
+            const observedStartedTurn = Boolean(activeTurnId) || startBaseline !== undefined && startBaseline !== null &&
+              [...turnIds].some(turnId => !startBaseline.has(turnId));
+            if (observedStartedTurn) profile.startingTurnByThread.delete(threadId);
+            profile.turnIdsByThread.set(threadId, turnIds);
             if (activeTurnId) profile.activeTurnByThread.set(threadId, activeTurnId);
             else profile.activeTurnByThread.delete(threadId);
             await emitSessionStart();
@@ -822,9 +848,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
           }
         }
       }
-      if (!sessionStartChecked) await emitSessionStart();
-      profile.threadStatusById.set(threadId, threadStatus(thread));
+      if (previousSignature !== summaryMeta.signature || !profile.threadStatusById.has(threadId))
+        profile.threadStatusById.set(threadId, threadStatus(thread));
       profile.threadBySessionMetadata.set(sessionId, { source: meta.source, title: meta.title, cwd: meta.cwd });
+      profile.metadataByThread.set(threadId, meta);
     }
     for (const threadId of [...profile.sessionByThread.keys()]) {
       if (seen.has(threadId)) continue;
@@ -835,6 +862,9 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       profile.failedTurnReads.delete(threadId);
       profile.controlSignature.delete(threadId);
       profile.turnSignature.delete(threadId);
+      profile.metadataByThread.delete(threadId);
+      profile.turnIdsByThread.delete(threadId);
+      profile.startingTurnByThread.delete(threadId);
       profile.emittedTerminalSignatureByThread.delete(threadId);
       profile.threadStatusById.delete(threadId);
       profile.activeTurnByThread.delete(threadId);

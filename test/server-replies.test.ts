@@ -658,6 +658,32 @@ test("capabilities remain queryable with replies disabled and do not claim liven
   await expectExactJson(await fetch(baseUrl + "/api/sessions/%E0%A4%A/capabilities"), 400, { error: "invalid key" });
   await expectExactJson(await fetch(baseUrl + apiCapabilitiesPath("synthetic-host|claude|missing_session")), 404, { error: "not found" });
 });
+test("Codex ingest retries with the same event ID do not apply the response twice", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true), host = localHost(), sessionId = "codex_idempotent_ingest";
+  const key = `${host}|codex|${sessionId}`, eventId = "a".repeat(64);
+  const event = { host, harness:"codex", sessionId, kind:"response", ts:nowMs + 1, interactive:true,
+    prompt:"same prompt", text:"same Codex answer" };
+  const headers = { "X-Dash-Event-Id":eventId };
+  await expectExactJson(await apiJson(baseUrl + "/ingest/codex", event, headers), 200, {});
+  await expectExactJson(await apiJson(baseUrl + "/ingest/codex", event, headers), 200, {});
+  expect(app!.db.getSession(key)?.turnSeq).toBe(1);
+  expect(app!.db.sqlite.query("SELECT COUNT(*) AS n FROM responses WHERE session_key=?").get(key)).toEqual({ n:1 });
+  expect(app!.db.sqlite.query("SELECT COUNT(*) AS n FROM events WHERE session_key=? AND event_id=?").get(key,eventId))
+    .toEqual({ n:1 });
+});
+
+test("Codex steer and interrupt capabilities are disabled when replies are disabled", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(false), host = localHost(), sessionId = "codex_disabled_capabilities";
+  const session = app!.db.applyEvent({ host, harness:"codex", sessionId, kind:"session_start", ts:nowMs, interactive:true,
+    codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:"active_turn" } });
+  const capabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(session.key))).json();
+  expect(capabilities.actions.message).toMatchObject({ status:"unavailable",code:"disabled" });
+  expect(capabilities.actions.steer).toMatchObject({ status:"unavailable",code:"disabled" });
+  expect(capabilities.actions.interrupt).toMatchObject({ status:"unavailable",code:"disabled" });
+});
+
 
 test("retained output with an unroutable identity does not advertise message support", async () => {
   const baseUrl = setup(true);

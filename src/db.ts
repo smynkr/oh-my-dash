@@ -212,7 +212,7 @@ export class DashDB {
       CREATE INDEX IF NOT EXISTS responses_hash ON responses(session_key, text_sha1);
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY, session_key TEXT NOT NULL REFERENCES sessions(key) ON DELETE CASCADE,
-        ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT
+        ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT, event_id TEXT
       );
       CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
       CREATE INDEX IF NOT EXISTS events_session_kind ON events(session_key, kind);
@@ -362,6 +362,7 @@ export class DashDB {
     const replyColumns = new Set((this.sqlite.query("PRAGMA table_info(replies)").all() as { name: string }[]).map(c => c.name));
     const draftColumns = new Set((this.sqlite.query("PRAGMA table_info(tg_drafts)").all() as { name: string }[]).map(c => c.name));
     const responseColumns = new Set((this.sqlite.query("PRAGMA table_info(responses)").all() as { name: string }[]).map(c => c.name));
+    const eventColumns = new Set((this.sqlite.query("PRAGMA table_info(events)").all() as { name: string }[]).map(c => c.name));
     this.sqlite.transaction(() => {
       for (const [name, type] of [["session_kind", "TEXT"], ["last_hook_event_ts", "INTEGER"], ["last_liveness_status", "TEXT"], ["dead_since", "INTEGER"], ["turn_seq", "INTEGER NOT NULL DEFAULT 0"], ["account_alias", "TEXT"], ["account_alias_override", "TEXT"], ["display_name_override", "TEXT"], ["pending_question_id", "TEXT"],
         ["codex_source", "TEXT"], ["codex_app_server_owned", "INTEGER"], ["codex_version", "TEXT"], ["codex_turn_start", "INTEGER"], ["codex_turn_steer", "INTEGER"], ["codex_turn_interrupt", "INTEGER"], ["codex_active_turn_id", "TEXT"]] as const) {
@@ -380,6 +381,8 @@ export class DashDB {
         if (!responseColumns.has(name)) this.sqlite.exec(`ALTER TABLE responses ADD COLUMN ${name} ${type}`);
       }
       this.sqlite.exec("CREATE INDEX IF NOT EXISTS responses_decision_pending ON responses(decision_state,id)");
+      if (!eventColumns.has("event_id")) this.sqlite.exec("ALTER TABLE events ADD COLUMN event_id TEXT");
+      this.sqlite.exec("CREATE UNIQUE INDEX IF NOT EXISTS events_session_event_id ON events(session_key,event_id) WHERE event_id IS NOT NULL");
     this.invalidateInterruptedQuestions(Date.now());
     })();
     const alertColumns = new Set((this.sqlite.query("PRAGMA table_info(tg_alerts)").all() as { name: string }[]).map(c => c.name));
@@ -1272,7 +1275,7 @@ export class DashDB {
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(key, event.host, event.harness, event.sessionId, value(event.cwd), value(event.title), event.interactive ? 1 : 0, value(event.transcriptPath), value(event.sessionKind), event.ts, event.ts);
     return this.getRow(key)!;
   }
-  applyEvent(event: NormalizedEvent): SessionDTO {
+  applyEvent(event: NormalizedEvent, eventId?: string): SessionDTO {
     const key = sessionKey(event);
     const invocation = event.harness === "claude" && event.toolUseId ? this.questionForToolUse(key,event.toolUseId) : undefined;
     const current = invocation ? { ...event, questionIdentity: invocation.id } : event;
@@ -1293,6 +1296,11 @@ export class DashDB {
         : current.kind === "question_answered" && current.questionIdentity
           ? JSON.stringify({ questionIdentity: current.questionIdentity })
           : value(current.detail);
+      if (eventId !== undefined) {
+        const inserted = this.sqlite.query("INSERT OR IGNORE INTO events(session_key,ts,kind,detail,event_id) VALUES(?,?,?,?,?)")
+          .run(key, current.ts, current.kind, questionDetail, eventId);
+        if (inserted.changes === 0) return;
+      }
       const codexControl = current.codexControl;
       const hasCodexControl = codexControl !== undefined;
       this.sqlite.query(`UPDATE sessions SET cwd=COALESCE(?,cwd), title=COALESCE(?,title),
@@ -1317,7 +1325,8 @@ export class DashDB {
         next.status, value(next.needsReason), value(next.needsText), value(next.pendingQuestionId), value(next.lastPrompt), value(next.lastError),
         value(next.lastNotification), next.backgroundPending ? 1 : 0, next.lastActivity, current.ts,
         (current.kind === "response" || current.kind === "error") && current.responseSource !== "backfill" ? 1 : 0, key);
-      this.sqlite.query("INSERT INTO events(session_key,ts,kind,detail) VALUES(?,?,?,?)").run(key, current.ts, current.kind, questionDetail);
+      if (eventId === undefined)
+        this.sqlite.query("INSERT INTO events(session_key,ts,kind,detail) VALUES(?,?,?,?)").run(key, current.ts, current.kind, questionDetail);
       if (current.kind === "response" && current.text?.trim()) {
         this.insertResponse(key, clip(current.text)!, describePrompt(current.prompt ?? next.lastPrompt), current.ts,
           current.responseSource ?? "hook", current.responseSource === "backfill" ? null : n(row.turn_seq) + 1);

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
+import { PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,7 +19,11 @@ type FakeProfile = {
   cwd?: string;
   turns?: unknown[];
   turnsFile?: string;
+  turnsDelayMs?: number;
+  turnAfterStart?: unknown;
   threadMetadataFile?: string;
+  threadListMetadataFile?: string;
+  threadReadMetadataFile?: string;
   version?: string;
 };
 type ControlAction = "turn/start" | "turn/steer" | "turn/interrupt";
@@ -37,6 +42,7 @@ type FakeServerConfig = {
   unsupportedOnceMethods?: string[];
   loadedThreads?: string[];
   failRequests?: string[];
+  failRequestMessages?: Record<string, string>;
   timeoutMethods?: string[];
   exitMethods?: string[];
   failAfterInitialSync?: string[];
@@ -65,6 +71,7 @@ class FakeControlHub {
   readonly receiptAttempts: Record<string, unknown>[] = [];
   readonly livenessReports: Record<string, unknown>[] = [];
   readonly livenessAttempts: Record<string, unknown>[] = [];
+  readonly codexIngests: { event: Record<string, unknown>; eventId: string | null }[] = [];
   ackFailuresRemaining = 0;
   livenessFailuresRemaining = 0;
   ackStatus?: number;
@@ -123,6 +130,12 @@ class FakeControlHub {
       }
       if (this.ackStatus !== undefined) return new Response(null, { status: this.ackStatus });
       this.receipts.push(receipt);
+      return Response.json({ ok: true });
+    }
+    if (request.method === "POST" && url.pathname === "/ingest/codex") {
+      const event = await request.json() as Record<string, unknown>;
+      this.codexIngests.push({ event, eventId: request.headers.get("X-Dash-Event-Id") });
+      changes.notify();
       return Response.json({ ok: true });
     }
     if (request.method === "POST" && url.pathname === "/ingest/liveness/codex") {
@@ -244,6 +257,7 @@ function startAdapter(options: {
   now?: () => number;
   fetchImpl?: typeof fetch;
   requestTimeoutMs?: number;
+  spawnImpl?: NonNullable<CodexAdapterOptions["spawnImpl"]>;
 }): { adapter: CodexAdapter; events: NormalizedEvent[]; liveness: LivenessRecord[][] } {
   const events: NormalizedEvent[] = [];
   const liveness: LivenessRecord[][] = [];
@@ -252,8 +266,11 @@ function startAdapter(options: {
       ...spawnOptions,
       env: { ...spawnOptions?.env, HOME: temporaryRoot, TMPDIR: temporaryRoot },
     };
-    const child = spawn(command, args, childOptions);
+    const child = options.spawnImpl
+      ? options.spawnImpl(command, args, childOptions)
+      : spawn(command, args, childOptions);
     spawnedChildren.push(child);
+    child.stdout?.on("data", () => changes.notify());
     child.once("exit", () => changes.notify());
     return child;
   }) as NonNullable<CodexAdapterOptions["spawnImpl"]>;
@@ -368,6 +385,21 @@ describe("Codex app-server adapter", () => {
       host: "codex-test-host", harness: "codex", sessionId: betaSession, cwd: "/fake/beta", name: "Beta history", detail: "busy",
     }));
   }, 10_000);
+  test("remote Codex events carry a stable idempotency key", async () => {
+    const home = makeHome("event-id-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "event_id_thread", session = sessionIdFor("EventId",threadId);
+    const { adapter } = startAdapter({
+      identities:[{accountAlias:"EventId",codeHome:home}],
+      fixture:{profiles:{[basename(home)]:{threadId,title:"Event identity"}}},
+      hub,
+    });
+    await adapter.waitForReady(5_000);
+    await waitUntil(() => hub.codexIngests.some(item => item.event.sessionId === session));
+    const forwarded = hub.codexIngests.find(item => item.event.sessionId === session)!;
+    expect(forwarded.eventId).toMatch(/^[0-9a-f]{64}$/);
+    expect(forwarded.eventId).toBe(createHash("sha256").update(JSON.stringify(forwarded.event)).digest("hex"));
+  }, 10_000);
   test("changed history emits only new terminal turns and keeps the observed active turn", async () => {
     const home = makeHome("history-refresh-home");
     const threadId = "history_refresh_thread";
@@ -455,6 +487,27 @@ describe("Codex app-server adapter", () => {
       .toHaveLength(1);
     expect(events.some(event => event.kind === "response" && event.sessionId === sessionIdFor("EmptyCompletion",threadId)))
       .toBe(false);
+  }, 10_000);
+  test("retains hydrated thread metadata when list summaries stay unchanged", async () => {
+    const home = makeHome("hydrated-metadata-home"), threadId = "hydrated_metadata_thread";
+    const summaryPath = join(home,"summary.json"), hydratedPath = join(home,"hydrated.json");
+    writeFileSync(summaryPath,JSON.stringify({ name:"List summary title",cwd:"/summary",updatedAt:1_800_000_000 }));
+    writeFileSync(hydratedPath,JSON.stringify({ name:"Hydrated thread title",cwd:"/hydrated",updatedAt:1_800_000_000 }));
+    const { adapter, events } = startAdapter({
+      identities:[{accountAlias:"HydratedMetadata",codeHome:home}],
+      fixture:{profiles:{[basename(home)]:{
+        threadId,title:"Default summary",threadListMetadataFile:summaryPath,threadReadMetadataFile:hydratedPath,
+      }}},
+      pollIntervalMs:250,
+    });
+    await adapter.waitForReady(5_000);
+    const sessionId = sessionIdFor("HydratedMetadata",threadId);
+    await waitUntil(() => events.some(event => event.kind === "session_start" &&
+      event.sessionId === sessionId && event.title === "Hydrated thread title"));
+    await waitUntil(() => readRpc(home).filter(request => request.method === "thread/list").length >= 4);
+    const starts = events.filter(event => event.kind === "session_start" && event.sessionId === sessionId);
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toMatchObject({ title:"Hydrated thread title",cwd:"/hydrated" });
   }, 10_000);
 
   test("waitForReady resolves when one identity is ready and another remains offline", async () => {
@@ -580,6 +633,35 @@ describe("Codex app-server adapter", () => {
     });
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(0);
   }, 10_000);
+  test("reserves an accepted turn/start until sync observes the new turn", async () => {
+    const home = makeHome("start-reservation-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "start_reservation_thread", turnId = "reserved_turn";
+    const turnsFile = join(home,"turns.json");
+    writeFileSync(turnsFile,"[]");
+    const { adapter, events } = startAdapter({
+      identities:[{accountAlias:"StartReservation",codeHome:home}],
+      hub,
+      fixture:{profiles:{[basename(home)]:{
+        // Keep the post-start turns read in flight so the second queued delivery tests the local reservation.
+        threadId,title:"Start reservation",turnsFile,turnsDelayMs:700,
+        turnAfterStart:activeTurn(turnId,"reserved prompt"),
+      }}},
+      requestTimeoutMs:5_000,
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("StartReservation",threadId), target = sessionKey("codex-test-host",session);
+    await waitUntil(() => events.some(event => event.kind === "session_start" && event.sessionId === session) &&
+      hub.waitSessions.has(session));
+    hub.enqueue(session,{ id:930,target,action:"turn/start",text:"first start" });
+    hub.enqueue(session,{ id:931,target,action:"turn/start",text:"duplicate start" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 930) && hub.receipts.some(receipt => receipt.id === 931));
+    await waitUntil(() => events.some(event => event.kind === "session_start" &&
+      event.sessionId === session && event.codexControl?.activeTurnId === turnId));
+    expect(hub.receipts.find(receipt => receipt.id === 930)).toMatchObject({ outcome:"accepted" });
+    expect(hub.receipts.find(receipt => receipt.id === 931)).toMatchObject({ outcome:"failed",reason:"turn_active" });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
 
   test("sends a Codex control only to its matching identity and records the accepted receipt", async () => {
     const alphaHome = makeHome("alpha-home");
@@ -669,6 +751,28 @@ describe("Codex app-server adapter", () => {
     expect(hub.receipts.find(receipt => receipt.id === 913)).toMatchObject({ outcome:"accepted",target });
     expect(readRpc(home).find(request => request.method === "turn/steer")?.params).toEqual({
       threadId,input:[{type:"text",text:"continue carefully"}],expectedTurnId:turnId,clientUserMessageId:"dash-913",
+    });
+  }, 10_000);
+  test("preserves stale_turn from an app-server steer rejection", async () => {
+    const home = makeHome("stale-steer-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "stale_steer_thread", turnId = "stale_steer_active_turn";
+    const { adapter } = startAdapter({
+      identities:[{accountAlias:"StaleSteer",codeHome:home}],
+      hub,
+      fixture:{
+        profiles:{[basename(home)]:{threadId,title:"Stale steer",turns:[activeTurn(turnId,"still running")]}},
+        failRequests:["turn/steer"],
+        failRequestMessages:{"turn/steer":"Turn is not active"},
+      },
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("StaleSteer",threadId), target = sessionKey("codex-test-host",session);
+    await waitUntil(() => hub.waitSessions.has(session));
+    hub.enqueue(session,{ id:932,target,action:"turn/steer",text:"stale steer",expectedTurnId:turnId });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 932));
+    expect(hub.receipts.find(receipt => receipt.id === 932)).toMatchObject({
+      outcome:"failed",reason:"stale_turn",
     });
   }, 10_000);
 
@@ -803,6 +907,79 @@ describe("Codex app-server adapter", () => {
       id:923,target,outcome:"unknown",reason:"request_interrupted",
     });
     expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
+  test("handles asynchronous app-server stdin errors as unknown without replaying controls", async () => {
+    const home = makeHome("stdin-error-home"), hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "stdin_error_thread", methods: string[] = [];
+    let failStart = true;
+    const syntheticSpawn = (() => {
+      const stdin = new PassThrough(), stdout = new PassThrough();
+      let child: EventEmitter & {
+        stdin: PassThrough; stdout: PassThrough; stderr: null; pid: number;
+        exitCode: number | null; signalCode: null; kill: () => boolean;
+      };
+      let exitScheduled = false;
+      child = Object.assign(new EventEmitter(), {
+        stdin, stdout, stderr:null, pid:1, exitCode:null as number | null, signalCode:null,
+        kill: () => {
+          if (!exitScheduled) {
+            exitScheduled = true;
+            setImmediate(() => {
+              child.exitCode = 0;
+              stdin.end(); stdout.end();
+              child.emit("exit",0,null);
+            });
+          }
+          return true;
+        },
+      });
+      const thread = { id:threadId,name:"stdin error",cwd:"/fake",source:"appServer",status:{type:"active"},updatedAt:1_800_000_000 };
+      let buffer = "";
+      stdin.on("data", chunk => {
+        buffer += chunk.toString();
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0,newline);
+          buffer = buffer.slice(newline + 1);
+          const request = JSON.parse(line) as Record<string, unknown>;
+          const method = typeof request.method === "string" ? request.method : "";
+          if (!method) continue;
+          methods.push(method);
+          if (method === "turn/start" && failStart) {
+            failStart = false;
+            setImmediate(() => stdin.emit("error",Object.assign(new Error("synthetic broken pipe"),{code:"EPIPE"})));
+            continue;
+          }
+          if (request.id === undefined) continue;
+          const params = request.params as Record<string, unknown> | undefined;
+          const result = method === "initialize" ? { userAgent:"codex-cli/0.160.0" }
+            : method === "thread/list" ? { data:params?.archived === true ? [] : [thread] }
+              : method === "thread/loaded/list" ? { data:[threadId] }
+                : method === "thread/read" ? { thread }
+                  : method === "thread/turns/list" ? { data:[] }
+                    : method === "thread/resume" ? { thread } : {};
+          stdout.write(`${JSON.stringify({ id:request.id,result })}\n`);
+        }
+      });
+      return child as unknown as ChildProcess;
+    }) as NonNullable<CodexAdapterOptions["spawnImpl"]>;
+    const { adapter } = startAdapter({
+      identities:[{accountAlias:"StdinError",codeHome:home}],
+      fixture:{profiles:{}},
+      hub,
+      spawnImpl:syntheticSpawn,
+      requestTimeoutMs:5_000,
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("StdinError",threadId), target = sessionKey("codex-test-host",session);
+    await waitUntil(() => hub.waitSessions.has(session));
+    hub.enqueue(session,{ id:933,target,action:"turn/start",text:"possibly sent before EPIPE" });
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 933));
+    expect(hub.receipts.find(receipt => receipt.id === 933)).toMatchObject({
+      outcome:"unknown",reason:"request_interrupted",
+    });
+    expect(methods.filter(method => method === "turn/start")).toHaveLength(1);
   }, 10_000);
 
   test("control poller survives commit transport failure without replaying a possibly committed action", async () => {

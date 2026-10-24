@@ -8,7 +8,11 @@ type Profile = {
   cwd?: string;
   turns?: unknown[];
   turnsFile?: string;
+  turnsDelayMs?: number;
+  turnAfterStart?: unknown;
   threadMetadataFile?: string;
+  threadListMetadataFile?: string;
+  threadReadMetadataFile?: string;
   version?: string;
 };
 type FixtureConfig = {
@@ -17,6 +21,7 @@ type FixtureConfig = {
   unsupportedOnceMethods?: string[];
   loadedThreads?: string[];
   failRequests?: string[];
+  failRequestMessages?: Record<string, string>;
   timeoutMethods?: string[];
   exitMethods?: string[];
   crashFirstLaunch?: boolean;
@@ -40,9 +45,12 @@ const thread = {
 const failAfterInitialSync = new Set(config.failAfterInitialSync ?? []);
 const unsupportedOnceMethods = new Set(config.unsupportedOnceMethods ?? []);
 let initialSyncComplete = false;
-function currentThread(): Record<string, unknown> {
-  if (!profile.threadMetadataFile || !existsSync(profile.threadMetadataFile)) return thread;
-  return { ...thread, ...(JSON.parse(readFileSync(profile.threadMetadataFile, "utf8")) as Record<string, unknown>) };
+function currentThread(kind: "list" | "read" = "list"): Record<string, unknown> {
+  const path = kind === "list"
+    ? profile.threadListMetadataFile ?? profile.threadMetadataFile
+    : profile.threadReadMetadataFile ?? profile.threadMetadataFile;
+  if (!path || !existsSync(path)) return thread;
+  return { ...thread, ...(JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>) };
 }
 const rpcLogPath = join(codeHome, "fake-app-server-rpc.jsonl");
 const launchCountPath = join(codeHome, "fake-app-server-launches");
@@ -71,7 +79,7 @@ lines.on("line", line => {
   }
   if (config.timeoutMethods?.includes(method)) return;
   if (config.failRequests?.includes(method) || (initialSyncComplete && failAfterInitialSync.delete(method))) {
-    respond({ id, error: { code: -32000, message: `Synthetic fixture failure: ${method}` } });
+    respond({ id, error: { code: -32000, message: config.failRequestMessages?.[method] ?? `Synthetic fixture failure: ${method}` } });
     return;
   }
 
@@ -91,22 +99,26 @@ lines.on("line", line => {
       }
       return;
     case "thread/list":
-      result = { data: params.archived === true ? [] : [currentThread()] };
+      result = { data: params.archived === true ? [] : [currentThread("list")] };
       break;
     case "thread/loaded/list":
       initialSyncComplete = true;
       result = { data: config.loadedThreads ?? [threadId] };
       break;
     case "thread/read":
-      result = { thread: currentThread() };
+      result = { thread: currentThread("read") };
       break;
     case "thread/turns/list":
       result = { data: profile.turnsFile ? JSON.parse(readFileSync(profile.turnsFile, "utf8")) : profile.turns ?? [] };
-      break;
-    case "thread/resume":
-      result = { thread: currentThread() };
+      if (profile.turnsDelayMs) {
+        setTimeout(() => respond({ id, result }), profile.turnsDelayMs);
+        return;
+      }
       break;
     case "turn/start":
+      if (profile.turnAfterStart && profile.turnsFile) writeFileSync(profile.turnsFile, JSON.stringify([profile.turnAfterStart]));
+      result = {};
+      break;
     case "turn/steer":
     case "turn/interrupt":
       result = {};

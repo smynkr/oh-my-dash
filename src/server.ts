@@ -792,10 +792,12 @@ export function createDashServer(options: ServerOptions = {}) {
           return ack();
         }
         const receivedAt = now();
+        const eventId = path === "/ingest/codex" ? request.headers.get("X-Dash-Event-Id") : null;
+        if (eventId !== null && !/^[0-9a-f]{64}$/.test(eventId)) { malformed++; return ack(); }
         const event = path.endsWith("claude") ? normalizeClaude(body, request.headers, receivedAt) :
           path.endsWith("codex") ? normalizeCodex(body, request.headers, receivedAt) : normalizeOmp(body, receivedAt);
         if (event) {
-          const dto = db.applyEvent(event);
+          const dto = db.applyEvent(event, eventId ?? undefined);
           db.recordSourceReport(event.host, receivedAt);
           emitSources();
           send(dto, event.kind);
