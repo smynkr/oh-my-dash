@@ -728,14 +728,15 @@ export class DashDB {
       return this.finishReply(row,"delivered",now,null,true);
     })();
   }
-  ackCodexControl(id: number, outcome: "accepted" | "unsupported" | "failed", reason: string | undefined, now: number): Reply | undefined {
+  ackCodexControl(id: number, outcome: "accepted" | "unsupported" | "failed" | "unknown", reason: string | undefined, now: number): Reply | undefined {
     return this.sqlite.transaction(() => {
       const row = this.sqlite.query("SELECT * FROM replies WHERE id=?").get(id) as Row | null;
       if (!row || row.state !== "leased" || !bool(row.lease_commit) || row.committed_at == null || row.codex_action == null) return undefined;
       const status = outcome === "failed" && reason === "stale_turn" ? "stale" : outcome;
       const cancelReason = outcome === "accepted" ? null : reason ?? outcome;
-      return this.finishReply(row, outcome === "accepted" ? "delivered" : "cancelled", now, cancelReason, true,
-        status, outcome === "accepted" ? null : reason ?? null);
+      const terminalState = outcome === "accepted" ? "delivered" : outcome === "unknown" ? "expired" : "cancelled";
+      return this.finishReply(row, terminalState, now, cancelReason, true, status,
+        outcome === "accepted" ? null : reason ?? null);
     })();
   }
   deferReply(id: number, _now: number): Reply | undefined {

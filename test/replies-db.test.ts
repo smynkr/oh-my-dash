@@ -173,6 +173,34 @@ test("expired committed Codex controls keep an unknown receipt instead of claimi
     expect(db.ackCodexControl(reply.id,"waiter-expiry","accepted",undefined,60_005)).toBeUndefined();
   } finally { db.close(); }
 });
+test("a timed-out committed Codex control stores an expired unknown receipt", () => {
+  const db = new DashDB(":memory:");
+  const audit = createAudit(db);
+  const key = "synthetic-host|codex|request_timeout_session";
+  const control = { source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null };
+  const prepare = (ts: number) => audit.prepare({
+    ts,sessionKey:key,source:"web",actor:"web:loopback",listener:"loopback",text:"synthetic Codex timeout",
+  });
+  try {
+    db.applyEvent({ host:"synthetic-host",harness:"codex",sessionId:"request_timeout_session",kind:"session_start",
+      detail:"history",ts:1,interactive:true,codexControl:control });
+    const reply = db.enqueueCodexControl(key,"timed out after RPC write","web","web:loopback","turn/start",undefined,
+      2,60_000,prepare(2));
+    expect(db.leaseQueuedForCodex(key,reply.id,"waiter-request-timeout",3,true).kind).toBe("leased");
+    expect(db.commitCodex(reply.id,4)).toEqual({ ok:true });
+
+    const receipt = db.ackCodexControl(reply.id,"unknown","request_timeout",5);
+    expect(receipt).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
+    });
+    expect(db.getReply(reply.id)).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
+    });
+    expect(db.getReplies(key)[0]).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",committed:true,
+    });
+  } finally { db.close(); }
+});
 
 test("R1 cancellation includes queued and uncommitted leases but keeps committed replies", () => {
   const db = new DashDB(":memory:");

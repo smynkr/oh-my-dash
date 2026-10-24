@@ -259,7 +259,7 @@ The source runner reads Codex profile and login state locally. It does not send 
 | Attach to or remotely resume a standalone CLI/Desktop session | Unsupported. Existing thread history may be readable if the app-server exposes it, but only threads marked as owned by this app-server can be controlled. Dash does not attach to standalone sessions. |
 | Launch a session | Unsupported. Dash does not launch Codex sessions. |
 
-Capabilities describe the local app-server's observed methods and active turn; they are not proof of source liveness. A pending Codex reply waiter is only a delivery-path observation, not proof the action reached Codex. If a committed control times out before its acknowledgement, the receipt becomes `expired` with `codexControlStatus: unknown` and reason `ack_timeout`. The action may or may not have been dispatched. Dash does not retry committed Codex controls automatically; inspect the target Codex thread before deciding whether to submit again.
+Capabilities describe the local app-server's observed methods and active turn; they are not proof of source liveness. A pending Codex reply waiter is only a delivery-path observation, not proof the action reached Codex. If a committed control times out before its acknowledgement, the receipt becomes `expired` with `codexControlStatus: unknown` and reason `ack_timeout`. If a sent `turn/start`, `turn/steer` or `turn/interrupt` RPC itself times out, the local app-server did not confirm it and Dash records `expired`/`unknown` with reason `request_timeout`. In either case, the action may or may not have been dispatched; Dash does not retry it automatically. Inspect the target Codex thread before deciding whether to submit again.
 
 ### Optional Telegram
 

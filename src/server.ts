@@ -708,7 +708,7 @@ export function createDashServer(options: ServerOptions = {}) {
         const reply = db.getReply(Number(body.id));
         const codexControl = !!reply?.codexAction;
         if (path === "/reply/ack" && (codexControl
-          ? (body.outcome !== "accepted" && body.outcome !== "unsupported" && body.outcome !== "failed")
+          ? (body.outcome !== "accepted" && body.outcome !== "unsupported" && body.outcome !== "failed" && body.outcome !== "unknown")
           : (body.outcome !== "sent" && body.outcome !== "deferred"))) return json({ error: "bad request" }, 400);
         if (codexControl && (!codexEnabled || typeof body.target !== "string" || body.target !== reply!.sessionKey ||
           (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 128))))
@@ -722,7 +722,7 @@ export function createDashServer(options: ServerOptions = {}) {
           : replies.commitOmp(Number(body.id), body.waiter, leasePeer))
           ? json({ ok: true }) : json({ error: "not deliverable" }, 409);
         return (codexControl
-          ? replies.ackCodex(Number(body.id), body.waiter, body.outcome as "accepted" | "unsupported" | "failed",
+          ? replies.ackCodex(Number(body.id), body.waiter, body.outcome as "accepted" | "unsupported" | "failed" | "unknown",
             body.target as string, typeof body.reason === "string" ? body.reason : undefined, leasePeer)
           : replies.ackOmp(Number(body.id), body.waiter, body.outcome as "sent" | "deferred", leasePeer))
           ? json({ ok: true }) : json({ error: "not found" }, 404);

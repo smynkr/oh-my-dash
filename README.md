@@ -104,7 +104,7 @@ DASH_ACCOUNT_ALIAS="personal" \
 bun run codex:source
 ```
 
-Codex start, steer and interrupt controls require `DASH_REPLIES=1` on both the collector and source runner and are limited to app-server-owned threads whose local app-server supports the method. Dash does not answer Codex approval or user-input requests, remotely attach to or resume standalone CLI/Desktop sessions, or launch sessions. A Codex `ack_timeout` means the outcome is unknown: the request may or may not have been dispatched, and Dash will not retry it automatically. Check the Codex thread before resubmitting.
+Codex start, steer and interrupt controls require `DASH_REPLIES=1` on both the collector and source runner and are limited to app-server-owned threads whose local app-server supports the method. Dash does not answer Codex approval or user-input requests, remotely attach to or resume standalone CLI/Desktop sessions, or launch sessions. A relay `ack_timeout`, or a `turn/start`, `turn/steer` or `turn/interrupt` RPC that times out after being sent, has an unknown outcome: the action may or may not have been dispatched. Dash will not retry it automatically; check the Codex thread before resubmitting.
 
 ## Optional Telegram and replies
 

@@ -18,11 +18,12 @@ let originalEnv: Record<string, string | undefined>;
 const sid = "synthetic_session";
 const waiter = "waiteraaaaaaaaaa";
 const remoteHeaders = { Host: "dash.tailnet.test", "X-Forwarded-For": "192.0.2.10" };
-const envNames = ["DASH_REPLIES", "DASH_ALLOWED_HOSTS", "DASH_ALLOWED_PEERS", "DASH_TAILNET_PORT", "DASH_TG_TOPICS", "DASH_TELEGRAM", "DASH_TELEGRAM_API_BASE", "DASH_JUDGE", "DASH_CODEX_BIN"];
+const envNames = ["DASH_REPLIES", "DASH_CODEX", "DASH_ALLOWED_HOSTS", "DASH_ALLOWED_PEERS", "DASH_TAILNET_PORT", "DASH_TG_TOPICS", "DASH_TELEGRAM", "DASH_TELEGRAM_API_BASE", "DASH_JUDGE", "DASH_CODEX_BIN"];
 
 beforeEach(() => {
   originalEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
   process.env.DASH_REPLIES = "";
+  process.env.DASH_CODEX = "";
   process.env.DASH_ALLOWED_HOSTS = "";
   process.env.DASH_ALLOWED_PEERS = "";
   process.env.DASH_TAILNET_PORT = "";
@@ -266,6 +267,35 @@ test("submission snapshot guards allow working-session text without binding late
   await expectExactJson(await apiJson(baseUrl + "/reply/commit", { id: replyId, waiter }), 200, { ok: true });
   await expectExactJson(await apiJson(baseUrl + "/reply/ack", { id: replyId, waiter, outcome: "sent" }), 200, { ok: true });
   expect(app!.db.getReplies(session.key)).toMatchObject([{ id: replyId, state: "delivered", answersTurn: null }]);
+});
+test("Codex request-timeout acknowledgements persist as expired unknown receipts", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true);
+  const session = app!.db.applyEvent({
+    host:localHost(),harness:"codex",sessionId:"codex_timeout_session",kind:"session_start",ts:nowMs,interactive:true,
+    codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null },
+  });
+  const submitted = await apiJson(baseUrl + apiReplyPath(session.key), { action:"turn/start",text:"Synthetic timeout control" });
+  expect(submitted.status).toBe(202);
+  const { replyId } = await submitted.json() as { replyId:number };
+  const waiterId = "codexwaiter000000";
+  const waitUrl = new URL("/reply/wait/codex",baseUrl);
+  waitUrl.searchParams.set("session",session.sessionId);
+  waitUrl.searchParams.set("waiter",waiterId);
+  waitUrl.searchParams.set("started",String(nowMs));
+  waitUrl.searchParams.set("wait","1");
+  waitUrl.searchParams.set("commit","1");
+  const delivered = await fetch(waitUrl);
+  expect(delivered.status).toBe(200);
+  expect(await delivered.json()).toMatchObject({ id:replyId,target:session.key });
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", { id:replyId,waiter:waiterId,target:session.key }),
+    200,{ ok:true });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
+    id:replyId,waiter:waiterId,target:session.key,outcome:"unknown",reason:"request_timeout",
+  }),200,{ ok:true });
+  expect(app!.db.getReply(replyId)).toMatchObject({
+    state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
+  });
 });
 
 test("submission snapshot guards reject malformed versions without queueing text", async () => {

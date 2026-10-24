@@ -160,6 +160,12 @@ export class CodexRpcError extends Error {
     this.name = "CodexRpcError";
   }
 }
+class CodexRpcTimeoutError extends Error {
+  constructor(readonly method: string) {
+    super("Codex app-server request timed out");
+    this.name = "CodexRpcTimeoutError";
+  }
+}
 
 type RpcId = number | string;
 type PendingRpc = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
@@ -234,7 +240,7 @@ class CodexAppServer {
     return new Promise((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => {
         this.pending.delete(String(id));
-        rejectPromise(new Error("Codex app-server request timed out"));
+        rejectPromise(new CodexRpcTimeoutError(method));
       }, timeoutMs);
       this.pending.set(String(id), { resolve: resolvePromise, reject: rejectPromise, timer });
       try { this.child!.stdin!.write(`${JSON.stringify({ method, id, params })}\n`); }
@@ -505,7 +511,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
   };
 
   const ackControl = async (profile: typeof profiles[number], waiter: string, message: CodexControlMessage,
-    outcome: "accepted" | "unsupported" | "failed", reason?: string) => {
+    outcome: "accepted" | "unsupported" | "failed" | "unknown", reason?: string) => {
     if (!hub) return;
     while (!closed) {
       try {
@@ -518,7 +524,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     }
   };
 
-  const dispatchControl = async (profile: typeof profiles[number], threadId: string, message: CodexControlMessage): Promise<"accepted" | "unsupported" | "failed"> => {
+  const dispatchControl = async (profile: typeof profiles[number], threadId: string, message: CodexControlMessage): Promise<"accepted" | "unsupported" | "failed" | "unknown"> => {
     const app = profile.app;
     if (!app || profile.state !== "ready") return "failed";
     if (message.action !== "turn/start" && message.action !== "turn/steer" && message.action !== "turn/interrupt") return "unsupported";
@@ -539,6 +545,10 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       }
       return "accepted";
     } catch (error) {
+      if (error instanceof CodexRpcTimeoutError && error.method !== "thread/resume") {
+        report("codex control", "request_timeout");
+        return "unknown";
+      }
       if (error instanceof CodexRpcError && error.code === -32601) {
         if (message.action === "turn/start") profile.features.turnStart = false;
         if (message.action === "turn/steer") profile.features.turnSteer = false;
@@ -611,7 +621,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
       }
       if (!committed.ok) { report("codex control", `commit_http_${committed.status}`); continue; }
       const outcome = await dispatchControl(profile, threadId, message);
-      const reason = outcome === "unsupported" ? "unsupported_method" : outcome === "failed" ?
+      const reason = outcome === "unknown" ? "request_timeout" : outcome === "unsupported" ? "unsupported_method" : outcome === "failed" ?
         message.action !== "turn/start" && profile.activeTurnByThread.get(threadId) !== message.expectedTurnId ? "stale_turn" : "codex_error" : undefined;
       await ackControl(profile, waiter, message, outcome, reason);
     }

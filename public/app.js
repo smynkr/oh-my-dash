@@ -931,7 +931,7 @@
         case 'failed': return ['Failed', `${action} failed at the local app-server.${reason}`];
         case 'stale': return ['Stale turn', `${action} targeted an active turn that is no longer current.${reason}`];
         case 'cancelled': return ['Cancelled', `${action} was cancelled before an app-server receipt.${reason}`];
-        case 'unknown': return ['Outcome unknown', `${action} was committed, but no app-server receipt arrived before the lease expired. It may or may not have been dispatched; Dash will not retry it automatically.`];
+        case 'unknown': return ['Outcome unknown', `${action} did not receive a definitive local app-server response. It may or may not have been dispatched; Dash will not retry it automatically. Check the Codex session history before resubmitting.${reason}`];
         default: return ['Pending', `${action} is queued for ${identity}; delivery is not confirmed.`];
       }
     }

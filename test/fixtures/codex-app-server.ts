@@ -15,7 +15,7 @@ type FixtureConfig = {
   profiles?: Record<string, Profile>;
   unsupportedMethods?: string[];
   failRequests?: string[];
-  crashFirstLaunch?: boolean;
+  timeoutMethods?: string[];
   crashDelayMs?: number;
   failAfterInitialSync?: string[];
 };
@@ -60,6 +60,7 @@ lines.on("line", line => {
   const id = request.id as number | string;
   const params = request.params && typeof request.params === "object" && !Array.isArray(request.params)
     ? request.params as Record<string, unknown> : {};
+  if (config.timeoutMethods?.includes(method)) return;
   if (config.failRequests?.includes(method) || (initialSyncComplete && failAfterInitialSync.delete(method))) {
     respond({ id, error: { code: -32000, message: `Synthetic fixture failure: ${method}` } });
     return;

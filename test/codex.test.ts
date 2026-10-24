@@ -34,7 +34,7 @@ type RpcRecord = Record<string, unknown> & { method?: string; params?: Record<st
 type FakeServerConfig = {
   profiles: Record<string, FakeProfile>;
   unsupportedMethods?: string[];
-  failRequests?: string[];
+  timeoutMethods?: string[];
   failAfterInitialSync?: string[];
   crashFirstLaunch?: boolean;
   crashDelayMs?: number;
@@ -238,6 +238,7 @@ function startAdapter(options: {
   pollIntervalMs?: number;
   retryDelayMs?: number;
   now?: () => number;
+  requestTimeoutMs?: number;
   fetchImpl?: typeof fetch;
 }): { adapter: CodexAdapter; events: NormalizedEvent[]; liveness: LivenessRecord[][] } {
   const events: NormalizedEvent[] = [];
@@ -263,7 +264,7 @@ function startAdapter(options: {
     ...(options.now ? { now: options.now } : {}),
     pollIntervalMs: options.pollIntervalMs ?? 15_000,
     retryDelayMs: options.retryDelayMs ?? 50,
-    requestTimeoutMs: 1_000,
+    requestTimeoutMs: options.requestTimeoutMs ?? 1_000,
     restartDelayMs: options.restartDelayMs ?? 50,
     onEvent: event => { events.push(event); changes.notify(); },
     onLiveness: records => { liveness.push(records); changes.notify(); },
@@ -642,6 +643,30 @@ describe("Codex app-server adapter", () => {
     await waitUntil(() => hub.livenessReports.length > delivered);
     expect(hub.livenessReports.at(-1)).toEqual(hub.livenessReports[delivered - 1]);
   }, 10_000);
+  test("a timed-out Codex control RPC reports unknown and is never automatically replayed", async () => {
+    const home = makeHome("control-timeout-home");
+    const hub = new FakeControlHub();
+    activeHub = hub;
+    const threadId = "control_timeout_thread";
+    const { adapter } = startAdapter({
+      identities: [{ accountAlias:"Timeout",codeHome:home }],
+      hub,
+      fixture: { profiles: { [basename(home)]: { threadId,title:"Timed out control" } }, timeoutMethods:["turn/start"] },
+      requestTimeoutMs:250,
+    });
+    await adapter.waitForReady(5_000);
+    const session = sessionIdFor("Timeout", threadId), target = sessionKey("codex-test-host", session);
+    await waitUntil(() => hub.waitSessions.has(session));
+    hub.enqueue(session, { id:922,target,action:"turn/start",text:"possibly dispatched" });
+    await waitUntil(() => readRpc(home).some(request => request.method === "turn/start"));
+    await waitUntil(() => hub.receipts.some(receipt => receipt.id === 922));
+
+    expect(hub.receipts.find(receipt => receipt.id === 922)).toMatchObject({
+      id:922,target,outcome:"unknown",reason:"request_timeout",
+    });
+    expect(readRpc(home).filter(request => request.method === "turn/start")).toHaveLength(1);
+  }, 10_000);
+
 
   test("control poller survives commit transport failure without replaying a possibly committed action", async () => {
     const home = makeHome("commit-retry-home");

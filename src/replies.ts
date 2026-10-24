@@ -640,7 +640,7 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       } else tryDispatch(reply.sessionKey);
       return true;
     },
-    ackCodex(id: number, waiterId: string, answer: "accepted" | "unsupported" | "failed", target: string, reason?: string, peer = "loopback") {
+    ackCodex(id: number, waiterId: string, answer: "accepted" | "unsupported" | "failed" | "unknown", target: string, reason?: string, peer = "loopback") {
       const ackKey = `${id}:${waiterId}:${peer}:${answer}:${reason ?? ""}:${target}`;
       if (acks.has(ackKey)) return true;
       const lease = leases.get(id);
@@ -651,7 +651,7 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       acks.add(ackKey);
       if (acks.size > 1000) acks.delete(acks.values().next().value!);
       const dto = db.getSession(reply.sessionKey);
-      outcome(reply, answer === "accepted" ? "delivered" : "cancelled", dto);
+      outcome(reply, answer === "accepted" ? "delivered" : answer === "unknown" ? "expired" : "cancelled", dto);
       return true;
     },
     observe(dto: SessionDTO) {
