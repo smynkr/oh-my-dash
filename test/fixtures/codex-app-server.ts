@@ -16,6 +16,7 @@ type FixtureConfig = {
   unsupportedMethods?: string[];
   failRequests?: string[];
   timeoutMethods?: string[];
+  crashFirstLaunch?: boolean;
   crashDelayMs?: number;
   failAfterInitialSync?: string[];
 };

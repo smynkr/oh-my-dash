@@ -239,8 +239,8 @@ function startAdapter(options: {
   pollIntervalMs?: number;
   retryDelayMs?: number;
   now?: () => number;
-  requestTimeoutMs?: number;
   fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
 }): { adapter: CodexAdapter; events: NormalizedEvent[]; liveness: LivenessRecord[][] } {
   const events: NormalizedEvent[] = [];
   const liveness: LivenessRecord[][] = [];
@@ -644,6 +644,7 @@ describe("Codex app-server adapter", () => {
     await waitUntil(() => hub.livenessReports.length > delivered);
     expect(hub.livenessReports.at(-1)).toEqual(hub.livenessReports[delivered - 1]);
   }, 10_000);
+
   test("a timed-out Codex control RPC reports unknown and is never automatically replayed", async () => {
     const home = makeHome("control-timeout-home");
     const hub = new FakeControlHub();
