@@ -11,6 +11,7 @@ type Profile = {
   turnsByThread?: Record<string, unknown[]>;
   turnsFile?: string;
   turnsDelayMs?: number;
+  loadedThreadsDelayMs?: number;
   turnAfterStart?: unknown;
   threadMetadataFile?: string;
   threadListMetadataFile?: string;
@@ -110,9 +111,15 @@ lines.on("line", line => {
     case "thread/list":
       result = { data: params.archived === true ? [] : threadIds.map(id => currentThread("list", id)) };
       break;
-    case "thread/loaded/list":
-      result = { data: [...loadedThreads] };
+    case "thread/loaded/list": {
+      const loadedResult = { data: [...loadedThreads] };
+      if (initialSyncComplete && profile.loadedThreadsDelayMs) {
+        setTimeout(() => respond({ id, result: loadedResult }), profile.loadedThreadsDelayMs);
+        return;
+      }
+      result = loadedResult;
       break;
+    }
     case "thread/read":
       result = { thread: currentThread("read", typeof params.threadId === "string" ? params.threadId : threadId) };
       break;
