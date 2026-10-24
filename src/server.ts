@@ -719,7 +719,8 @@ export function createDashServer(options: ServerOptions = {}) {
           (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 128))))
           return json({ error: "bad request" }, 400);
         const label = request.headers.get("X-Dash-Host");
-        const replyHostMatches = !!reply && hostLabel(label) && reply.sessionKey.startsWith(`${label}|`);
+        const replyHostLabel = label ?? localHost();
+        const replyHostMatches = !!reply && hostLabel(replyHostLabel) && reply.sessionKey.startsWith(`${replyHostLabel}|`);
         if (listener === "loopback"
           ? (codexControl ? !replyHostMatches : label !== null && label !== localHost())
           : (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)) ||
