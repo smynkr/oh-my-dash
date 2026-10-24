@@ -62,8 +62,11 @@ lines.on("line", line => {
   const id = request.id as number | string;
   const params = request.params && typeof request.params === "object" && !Array.isArray(request.params)
     ? request.params as Record<string, unknown> : {};
+  if (config.exitMethods?.includes(method)) {
+    process.exit(73);
+    return;
+  }
   if (config.timeoutMethods?.includes(method)) return;
-  if (config.exitMethods?.includes(method)) process.exit(73);
   if (config.failRequests?.includes(method) || (initialSyncComplete && failAfterInitialSync.delete(method))) {
     respond({ id, error: { code: -32000, message: `Synthetic fixture failure: ${method}` } });
     return;

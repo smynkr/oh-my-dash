@@ -175,6 +175,9 @@ class CodexRpcTimeoutError extends CodexRpcUnknownError {
 
 type RpcId = number | string;
 type PendingRpc = { method: string; resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+type CodexControlDispatchResult =
+  | { outcome: "accepted" | "unsupported" | "failed"; reason?: string }
+  | { outcome: "unknown"; reason: "request_timeout" | "request_interrupted" };
 type AppServerNotification = (method: string, params: Record<string, unknown>) => void;
 type AppServerRequest = (method: string, params: Record<string, unknown>) => void;
 
@@ -533,10 +536,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
     }
   };
 
-  type DispatchControlResult =
-    | { outcome: "accepted" | "unsupported" | "failed"; reason?: never }
-    | { outcome: "unknown"; reason: "request_timeout" | "request_interrupted" };
-  const dispatchControl = async (profile: typeof profiles[number], threadId: string, message: CodexControlMessage): Promise<DispatchControlResult> => {
+  const dispatchControl = async (profile: typeof profiles[number], threadId: string, message: CodexControlMessage): Promise<CodexControlDispatchResult> => {
     const app = profile.app;
     if (!app || profile.state !== "ready") return { outcome: "failed" };
     if (message.action !== "turn/start" && message.action !== "turn/steer" && message.action !== "turn/interrupt") return { outcome: "unsupported" };
@@ -632,10 +632,11 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
         continue;
       }
       if (!committed.ok) { report("codex control", `commit_http_${committed.status}`); continue; }
-      const result = await dispatchControl(profile, threadId, message);
-      const reason = result.outcome === "unknown" ? result.reason : result.outcome === "unsupported" ? "unsupported_method" : result.outcome === "failed" ?
-        message.action !== "turn/start" && profile.activeTurnByThread.get(threadId) !== message.expectedTurnId ? "stale_turn" : "codex_error" : undefined;
-      await ackControl(profile, waiter, message, result.outcome, reason);
+      const dispatch = await dispatchControl(profile, threadId, message);
+      const outcome = dispatch.outcome;
+      const reason = dispatch.reason ?? (outcome === "unsupported" ? "unsupported_method" : outcome === "failed" ?
+        message.action !== "turn/start" && profile.activeTurnByThread.get(threadId) !== message.expectedTurnId ? "stale_turn" : "codex_error" : undefined);
+      await ackControl(profile, waiter, message, outcome, reason);
     }
   };
 
