@@ -460,7 +460,7 @@
   function statusOf(s) { return byId(s,'status') || 'unknown'; }
   function appendPill(parent, cls, text) { parent.append(el('span', `pill ${cls}`, text)); }
   const identityDrafts = new Map(), identityPending = new Set(), identityNotices = new Map();
-  const identityText = s => `${byId(s,'host') || 'Unknown host'} · ${byId(s,'accountAlias') || 'Unassigned account'} · ${byId(s,'harness') === 'omp' ? 'OMP' : 'Claude'} · ${byId(s,'sessionId','session_id') || ''}`;
+  const identityText = s => `${byId(s,'host') || 'Unknown host'} · ${byId(s,'accountAlias') || 'Unassigned account'} · ${byId(s,'harness') === 'omp' ? 'OMP' : byId(s,'harness') === 'codex' ? 'Codex' : 'Claude'} · ${byId(s,'sessionId','session_id') || ''}`;
 
   const capabilityReceiptAnchors = new WeakMap();
   function recordCapabilityReceipt(capabilities) {
@@ -530,7 +530,8 @@
 
   const capabilityActions = [
     ['view', 'View retained output'],
-    ['message', 'Queue message'],
+    ['message', 'Start / queue message'],
+    ['steer', 'Steer active turn'],
     ['structuredQuestion', 'Structured question'],
     ['approve', 'Approve'],
     ['interrupt', 'Interrupt'],
@@ -591,7 +592,7 @@
     details.addEventListener('toggle', () => details.open ? state.expanded.add(`${key}:capabilities`) : state.expanded.delete(`${key}:capabilities`));
     const summary = el('summary', 'capability-summary');
     summary.dataset.replyFocus = 'capabilities-summary';
-    summary.append(el('span', '', 'Controls'), el('span', 'capability-summary-help', '7 actions · delivery snapshot'));
+    summary.append(el('span', '', 'Controls'), el('span', 'capability-summary-help', '8 actions · delivery snapshot'));
     details.append(summary);
     const list = el('dl', 'capability-actions');
     for (const [name, label] of capabilityActions) {
@@ -678,6 +679,8 @@
     }
     if (byId(s, 'harness') === 'claude' && ['permission','permission_prompt','elicitation_dialog','elicitation_url_dialog'].includes(reason)) return 'Answer in the terminal or Remote Control (dialog answering: Step 6)';
     if (byId(s, 'harness') === 'omp' && reason === 'permission') return 'Approve in the terminal (dialog answering: Step 6)';
+    if (byId(s, 'harness') === 'codex' && reason === 'permission')
+      return 'Codex approval or user-input is unsupported; respond in the Codex session. Dash does not answer or approve it.';
     return '';
   }
   function replyNotice(key, message) {
@@ -919,23 +922,46 @@
     return box;
   }
   function replyDeliveryLabel(reply) {
+    if (reply.codexAction) {
+      const action = String(reply.codexAction), identity = 'this session';
+      const reason = typeof reply.codexControlReason === 'string' && reply.codexControlReason ? ` ${reply.codexControlReason}` : '';
+      switch (reply.codexControlStatus || 'pending') {
+        case 'accepted': return ['Codex accepted', `The local app-server accepted ${action} for ${identity}; execution or turn outcome is not confirmed.`];
+        case 'unsupported': return ['Unsupported', `${action} is unsupported by this source or request.${reason}`];
+        case 'failed': return reply.codexControlReason === 'turn_active'
+          ? ['Not sent', 'A Codex turn is already active; Dash did not send this control.']
+          : ['Failed', `${action} failed at the local app-server.${reason}`];
+        case 'stale': return ['Stale turn', `${action} targeted an active turn that is no longer current.${reason}`];
+        case 'cancelled': return ['Cancelled', `${action} was cancelled before an app-server receipt.${reason}`];
+        case 'expired': return ['Expired before dispatch', 'The queue deadline passed before Dash sent this Codex control; no Codex RPC was sent.'];
+        case 'unknown': return ['Outcome unknown', `${action} did not receive a definitive local app-server response. It may or may not have been dispatched; Dash will not retry it automatically. Check the Codex session history before resubmitting.${reason}`];
+        default: return ['Pending', `${action} is queued for ${identity}; delivery is not confirmed.`];
+      }
+    }
     if (reply.state === 'queued') return ['Queued', 'Waiting for a safe delivery point; cancellation is available.'];
     if (reply.state === 'leased') return reply.committed === true
       ? ['Committed', 'Delivery has committed; it can no longer be cancelled. Execution is not confirmed.']
       : reply.committed === false
         ? ['Sending', 'A delivery worker has the reply; cancellation is still available until commitment.']
         : ['Sending', 'Delivery is in progress; cancellation availability is unknown.'];
-    if (reply.state === 'delivered') return ['Delivered', 'Delivery was recorded, not task completion. A committed handoff may be recorded after its receipt times out.'];
+    if (reply.state === 'delivered') return ['Delivered', 'Delivery was recorded, not task completion. A committed OMP handoff may be recorded after its receipt times out.'];
     if (reply.state === 'expired') return ['Expired', 'The queue deadline passed without delivery; nothing will be sent.'];
     if (reply.state === 'cancelled') return ['Cancelled', reply.cancelReason === 'stale'
       ? 'The session moved to another turn; this reply will not be sent.'
       : 'This reply was cancelled before commitment and will not be sent.'];
     return ['Unknown', 'Delivery state could not be determined.'];
   }
-  async function submitReply(key, text, answersTurn, answersQuestion) {
+  async function submitReply(key, text, answersTurn, answersQuestion, codexAction, expectedTurnId) {
     if (state.replyPending.has(key)) return;
     const session = state.sessions.find(item => responseKey(item) === key);
-    if (!session || !messageCapability(session).allowed || replyDialogCopy(session)) return;
+    if (!session) return;
+    if (byId(session, 'harness') === 'codex') {
+      if (!codexAction) return;
+      const capabilityName = codexAction === 'turn/interrupt' ? 'interrupt' : codexAction === 'turn/steer' ? 'steer' : 'message';
+      const capability = capabilityName === 'message' ? messageCapability(session) : actionCapability(session, capabilityName);
+      if (!state.repliesEnabled || statusOf(session) === 'ended' ||
+          (capability.allowed !== true && capability.status !== 'supported')) return;
+    } else if (!messageCapability(session).allowed || replyDialogCopy(session)) return;
     if (answersQuestion !== undefined && (session.pendingQuestion?.id ?? session.pendingQuestionId) !== answersQuestion) {
       replyNotice(key, 'Out of date: the question has been answered or replaced');
       await loadSessions().catch(() => {});
@@ -945,11 +971,11 @@
     state.replyPending.add(key);
     patchSessionCard(session, session);
     try {
-      const response = await postJson(replyApiPath(key, '/reply'), {
-        text,
-        ...(answersTurn !== undefined ? { answersTurn } : {}),
-        ...(answersQuestion !== undefined ? { answersQuestion } : {})
-      });
+      const requestBody = byId(session, 'harness') === 'codex'
+        ? { action: codexAction, ...(text ? { text } : {}), ...(expectedTurnId ? { expectedTurnId } : {}) }
+        : { text, ...(answersTurn !== undefined ? { answersTurn } : {}),
+          ...(answersQuestion !== undefined ? { answersQuestion } : {}) };
+      const response = await postJson(replyApiPath(key, '/reply'), requestBody);
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
         if (response.status === 404 && payload?.error === 'not found') {
@@ -1044,8 +1070,14 @@
   function renderReplyControls(s, key, status, responses) {
     if (!state.repliesEnabled || status === 'ended') return null;
     const controls = el('section', 'reply-controls');
-    const message = messageCapability(s), dialogCopy = replyDialogCopy(s), busy = state.replyPending.has(key);
-    const harness = byId(s, 'harness'), reason = byId(s, 'needsReason', 'needs_reason');
+    const harness = byId(s, 'harness'), activeTurnId = harness === 'codex' ? s.codexControl?.activeTurnId : undefined;
+    const dialogCopy = replyDialogCopy(s), busy = state.replyPending.has(key), reason = byId(s, 'needsReason', 'needs_reason');
+    const codexAction = harness === 'codex' ? (activeTurnId ? 'turn/steer' : 'turn/start') : undefined;
+    const baseMessage = messageCapability(s);
+    const steerCapability = harness === 'codex' && activeTurnId ? actionCapability(s, 'steer') : undefined;
+    const message = steerCapability
+      ? { ...steerCapability, allowed: steerCapability.status === 'supported' && state.repliesEnabled }
+      : baseMessage;
     const pendingId = harness === 'omp' && status === 'needs_input' && !dialogCopy
       ? s.pendingQuestion?.id ?? s.pendingQuestionId
       : harness === 'claude' && status === 'needs_input' && reason === 'question' &&
@@ -1061,15 +1093,15 @@
       const hint = !message.allowed ? message.reason : dialogCopy || (ompQuestion
         ? pendingId ? "Answers omp's pending question" : `This queues ordinary text; it does not submit a structured answer to the OMP question. Structured-question capability is ${structured.status}: ${structured.reason}`
         : 'Cmd/Ctrl+Enter to queue a message.');
-      const label = el('label', 'reply-label', `Reply to ${nameOf(s)}`), textarea = el('textarea', 'reply-input');
+      const label = el('label', 'reply-label', harness === 'codex' ? (activeTurnId ? 'Steer active Codex turn' : 'Start Codex turn') : `Reply to ${nameOf(s)}`), textarea = el('textarea', 'reply-input');
       if (allowed) controls.append(el('p', 'reply-queue-note', 'Send places text in Dash’s bounded queue; it does not confirm delivery.'));
       textarea.rows = 3; textarea.value = state.drafts.get(draftKey) ?? ''; textarea.disabled = !allowed;
       textarea.dataset.sessionKey = draftKey;
-      textarea.setAttribute('aria-label', `Reply to ${nameOf(s)}`); textarea.dataset.replyFocus = 'input';
+      textarea.setAttribute('aria-label', harness === 'codex' ? activeTurnId ? 'Steer active Codex turn' : 'Start Codex turn' : `Reply to ${nameOf(s)}`); textarea.dataset.replyFocus = 'input';
       textarea.addEventListener('keydown', event => {
         if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
           event.preventDefault();
-          if (!textarea.disabled && textarea.value.trim()) submitReply(key, textarea.value, undefined, pendingId);
+          if (!textarea.disabled && textarea.value.trim()) submitReply(key, textarea.value, undefined, pendingId, codexAction, activeTurnId);
         }
       });
       label.append(textarea); controls.append(label, el('p', `reply-hint${allowed ? '' : ' reply-dialog-note'}`, hint));
@@ -1088,14 +1120,22 @@
         for (const session of replySessions()) patchSessionCard(session, session);
       });
       controls.append(recoveryLabel, recoveryNote);
-      const send = el('button', 'button button-primary', 'Send reply');
+      const send = el('button', 'button button-primary', harness === 'codex' ? activeTurnId ? 'Steer turn' : 'Start turn' : 'Send reply');
       send.type = 'button'; send.disabled = !allowed || busy || !textarea.value.trim(); send.dataset.replyFocus = 'send';
       textarea.addEventListener('input', () => {
         saveDraft(draftKey, textarea.value);
         recoveryNote.textContent = draftRecoveryNote(draftKey);
         send.disabled = !allowed || state.replyPending.has(key) || !textarea.value.trim();
       });
-      send.addEventListener('click', () => submitReply(key, textarea.value, undefined, pendingId)); actions.append(send);
+      send.addEventListener('click', () => submitReply(key, textarea.value, undefined, pendingId, codexAction, activeTurnId)); actions.append(send);
+      if (harness === 'codex') {
+        const interruptCapability = actionCapability(s, 'interrupt');
+        const interrupt = el('button', 'button button-secondary', 'Interrupt turn');
+        interrupt.type = 'button'; interrupt.disabled = !activeTurnId || !state.repliesEnabled || busy || interruptCapability.status !== 'supported';
+        interrupt.title = interruptCapability.reason; interrupt.dataset.replyFocus = 'interrupt';
+        interrupt.addEventListener('click', () => submitReply(key, '', undefined, undefined, 'turn/interrupt', activeTurnId));
+        actions.append(interrupt);
+      }
       const clearDraft = el('button', 'button button-secondary', 'Clear draft');
       clearDraft.type = 'button'; clearDraft.dataset.replyFocus = 'clear-draft';
       clearDraft.addEventListener('click', () => {
@@ -1106,7 +1146,7 @@
       actions.append(clearDraft);
     }
     const turnSeq = Number(byId(s, 'turnSeq', 'turn_seq') || 0), current = currentTurnResponse(responses, turnSeq);
-    if (!pendingId && responses.length > 0 && turnSeq > 0) {
+    if (harness !== 'codex' && !pendingId && responses.length > 0 && turnSeq > 0) {
       const ready = status === 'your_turn' && allowed && !busy && Boolean(current);
       if (current) controls.append(...renderDecisions(key, current, turnSeq, ready));
       else controls.append(el('p', 'reply-hint reply-dialog-note', "Quick actions are off: the latest response isn't this turn's. Reply with text."));
@@ -1335,7 +1375,7 @@
     header.append(title);
     const badges = el('div','badges');
     appendPill(badges, `status-pill ${status}`, `${historical ? 'Current: ' : ''}${statusLabel(s)}`);
-    appendPill(badges,'host-pill',byId(s,'host') || 'local'); appendPill(badges,`harness-pill ${byId(s,'harness')}`,byId(s,'harness') === 'omp' ? 'OMP' : 'Claude');
+    appendPill(badges,'host-pill',byId(s,'host') || 'local'); appendPill(badges,`harness-pill ${byId(s,'harness')}`,byId(s,'harness') === 'omp' ? 'OMP' : byId(s,'harness') === 'codex' ? 'Codex' : 'Claude');
     appendPill(badges, 'account-pill', byId(s,'accountAlias') || 'Unassigned account');
     if (byId(s,'sessionKind','session_kind') === 'bg') appendPill(badges,'kind-pill','bg');
     header.append(badges); card.append(header);
@@ -1381,13 +1421,16 @@
       read.addEventListener('click', () => markSeen(key));
       actions.append(read);
     }
-    const copy = el('button','button button-secondary','Copy resume cmd'); copy.type='button'; copy.addEventListener('click', async () => {
-      const id = byId(s,'sessionId','session_id') || ''; const command = `${byId(s,'harness') === 'omp' ? 'omp' : 'claude'} --resume ${JSON.stringify(String(id))}`;
-      try { await navigator.clipboard.writeText(command); copy.textContent='Copied'; setTimeout(() => copy.textContent='Copy resume cmd',1200); } catch { copy.textContent='Clipboard unavailable'; setTimeout(() => copy.textContent='Copy resume cmd',1600); }
-    }); actions.append(copy); card.append(actions);
+    if (byId(s, 'harness') !== 'codex') {
+      const copy = el('button','button button-secondary','Copy resume cmd'); copy.type='button'; copy.addEventListener('click', async () => {
+        const id = byId(s,'sessionId','session_id') || ''; const command = `${byId(s,'harness') === 'omp' ? 'omp' : 'claude'} --resume ${JSON.stringify(String(id))}`;
+        try { await navigator.clipboard.writeText(command); copy.textContent='Copied'; setTimeout(() => copy.textContent='Copy resume cmd',1200); } catch { copy.textContent='Clipboard unavailable'; setTimeout(() => copy.textContent='Copy resume cmd',1600); }
+      }); actions.append(copy);
+    }
+    card.append(actions);
     card.append(renderSessionCapabilities(s, key));
     if (!historical) {
-      if (autopilotUi.settings?.flagEnabled) card.append(autopilotGoalControls(s,key));
+      if (byId(s, 'harness') !== 'codex' && autopilotUi.settings?.flagEnabled) card.append(autopilotGoalControls(s,key));
       const replyControls = renderReplyControls(s, key, status, responses);
       if (replyControls) card.append(replyControls);
     }
@@ -1856,9 +1899,11 @@
     const { phase, targets } = selectiveSendState, editing = phase === 'draft';
     const selected = state.sessions.find(session => responseKey(session) === consoleState.selectedKey);
     const add = $('#selective-add');
-    add.disabled = !editing || !selected || targets.has(consoleState.selectedKey);
+    const selectedCodex = selected && byId(selected, 'harness') === 'codex';
+    add.disabled = !editing || !selected || selectedCodex || targets.has(consoleState.selectedKey);
     add.textContent = selected ? `Add ${nameOf(selected)}` : 'Add current session';
-    add.title = selected ? identityText(selected) : 'Select an available session first.';
+    add.title = selectedCodex ? 'Bulk selective send does not support Codex actions; use the target-specific session controls.' :
+      selected ? identityText(selected) : 'Select an available session first.';
     $('#selective-prompt').readOnly = !editing;
     $('#selective-preview').hidden = !editing;
     $('#selective-preview').disabled = !state.repliesEnabled || !targets.size || !$('#selective-prompt').value.trim();
@@ -1907,7 +1952,7 @@
   function addSelectiveTarget() {
     if (selectiveSendState.phase !== 'draft') return;
     const session = state.sessions.find(item => responseKey(item) === consoleState.selectedKey);
-    if (!session || selectiveSendState.targets.has(responseKey(session))) return;
+    if (!session || byId(session, 'harness') === 'codex' || selectiveSendState.targets.has(responseKey(session))) return;
     selectiveSendState.targets.set(responseKey(session), { snapshot: selectiveSnapshot(session), replyId: null, receipt: null, outcome: '', message: '' });
     renderSelectiveSend();
   }
@@ -1989,7 +2034,7 @@
         el('span', '', String(result.project || 'Unassigned project')),
         el('span', '', String(result.host || 'Unknown machine')),
         el('span', '', String(result.accountAlias || 'Unassigned account')),
-        el('span', '', result.harness === 'omp' ? 'OMP' : 'Claude Code'),
+        el('span', '', result.harness === 'omp' ? 'OMP' : result.harness === 'codex' ? 'Codex' : 'Claude Code'),
         el('span', 'output-search-match', result.match === 'identity' ? 'Session identity' : 'Response text'),
       );
       const ts = Number(result.ts), date = new Date(ts);
@@ -2134,7 +2179,7 @@
       typeof config.host === 'string' && config.host.length <= 1024 &&
       (config.project === null || typeof config.project === 'string' && config.project.length <= 1024) &&
       (config.account === null || typeof config.account === 'string' && config.account.length <= 1024) &&
-      ['','claude','omp'].includes(config.harness) &&
+      ['','claude','omp','codex'].includes(config.harness) &&
       ['','needs_input','your_turn','working','ended','unread','unknown'].includes(config.status) &&
       typeof config.headless === 'boolean' && typeof config.ended === 'boolean' &&
       ['','project','host','account','harness'].includes(config.group) &&
@@ -2493,7 +2538,7 @@
     const account = result.accountAlias ?? byId(session, 'accountAlias') ?? byId(response, 'accountAlias') ?? 'Unassigned account';
     const harness = result.harness ?? byId(session, 'harness') ?? byId(response, 'harness');
     const details = [project, host || 'Unknown machine', account || 'Unassigned account',
-      harness === 'omp' ? 'OMP' : harness === 'claude' ? 'Claude Code' : 'Harness unavailable'].join(' · ');
+      harness === 'omp' ? 'OMP' : harness === 'codex' ? 'Codex' : harness === 'claude' ? 'Claude Code' : 'Harness unavailable'].join(' · ');
     return el('p', 'historical-response-note',
       `Historical output match · ${name} · response ${target.responseId}. ${details}. Reply and decision actions are disabled.`);
   }
@@ -2537,7 +2582,7 @@
         row.dataset.key = key; row.dataset.selected = String(selected); row.className = `status-${statusOf(s)}`;
         const values = [['state', statusLabel(s)], ['project', byId(s, 'project') || 'Unassigned'], ['session', nameOf(s)],
           ['host', byId(s, 'host') || 'Unknown'], ['account', byId(s, 'accountAlias') || 'Unassigned'],
-          ['harness', byId(s, 'harness') === 'omp' ? 'OMP' : 'Claude'], ['age', relative(byId(s, 'lastActivity', 'last_activity'))]];
+          ['harness', byId(s, 'harness') === 'omp' ? 'OMP' : byId(s, 'harness') === 'codex' ? 'Codex' : 'Claude'], ['age', relative(byId(s, 'lastActivity', 'last_activity'))]];
         for (const [column, value] of values) {
           let cell = row.querySelector(`[data-cell="${column}"]`);
           if (!cell) {
@@ -2796,7 +2841,7 @@
   // repository-filter helpers end
   const dimensionLabels = { project: 'Project', host: 'Machine', account: 'Account', harness: 'Harness' };
   const dimensionValue = (session, dimension) => String(byId(session, dimension === 'account' ? 'accountAlias' : dimension) || '');
-  const dimensionLabel = (dimension, value) => value ? dimension === 'harness' ? value === 'omp' ? 'OMP' : 'Claude Code' : value : `Unassigned ${dimensionLabels[dimension].toLowerCase()}`;
+  const dimensionLabel = (dimension, value) => value ? dimension === 'harness' ? value === 'omp' ? 'OMP' : value === 'codex' ? 'Codex' : 'Claude Code' : value : `Unassigned ${dimensionLabels[dimension].toLowerCase()}`;
   function visibleSessions(ignoreStatus = false) {
     const host = $('#host-filter').value, harness = $('#harness-filter').value;
     const project = $('#project-filter').value, account = $('#account-filter').value, status = $('#status-filter').value;
@@ -3078,7 +3123,7 @@
   function renderSourceSession(session, hostLabel, accountLabel, snapshot) {
     const key = typeof session?.key === 'string' ? session.key : '';
     const name = typeof session?.displayName === 'string' && session.displayName.trim() ? session.displayName.trim() : 'Session';
-    const harness = session?.harness === 'omp' ? 'OMP' : session?.harness === 'claude' ? 'Claude' : 'Harness unknown';
+    const harness = session?.harness === 'omp' ? 'OMP' : session?.harness === 'codex' ? 'Codex' : session?.harness === 'claude' ? 'Claude' : 'Harness unknown';
     const status = typeof session?.status === 'string' && session.status.trim() ? session.status.trim() : 'unknown';
     const mode = session?.interactive === true ? 'Interactive' : session?.interactive === false ? 'Headless' : 'Mode unknown';
     const activity = sourceTimestamp(session?.lastActivity) ? sourceRelativeTime(session.lastActivity, snapshot) : 'time unknown';
@@ -3415,7 +3460,7 @@
       header.append(el('strong', '', name));
     }
     const meta = el('span', 'timeline-meta');
-    const parts = [row.project || '', row.host || '', row.accountAlias || 'Unassigned account', row.harness === 'omp' ? 'OMP' : 'Claude'].filter(Boolean);
+    const parts = [row.project || '', row.host || '', row.accountAlias || 'Unassigned account', row.harness === 'omp' ? 'OMP' : row.harness === 'codex' ? 'Codex' : 'Claude'].filter(Boolean);
     meta.textContent = `${parts.join(' · ')} · `;
     const ts = Number(byId(row, 'ts')), date = new Date(ts);
     const time = el('time', 'timeline-time', relative(ts));
@@ -3473,7 +3518,7 @@
   }
   // Ideas inbox (AXI-445 step 5, C6). Its routes return 404 while replies are off, so the header button stays hidden then.
   const ideasState = { open: 0, failed: false, showAll: false, items: [], version: 0, busy: new Set(), adding: false, picks: new Map() };
-  const ideaSessions = () => state.sessions.filter(session => messageCapability(session).allowed);
+  const ideaSessions = () => state.sessions.filter(session => byId(session, 'harness') !== 'codex' && messageCapability(session).allowed);
   const ideaOptionLabel = session => `${nameOf(session)} · ${byId(session, 'host') || 'Unknown host'}`;
   const ideaSignature = (sessions) => sessions.map(session => `${responseKey(session)}\u0001${ideaOptionLabel(session)}`).join('\u0002');
   function ideaNotice(text, error = false) {

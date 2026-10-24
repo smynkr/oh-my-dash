@@ -2,18 +2,19 @@ import { createAudit } from "./audit.ts";
 import type { DashDB, Reply, ReplyKind, ReplySource, SessionDTO } from "./db.ts";
 import { GO_REC_AUTH_TEXT } from "./actions.ts";
 import { isReplyKey, messageRefusalReason, type DeliveryObservation } from "./capabilities.ts";
-import type { EventKind, NormalizedEvent } from "./normalize.ts";
+import type { CodexAction, EventKind, NormalizedEvent } from "./normalize.ts";
 import { normalizeQuestionSelections, normalizeRecommendedQuestionAnswers } from "./normalize.ts";
 
 export type { ReplySource };
 export type AutopilotDelivery = { goal_id: number; expires_at: number; remaining_ttl_ms: number };
-type Harness = "claude" | "omp";
+type Harness = "claude" | "omp" | "codex";
 type Outcome = "delivered" | "expired" | "cancelled";
 type Listener = "loopback" | "tailnet" | "telegram" | "internal";
-type WaitResult = { status: 200; reply: string | { id: number; text: string; source: ReplySource; autopilot?: AutopilotDelivery } } | { status: 204 | 409 | 410 };
+type WaitResult = { status: 200; reply: string | { id: number; text: string; source: ReplySource; target?: string;
+  action?: CodexAction; expectedTurnId?: string; autopilot?: AutopilotDelivery } } | { status: 204 | 409 | 410 };
 type Pending = { resolve: (result: WaitResult) => void; timer: ReturnType<typeof setTimeout>; observedAt: number; expiresAt: number; signal?: AbortSignal; abort?: () => void };
 type Waiter = { key: string; harness: Harness; waiterId: string; started: number; commitCapable: boolean; peer: string; pending?: Pending };
-type Lease = { waiterId: string; peer: string };
+type Lease = { key: string; waiterId: string; peer: string; harness: Harness };
 export type QuestionWaitResult = { status: 200; answers: Record<string, string> } | { status: 204 | 409 | 410 };
 type QuestionPending = { resolve: (result: QuestionWaitResult) => void; timer: ReturnType<typeof setTimeout>; signal?: AbortSignal; abort?: () => void };
 type QuestionWaiter = { key: string; toolUseId: string; pending?: QuestionPending };
@@ -24,11 +25,17 @@ export type SubmitArgs = { key: string; text: string; source: ReplySource; actor
   kind?: ReplyKind; /** The idea this message sends; it must be open and is marked sent with the queued reply. */ ideaId?: number };
 export type RefusalReason = "disabled" | "invalid_key" | "invalid_source" | "invalid_actor" |
   "invalid_text" | "empty_text" | "invalid_turn" | "invalid_question" | "stale_turn" | "stale_question" | "session_not_found" |
-  "session_ended" | "claude_dialog" | "omp_approval" | "not_deliverable" | "too_long" | "idea_not_open";
+  "session_ended" | "claude_dialog" | "omp_approval" | "not_deliverable" | "too_long" | "idea_not_open" |
+  "codex_disabled" | "codex_not_owned" | "unsupported_control" | "turn_active" | "stale_codex_turn";
 export type SubmitResult = { ok: true; replyId: number } | { refused: true; reason: RefusalReason };
 export type RegisterQuestionArgs = { event: NormalizedEvent; id: string; toolUseId: string; timeoutMs: number };
 export type QuestionSubmitArgs = { key: string; questionId: string; answers: unknown; source: ReplySource; actor: string; listener?: Listener };
 export type QuestionSubmitResult = { ok: true } | { refused: true; reason: "disabled" | "invalid_key" | "invalid_question" | "invalid_source" | "invalid_actor" | "session_not_found" | "session_ended" | "stale_question" };
+export type CodexSubmitArgs = { key: string; action: CodexAction; text?: string; expectedTurnId?: string;
+  source: ReplySource; actor: string; listener?: Listener };
+export type CodexRefusalReason = RefusalReason;
+export type CodexSubmitResult = { ok: true; replyId: number; receipt: { target: string; action: CodexAction; status: "pending" } } |
+  { refused: true; reason: CodexRefusalReason };
 export type QuestionRegisterResult =
   | { ok: true; questionId: string; expiresAt: number }
   | { refused: true; reason: "disabled" | "invalid_question" | "session_ended" | "duplicate" };
@@ -36,6 +43,7 @@ export type QuestionRegisterResult =
 export interface RepliesOptions {
   db: DashDB;
   enabled?: boolean;
+  codexEnabled?: boolean;
   now?: () => number;
   ttlMs?: number;
   /** TTL for kind "message"; clamped to MESSAGE_TTL_MIN_MS..MESSAGE_TTL_MAX_MS (the Claude waiter hook times out at 6 h). */
@@ -83,7 +91,7 @@ const clampMessageTtl = (ms: number) => Number.isFinite(ms) ? Math.min(MESSAGE_T
 /** DASH_MESSAGE_TTL_MS: unset or non-numeric means the 4 h default; numbers are clamped to 60 s..6 h. */
 export const messageTtlFromEnv = (raw: string | undefined) => raw === undefined || raw.trim() === "" || !Number.isFinite(Number(raw)) ? MESSAGE_TTL_MS : clampMessageTtl(Number(raw));
 
-export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_000, messageTtlMs = MESSAGE_TTL_MS,
+export function createReplies({ db, enabled = true, codexEnabled = false, now = Date.now, ttlMs = 900_000, messageTtlMs = MESSAGE_TTL_MS,
   setTimer, onQueued, onOutcome, onQuestionOutcome, send, onWaiterChange, autopilotDelivery, autopilotAllowed }: RepliesOptions) {
   const audit = createAudit(db);
   const messageTtl = clampMessageTtl(messageTtlMs);
@@ -125,7 +133,8 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     const dto = db.getSession(key);
     if (!dto || dto.status === "ended") return;
     while (waiter.pending) {
-      const reply = db.nextQueuedReply(key, waiter.harness !== "omp" || waiter.commitCapable);
+      const includeAutopilot = waiter.harness === "claude" || waiter.harness === "omp" && waiter.commitCapable;
+      const reply = db.nextQueuedReply(key, includeAutopilot);
       if (!reply) return;
       let delivery: AutopilotDelivery | null = null;
       if (reply.source === "autopilot") {
@@ -138,7 +147,9 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       }
       const result = waiter.harness === "claude"
         ? db.takeQueuedForClaude(key, reply.id, dto.turnSeq, now())
-        : db.leaseQueuedForOmp(key, reply.id, waiter.waiterId, dto.turnSeq, now(), waiter.commitCapable);
+        : waiter.harness === "codex"
+          ? db.leaseQueuedForCodex(key, reply.id, waiter.waiterId, now(), waiter.commitCapable)
+          : db.leaseQueuedForOmp(key, reply.id, waiter.waiterId, dto.turnSeq, now(), waiter.commitCapable);
       if (result.kind === "stale") { outcome(result.reply!, "cancelled", db.getSession(key)); continue; }
       if (result.kind === "unavailable" && reply.expiresAt <= now()) {
         for (const expired of db.expireReplies(now())) outcome(expired, "expired", db.getSession(expired.sessionKey));
@@ -151,8 +162,17 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
         finish(waiter, { status: 200, reply: delivery ? JSON.stringify({ kind:"dash.autopilot.reply.v1",source:"autopilot",text:body,autopilot:delivery }) : body });
         outcome(result.reply, "delivered", dto);
         syntheticPrompt(dto, result.reply.source);
+      } else if (waiter.harness === "codex") {
+        const action = result.reply.codexAction;
+        if (!action) {
+          cancelled(db.cancelReplies({ key, id: result.reply.id, reason: "missing_codex_action" }, now()), dto);
+          continue;
+        }
+        leases.set(result.reply.id, { key, waiterId: waiter.waiterId, peer: waiter.peer, harness: "codex" });
+        finish(waiter, { status: 200, reply: { id: result.reply.id, target: key, action, text: result.reply.text,
+          ...(result.reply.codexExpectedTurnId ? { expectedTurnId: result.reply.codexExpectedTurnId } : {}), source: result.reply.source } });
       } else {
-        leases.set(result.reply.id, { waiterId: waiter.waiterId, peer: waiter.peer });
+        leases.set(result.reply.id, { key, waiterId: waiter.waiterId, peer: waiter.peer, harness: "omp" });
         finish(waiter, { status: 200, reply: { id: result.reply.id, text: result.reply.text, source: result.reply.source,
           ...(delivery ? { autopilot: delivery } : {}) } });
       }
@@ -285,6 +305,11 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     for (const reply of db.expireReplies(now())) { outcome(reply, "expired", db.getSession(reply.sessionKey)); retry.add(reply.sessionKey); }
     for (const reply of db.expiredLeases(now())) {
       leases.delete(reply.id);
+      if (reply.state === "expired") {
+        outcome(reply, "expired", db.getSession(reply.sessionKey));
+        retry.add(reply.sessionKey);
+        continue;
+      }
       if (reply.state !== "delivered") { retry.add(reply.sessionKey); continue; }
       const dto = db.getSession(reply.sessionKey);
       outcome(reply, "delivered", dto);
@@ -309,6 +334,14 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
         actor: args.actor, listener, text, outcome: `refused:${reason}`, outcomeTs: ts });
     }
     else counts.invalid++;
+    return { refused: true, reason };
+  };
+  const refuseCodex = (reason: CodexRefusalReason, args: CodexSubmitArgs, text: string, listener: Listener): CodexSubmitResult => {
+    if (args.source === "web" && typeof args.actor === "string") {
+      const ts = now();
+      audit.record({ ts, sessionKey: args.key, source: args.source, actor: args.actor, listener, text,
+        outcome: `refused:${reason}`, outcomeTs: ts });
+    } else counts.invalid++;
     return { refused: true, reason };
   };
   const refuseQuestion = (reason: "disabled" | "invalid_key" | "invalid_question" | "invalid_source" |
@@ -385,7 +418,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
 
   return {
     submit(args: SubmitArgs): SubmitResult {
-      const disabled = messageRefusalReason(undefined, enabled);
+      const disabled = messageRefusalReason(undefined, enabled, codexEnabled);
       if (disabled) return refuse(disabled, args);
       if (!isReplyKey(args.key)) return refuse("invalid_key", args);
       if (args.source !== "telegram" && args.source !== "web" && args.source !== "autopilot") return refuse("invalid_source", args);
@@ -411,12 +444,13 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       const listener = args.listener ?? (args.source === "telegram" ? "telegram" : args.source === "web" ? "loopback" : "internal");
       const dto = db.getSession(args.key);
       if (!dto) return refuse("session_not_found", args, text, listener);
-      const refusal = messageRefusalReason(dto, enabled);
+      const refusal = messageRefusalReason(dto, enabled, codexEnabled);
       if (refusal && refusal !== "omp_approval") return refuse(refusal, args, text, listener);
       if (args.answersQuestion !== undefined && (dto.harness !== "omp" || dto.status !== "needs_input" ||
           dto.needsReason !== "question" || dto.pendingQuestionId !== args.answersQuestion))
         return refuse("stale_question", args, text, listener);
       if (refusal) return refuse(refusal, args, text, listener);
+      if (dto.harness === "codex") return refuse("unsupported_control", args, text, listener);
       // Submission-only snapshot guard: ordinary queued text is not a turn-bound answer.
       if (args.expectedTurn !== undefined && args.expectedTurn !== dto.turnSeq) return refuse("stale_turn", args, text, listener);
       if (args.answersTurn !== undefined && args.answersTurn !== dto.turnSeq) return refuse("stale_turn", args, text, listener);
@@ -434,6 +468,49 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       onQueued?.(reply);
       tryDispatch(args.key);
       return { ok: true, replyId: reply.id };
+    },
+    submitCodexControl(args: CodexSubmitArgs): CodexSubmitResult {
+      const listener = args.listener ?? (args.source === "web" ? "loopback" : args.source === "telegram" ? "telegram" : "internal");
+      const auditText = typeof args.text === "string" && args.text.trim() ? args.text : `Codex control: ${args.action}`;
+      if (!enabled) return refuseCodex("disabled", args, auditText, listener);
+      if (!codexEnabled) return refuseCodex("codex_disabled", args, auditText, listener);
+      if (!isReplyKey(args.key)) return refuseCodex("invalid_key", args, auditText, listener);
+      if (args.source !== "web") return refuseCodex("invalid_source", args, auditText, listener);
+      if (typeof args.actor !== "string" || !actorPattern.web.test(args.actor)) return refuseCodex("invalid_actor", args, auditText, listener);
+      if (listener !== "loopback" && listener !== "tailnet") return refuseCodex("invalid_source", args, auditText, listener);
+      if (args.action !== "turn/start" && args.action !== "turn/steer" && args.action !== "turn/interrupt") {
+        return refuseCodex("unsupported_control", args, auditText, listener);
+      }
+      const dto = db.getSession(args.key);
+      if (!dto) return refuseCodex("session_not_found", args, auditText, listener);
+      const refusal = messageRefusalReason(dto, enabled, codexEnabled);
+      if (refusal) return refuseCodex(refusal, args, auditText, listener);
+      if (dto.harness !== "codex") return refuseCodex("invalid_key", args, auditText, listener);
+      const control = dto.codexControl;
+      if (!control?.appServerOwned || control.source !== "appServer") return refuseCodex("codex_not_owned", args, auditText, listener);
+      const supported = args.action === "turn/start" ? control.turnStart :
+        args.action === "turn/steer" ? control.turnSteer : control.turnInterrupt;
+      if (!supported) return refuseCodex("unsupported_control", args, auditText, listener);
+      const text = typeof args.text === "string" ? cleanMessageText(args.text) : "";
+      if (args.action === "turn/start" || args.action === "turn/steer") {
+        if (typeof args.text !== "string") return refuseCodex("invalid_text", args, auditText, listener);
+        if ([...text].length > MAX_MESSAGE_CHARS) return refuseCodex("too_long", args, auditText, listener);
+        if (!text) return refuseCodex("empty_text", args, auditText, listener);
+      } else if (text) return refuseCodex("invalid_text", args, auditText, listener);
+      const expectedTurnId = args.expectedTurnId;
+      if (args.action === "turn/start") {
+        if (expectedTurnId !== undefined) return refuseCodex("invalid_turn", args, auditText, listener);
+        if (control.activeTurnId) return refuseCodex("turn_active", args, auditText, listener);
+      } else if (typeof expectedTurnId !== "string" || !/^[A-Za-z0-9_-]{1,96}$/.test(expectedTurnId) ||
+          expectedTurnId !== control.activeTurnId) return refuseCodex("stale_codex_turn", args, auditText, listener);
+      const ts = now();
+      const receiptText = text || `Codex control: ${args.action}`;
+      const prepared = audit.prepare({ ts, sessionKey: args.key, source: args.source, actor: args.actor, listener, text: receiptText });
+      const reply = db.enqueueCodexControl(args.key, text, args.source, args.actor, args.action, expectedTurnId, ts, ttlMs, prepared);
+      cancelled(db.cancelReplies({ key: args.key, source: "autopilot", reason: "owner_replied" }, ts), dto);
+      onQueued?.(reply);
+      tryDispatch(args.key);
+      return { ok: true, replyId: reply.id, receipt: { target: args.key, action: args.action, status: "pending" } };
     },
     submitQuestion(args: QuestionSubmitArgs): QuestionSubmitResult {
       if (!enabled) return refuseQuestion("disabled",args);
@@ -486,7 +563,7 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     },
     commitOmp(id: number, waiterId: string, peer = "loopback") {
       const lease = leases.get(id);
-      if (!lease || lease.waiterId !== waiterId || lease.peer !== peer) return false;
+      if (!lease || lease.harness !== "omp" || lease.waiterId !== waiterId || lease.peer !== peer) return false;
       const reply = db.getReply(id);
       if (reply?.source === "autopilot") {
         const goalId = reply.actor ? actorGoalId(reply.actor) : null;
@@ -500,6 +577,16 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
         }
       }
       const result = db.commitOmp(id, waiterId, now());
+      if (!result.ok && result.reason === "stale" && result.reply) {
+        leases.delete(id);
+        outcome(result.reply, "cancelled", db.getSession(result.reply.sessionKey));
+      }
+      return result.ok;
+    },
+    commitCodex(id: number, waiterId: string, target: string, peer = "loopback") {
+      const lease = leases.get(id);
+      if (!lease || lease.harness !== "codex" || lease.key !== target || lease.waiterId !== waiterId || lease.peer !== peer) return false;
+      const result = db.commitCodex(id, now());
       if (!result.ok && result.reason === "stale" && result.reply) {
         leases.delete(id);
         outcome(result.reply, "cancelled", db.getSession(result.reply.sessionKey));
@@ -526,18 +613,21 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
     waitClaude: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal) => wait("claude", key, waiterId, started, waitMs, signal),
     waitOmp: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal, commitCapable = false, peer = "loopback") =>
       wait("omp", key, waiterId, started, waitMs, signal, commitCapable, peer),
+    waitCodex: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal, peer = "loopback") =>
+      wait("codex", key, waiterId, started, waitMs, signal, true, peer),
     deliveryObservation(key: string): DeliveryObservation | undefined {
       const waiter = waiters.get(key);
       const pending = waiter?.pending;
       if (!waiter || !pending || pending.signal?.aborted || pending.expiresAt <= now()) return undefined;
       return { observedAt: pending.observedAt, expiresAt: pending.expiresAt,
-        protocol: waiter.harness === "claude" ? "claude-waiter" : waiter.commitCapable ? "omp-commit" : "omp-legacy" };
+        protocol: waiter.harness === "claude" ? "claude-waiter" : waiter.harness === "codex" ? "codex-control" :
+          waiter.commitCapable ? "omp-commit" : "omp-legacy" };
     },
     ackOmp(id: number, waiterId: string, answer: "sent" | "deferred", peer = "loopback") {
       const ackKey = `${id}:${waiterId}:${peer}:${answer}`;
       if (acks.has(ackKey)) return true;
       const lease = leases.get(id);
-      if (!lease || lease.waiterId !== waiterId || lease.peer !== peer) return false;
+      if (!lease || lease.harness !== "omp" || lease.waiterId !== waiterId || lease.peer !== peer) return false;
       const reply = answer === "sent" ? db.ackReply(id, now()) : db.deferReply(id, now());
       if (!reply) return false;
       leases.delete(id);
@@ -548,6 +638,20 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
         outcome(reply, "delivered", dto);
         syntheticPrompt(dto, reply.source);
       } else tryDispatch(reply.sessionKey);
+      return true;
+    },
+    ackCodex(id: number, waiterId: string, answer: "accepted" | "unsupported" | "failed" | "unknown", target: string, reason?: string, peer = "loopback") {
+      const ackKey = `${id}:${waiterId}:${peer}:${answer}:${reason ?? ""}:${target}`;
+      if (acks.has(ackKey)) return true;
+      const lease = leases.get(id);
+      if (!lease || lease.harness !== "codex" || lease.key !== target || lease.waiterId !== waiterId || lease.peer !== peer) return false;
+      const reply = db.ackCodexControl(id, answer, reason, now());
+      if (!reply) return false;
+      leases.delete(id);
+      acks.add(ackKey);
+      if (acks.size > 1000) acks.delete(acks.values().next().value!);
+      const dto = db.getSession(reply.sessionKey);
+      outcome(reply, answer === "accepted" ? "delivered" : answer === "unknown" ? "expired" : "cancelled", dto);
       return true;
     },
     observe(dto: SessionDTO) {
@@ -564,7 +668,8 @@ export function createReplies({ db, enabled = true, now = Date.now, ttlMs = 900_
       const at = now();
       const active = [...waiters.values()].filter(w => w.pending && !w.pending.signal?.aborted && w.pending.expiresAt > at);
       return { enabled, queued: count.queued, leased: count.leased,
-        waiters: { claude: active.filter(w => w.harness === "claude").length, omp: active.filter(w => w.harness === "omp").length }, ...counts };
+        waiters: { claude: active.filter(w => w.harness === "claude").length,
+          omp: active.filter(w => w.harness === "omp").length, codex: active.filter(w => w.harness === "codex").length }, ...counts };
     },
     close() {
       stopTimer();

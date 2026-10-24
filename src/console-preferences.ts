@@ -5,7 +5,7 @@ export interface ConsoleViewConfig {
   host: string;
   project: string | null;
   account: string | null;
-  harness: "" | "claude" | "omp";
+  harness: "" | "claude" | "omp" | "codex";
   status: "" | "needs_input" | "your_turn" | "working" | "ended" | "unread" | "unknown";
   headless: boolean;
   ended: boolean;
@@ -40,7 +40,7 @@ const CONFIG_FIELDS = ["search", "host", "project", "account", "harness", "statu
 const STATUSES = ["", "needs_input", "your_turn", "working", "ended", "unread", "unknown"] as const;
 const COLUMNS = ["project", "host", "account", "harness", "age"] as const;
 const GROUPS = ["", "project", "host", "account", "harness"] as const;
-const HARNESS = ["", "claude", "omp"] as const;
+const HARNESS = ["", "claude", "omp", "codex"] as const;
 const DENSITIES = ["compact", "comfortable"] as const;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);

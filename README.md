@@ -16,10 +16,10 @@ This public source snapshot is software documentation, not an operational histor
 - Dense console, the default view. A session table shows state, project, session, machine, account, harness and activity age, with a reading and reply pane for the selected session alongside a consolidated chronological **Client output timeline** across all clients (available via **Timeline (all clients)** in the reading pane, in the **Client output timeline** section below the console table, and in the full-page **Timeline** tab, which persists `#view=timeline` across reloads). The collector tracks unread responses, so the reading position survives reloads and syncs across your browsers. See the [console section](docs/runbook.md#dashboard-console) of the runbook.
 - Compare, search and organize. Compare two retained outputs side by side without generated summaries, search captured response text with repository-host and folder filters, pin sessions, save named views, and use keyboard shortcuts or the **Commands** palette. Output search keeps a selected repository filter even when no live session currently matches it. No palette action sends replies or grants authorization.
 - Batch prompts with a preview. Send one ordinary prompt to sessions you add one at a time, after reviewing a frozen preview of targets and text. There is no all-sessions target, and each target gets its own receipt.
-- Sources and session controls. **Sources** lists machines and accounts with the hub's own report times, shown as reporting, stale, unreported or unknown. Each session's **Controls** panel marks queueing, structured-question answers, approvals, interruption, resume and launch as supported, unavailable or unknown. Dash offers no remote approval, interruption, resume or launch.
+- Sources and session controls. **Sources** lists machines and accounts with the hub's own report times, shown as reporting, stale, unreported or unknown. Each session's **Controls** panel marks queueing, structured-question answers, approvals, interruption, resume and launch as supported, unavailable or unknown. Codex app-server-owned threads may support turn start, steer and interrupt; Dash does not grant Codex approvals, answer Codex user-input requests, attach to standalone sessions, remotely resume sessions or launch them. See the [Codex source adapter](docs/runbook.md#codex-source-adapter).
 - Account aliases. Set a short, non-secret `DASH_ACCOUNT_ALIAS` when you launch a session to label its account. You can also rename a session or edit its alias in the dashboard. Aliases are display labels, not account identities.
 - Ideas inbox. With replies enabled, save a message for later from Telegram (`/idea`, or the session picker) or from the dashboard's **Ideas** panel, then send it to a session when it is ready. Messages that expire before delivery are saved there too.
-- Codex sessions are not yet ingested or controlled. Claude Code and OMP are the supported harnesses.
+- Optional Codex source adapter runs a local `codex app-server` and ingests the thread metadata, recent turns and liveness it exposes. Limited turn controls apply only to app-server-owned threads; standalone CLI/Desktop sessions are not attachable, and approvals and user-input requests must be handled in Codex.
 
 ## Requirements and local quick start
 
@@ -89,6 +89,22 @@ setx DASH_HOST "windows-peer"
 ```
 
 Replace the example host/label with the values configured on your hub, open a new terminal so the environment is refreshed, and restart OMP. The OMP extension and Claude installer are separate client integrations; neither installs the hub on Windows.
+
+## Optional Codex source adapter
+
+Codex ingestion is opt-in: set `DASH_CODEX=1` on both the collector and source runner; it is off by default. On the source machine, the runner starts a local `codex app-server` and forwards its thread metadata, recent turns, turn-state updates and liveness to an existing Dash hub. `DASH_CODEX_IDENTITIES` can select up to 16 local profiles; each configured profile uses its own absolute `codeHome` and a distinct non-secret account alias when multiple profiles are used. See the [Codex source adapter runbook](docs/runbook.md#codex-source-adapter) for configuration and the control matrix.
+
+For a single profile using the default Codex home:
+
+```sh
+DASH_CODEX=1 \
+DASH_URL="http://127.0.0.1:4777" \
+CODEX_HOME="$HOME/.codex" \
+DASH_ACCOUNT_ALIAS="personal" \
+bun run codex:source
+```
+
+Codex start, steer and interrupt controls require `DASH_REPLIES=1` on both the collector and source runner and are limited to app-server-owned threads whose local app-server supports the method. Dash does not answer Codex approval or user-input requests, remotely attach to or resume standalone CLI/Desktop sessions, or launch sessions. A relay `ack_timeout`, or a `turn/start`, `turn/steer` or `turn/interrupt` RPC that Dash sent but did not receive a response to (because it timed out or the local app-server exited before responding), has an unknown outcome: the action may or may not have been dispatched. Dash will not retry it automatically; check the Codex thread before resubmitting.
 
 ## Optional Telegram and replies
 

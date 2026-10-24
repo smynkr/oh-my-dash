@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { readdir, readFile } from "node:fs/promises";
 
 export interface LivenessRecord {
-  host: string; harness: "claude" | "omp"; sessionId: string; pid?: number;
+  host: string; harness: "claude" | "omp" | "codex"; sessionId: string; pid?: number;
   cwd?: string; name?: string; detail?: string;
 }
 const execFileAsync = promisify(execFile);

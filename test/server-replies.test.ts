@@ -18,11 +18,12 @@ let originalEnv: Record<string, string | undefined>;
 const sid = "synthetic_session";
 const waiter = "waiteraaaaaaaaaa";
 const remoteHeaders = { Host: "dash.tailnet.test", "X-Forwarded-For": "192.0.2.10" };
-const envNames = ["DASH_REPLIES", "DASH_ALLOWED_HOSTS", "DASH_ALLOWED_PEERS", "DASH_TAILNET_PORT", "DASH_TG_TOPICS", "DASH_TELEGRAM", "DASH_TELEGRAM_API_BASE", "DASH_JUDGE", "DASH_CODEX_BIN"];
+const envNames = ["DASH_REPLIES", "DASH_CODEX", "DASH_ALLOWED_HOSTS", "DASH_ALLOWED_PEERS", "DASH_TAILNET_PORT", "DASH_TG_TOPICS", "DASH_TELEGRAM", "DASH_TELEGRAM_API_BASE", "DASH_JUDGE", "DASH_CODEX_BIN"];
 
 beforeEach(() => {
   originalEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
   process.env.DASH_REPLIES = "";
+  process.env.DASH_CODEX = "";
   process.env.DASH_ALLOWED_HOSTS = "";
   process.env.DASH_ALLOWED_PEERS = "";
   process.env.DASH_TAILNET_PORT = "";
@@ -266,6 +267,70 @@ test("submission snapshot guards allow working-session text without binding late
   await expectExactJson(await apiJson(baseUrl + "/reply/commit", { id: replyId, waiter }), 200, { ok: true });
   await expectExactJson(await apiJson(baseUrl + "/reply/ack", { id: replyId, waiter, outcome: "sent" }), 200, { ok: true });
   expect(app!.db.getReplies(session.key)).toMatchObject([{ id: replyId, state: "delivered", answersTurn: null }]);
+});
+test("Codex request-timeout acknowledgements persist as expired unknown receipts", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true);
+  const session = app!.db.applyEvent({
+    host:localHost(),harness:"codex",sessionId:"codex_timeout_session",kind:"session_start",ts:nowMs,interactive:true,
+    codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null },
+  });
+  const submitted = await apiJson(baseUrl + apiReplyPath(session.key), { action:"turn/start",text:"Synthetic timeout control" });
+  expect(submitted.status).toBe(202);
+  const { replyId } = await submitted.json() as { replyId:number };
+  const waiterId = "codexwaiter000000";
+  const waitUrl = new URL("/reply/wait/codex",baseUrl);
+  waitUrl.searchParams.set("session",session.sessionId);
+  waitUrl.searchParams.set("waiter",waiterId);
+  waitUrl.searchParams.set("started",String(nowMs));
+  waitUrl.searchParams.set("wait","1");
+  waitUrl.searchParams.set("commit","1");
+  const delivered = await fetch(waitUrl);
+  expect(delivered.status).toBe(200);
+  expect(await delivered.json()).toMatchObject({ id:replyId,target:session.key });
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", { id:replyId,waiter:waiterId,target:session.key }),
+    200,{ ok:true });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
+    id:replyId,waiter:waiterId,target:session.key,outcome:"unknown",reason:"request_timeout",
+  }),200,{ ok:true });
+  expect(app!.db.getReply(replyId)).toMatchObject({
+    state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
+  });
+});
+test("Codex loopback control routes honor a configured source host label", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true), host = "codex-profile-host";
+  const session = app!.db.applyEvent({
+    host,harness:"codex",sessionId:"custom_host_session",kind:"session_start",ts:nowMs,interactive:true,
+    codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null },
+  });
+  const submitted = await apiJson(baseUrl + apiReplyPath(session.key), {
+    action:"turn/start",text:"Synthetic custom-host control",
+  });
+  expect(submitted.status).toBe(202);
+  const { replyId } = await submitted.json() as { replyId:number };
+  const waiterId = "codexhostwaiter01";
+  const waitUrl = new URL("/reply/wait/codex",baseUrl);
+  waitUrl.searchParams.set("session",session.sessionId);
+  waitUrl.searchParams.set("waiter",waiterId);
+  waitUrl.searchParams.set("started",String(nowMs));
+  waitUrl.searchParams.set("wait","1");
+  waitUrl.searchParams.set("commit","1");
+  const headers = { "X-Dash-Host":host };
+  const delivered = await fetch(waitUrl,{ headers });
+  expect(delivered.status).toBe(200);
+  expect(await delivered.json()).toMatchObject({ id:replyId,target:session.key });
+
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", {
+    id:replyId,waiter:waiterId,target:session.key,
+  },{ "X-Dash-Host":"other-codex-host" }),403,{ error:"forbidden" });
+  await expectExactJson(await apiJson(baseUrl + "/reply/commit", {
+    id:replyId,waiter:waiterId,target:session.key,
+  },headers),200,{ ok:true });
+  await expectExactJson(await apiJson(baseUrl + "/reply/ack", {
+    id:replyId,waiter:waiterId,target:session.key,outcome:"accepted",
+  },headers),200,{ ok:true });
+  expect(app!.db.getReply(replyId)).toMatchObject({ state:"delivered",codexControlStatus:"accepted" });
 });
 
 test("submission snapshot guards reject malformed versions without queueing text", async () => {
@@ -593,6 +658,32 @@ test("capabilities remain queryable with replies disabled and do not claim liven
   await expectExactJson(await fetch(baseUrl + "/api/sessions/%E0%A4%A/capabilities"), 400, { error: "invalid key" });
   await expectExactJson(await fetch(baseUrl + apiCapabilitiesPath("synthetic-host|claude|missing_session")), 404, { error: "not found" });
 });
+test("Codex ingest retries with the same event ID do not apply the response twice", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(true), host = localHost(), sessionId = "codex_idempotent_ingest";
+  const key = `${host}|codex|${sessionId}`, eventId = "a".repeat(64);
+  const event = { host, harness:"codex", sessionId, kind:"response", ts:nowMs + 1, interactive:true,
+    prompt:"same prompt", text:"same Codex answer" };
+  const headers = { "X-Dash-Event-Id":eventId };
+  await expectExactJson(await apiJson(baseUrl + "/ingest/codex", event, headers), 200, {});
+  await expectExactJson(await apiJson(baseUrl + "/ingest/codex", event, headers), 200, {});
+  expect(app!.db.getSession(key)?.turnSeq).toBe(1);
+  expect(app!.db.sqlite.query("SELECT COUNT(*) AS n FROM responses WHERE session_key=?").get(key)).toEqual({ n:1 });
+  expect(app!.db.sqlite.query("SELECT COUNT(*) AS n FROM events WHERE session_key=? AND event_id=?").get(key,eventId))
+    .toEqual({ n:1 });
+});
+
+test("Codex steer and interrupt capabilities are disabled when replies are disabled", async () => {
+  process.env.DASH_CODEX = "1";
+  const baseUrl = setup(false), host = localHost(), sessionId = "codex_disabled_capabilities";
+  const session = app!.db.applyEvent({ host, harness:"codex", sessionId, kind:"session_start", ts:nowMs, interactive:true,
+    codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:"active_turn" } });
+  const capabilities: SessionCapabilities = await (await fetch(baseUrl + apiCapabilitiesPath(session.key))).json();
+  expect(capabilities.actions.message).toMatchObject({ status:"unavailable",code:"disabled" });
+  expect(capabilities.actions.steer).toMatchObject({ status:"unavailable",code:"disabled" });
+  expect(capabilities.actions.interrupt).toMatchObject({ status:"unavailable",code:"disabled" });
+});
+
 
 test("retained output with an unroutable identity does not advertise message support", async () => {
   const baseUrl = setup(true);

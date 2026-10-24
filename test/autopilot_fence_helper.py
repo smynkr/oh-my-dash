@@ -1,13 +1,13 @@
 import importlib.util
-import json
 import io
+import json
 import os
 import sys
 import tempfile
 import time
 import unittest
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -77,6 +77,7 @@ class FenceResponseValidationTests(unittest.TestCase):
         self.assertFalse(denied)
         self.assertIsNone(reason)
         write_cache.assert_called_once_with("synthetic-host", "synthetic-session", False)
+
 
 class FenceNetworkFailureTests(unittest.TestCase):
     def test_cold_or_inactive_cache_denies_when_hub_is_unreachable(self):

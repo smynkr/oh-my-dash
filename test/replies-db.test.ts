@@ -118,6 +118,111 @@ test("R1 hand-out checks turn and status atomically and public replies omit priv
     expect(publicDto).not.toHaveProperty("textSha256");
   } finally { db.close(); }
 });
+test("Codex stale-control receipts persist the declared stale status and reason", () => {
+  const db = new DashDB(":memory:");
+  const audit = createAudit(db);
+  const key = "synthetic-host|codex|codex_session";
+  const host = "synthetic-host", sessionId = "codex_session";
+  const control = (activeTurnId: string) => ({
+    source: "appServer", appServerOwned: true, turnStart: true, turnSteer: true, turnInterrupt: true, activeTurnId,
+  });
+  const prepare = (ts: number, text: string) => audit.prepare({
+    ts, sessionKey: key, source: "web", actor: "web:loopback", listener: "loopback", text,
+  });
+  try {
+    db.applyEvent({ host, harness: "codex", sessionId, kind: "session_start", detail: "history", ts: 1, interactive: true,
+      codexControl: control("first_turn") });
+    const start = db.enqueueCodexControl(key, "synthetic send", "web", "web:loopback", "turn/start", undefined, 2, 60_000, prepare(2, "synthetic send"));
+    expect(db.leaseQueuedForCodex(key, start.id, "waiter-start", 3, true).kind).toBe("stale");
+    expect(db.getReply(start.id)).toMatchObject({ state:"cancelled", codexControlStatus:"stale", codexControlReason:"stale_turn" });
+
+    const steer = db.enqueueCodexControl(key, "synthetic steer", "web", "web:loopback", "turn/steer", "first_turn", 4, 60_000, prepare(4, "synthetic steer"));
+    expect(db.leaseQueuedForCodex(key, steer.id, "waiter-steer", 5, true).kind).toBe("leased");
+    db.applyEvent({ host, harness: "codex", sessionId, kind: "prompt", text:"synthetic next prompt", ts:6, interactive:true,
+      codexControl: control("second_turn") });
+    expect(db.commitCodex(steer.id, 7)).toMatchObject({ ok:false, reason:"stale" });
+    expect(db.getReply(steer.id)).toMatchObject({ state:"cancelled", codexControlStatus:"stale", codexControlReason:"stale_turn" });
+  } finally { db.close(); }
+});
+test("expired committed Codex controls keep an unknown receipt instead of claiming acceptance", () => {
+  const db = new DashDB(":memory:");
+  const audit = createAudit(db);
+  const key = "synthetic-host|codex|expiry_session";
+  const control = { source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null };
+  const prepare = (ts: number) => audit.prepare({
+    ts, sessionKey:key, source:"web", actor:"web:loopback", listener:"loopback", text:"synthetic codex control",
+  });
+  try {
+    db.applyEvent({ host:"synthetic-host",harness:"codex",sessionId:"expiry_session",kind:"session_start",
+      detail:"history",ts:1,interactive:true,codexControl:control });
+    const reply = db.enqueueCodexControl(key,"synthetic turn start","web","web:loopback","turn/start",undefined,
+      2,60_000,prepare(2));
+    expect(db.leaseQueuedForCodex(key,reply.id,"waiter-expiry",3,true).kind).toBe("leased");
+    expect(db.commitCodex(reply.id,4)).toEqual({ ok:true });
+
+    const [expired] = db.expiredLeases(60_004);
+    expect(expired).toMatchObject({
+      id:reply.id,state:"expired",codexControlStatus:"unknown",codexControlReason:"ack_timeout",
+    });
+    expect(db.getReply(reply.id)).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"ack_timeout",
+    });
+    expect(db.getReplies(key)[0]).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"ack_timeout",committed:true,
+    });
+    expect(db.ackCodexControl(reply.id,"waiter-expiry","accepted",undefined,60_005)).toBeUndefined();
+  } finally { db.close(); }
+});
+test("a timed-out committed Codex control stores an expired unknown receipt", () => {
+  const db = new DashDB(":memory:");
+  const audit = createAudit(db);
+  const key = "synthetic-host|codex|request_timeout_session";
+  const control = { source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null };
+  const prepare = (ts: number) => audit.prepare({
+    ts,sessionKey:key,source:"web",actor:"web:loopback",listener:"loopback",text:"synthetic Codex timeout",
+  });
+  try {
+    db.applyEvent({ host:"synthetic-host",harness:"codex",sessionId:"request_timeout_session",kind:"session_start",
+      detail:"history",ts:1,interactive:true,codexControl:control });
+    const reply = db.enqueueCodexControl(key,"timed out after RPC write","web","web:loopback","turn/start",undefined,
+      2,60_000,prepare(2));
+    expect(db.leaseQueuedForCodex(key,reply.id,"waiter-request-timeout",3,true).kind).toBe("leased");
+    expect(db.commitCodex(reply.id,4)).toEqual({ ok:true });
+
+    const receipt = db.ackCodexControl(reply.id,"unknown","request_timeout",5);
+    expect(receipt).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
+    });
+    expect(db.getReply(reply.id)).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",
+    });
+    expect(db.getReplies(key)[0]).toMatchObject({
+      state:"expired",codexControlStatus:"unknown",codexControlReason:"request_timeout",committed:true,
+    });
+  } finally { db.close(); }
+});
+test("queued Codex controls that expire before dispatch keep an expired receipt", () => {
+  const db = new DashDB(":memory:");
+  const audit = createAudit(db);
+  const key = "synthetic-host|codex|queued_expiry_session";
+  const prepare = audit.prepare({
+    ts:2,sessionKey:key,source:"web",actor:"web:loopback",listener:"loopback",text:"synthetic queued control",
+  });
+  try {
+    db.applyEvent({ host:"synthetic-host",harness:"codex",sessionId:"queued_expiry_session",kind:"session_start",
+      detail:"history",ts:1,interactive:true,
+      codexControl:{ source:"appServer",appServerOwned:true,turnStart:true,turnSteer:true,turnInterrupt:true,activeTurnId:null } });
+    const reply = db.enqueueCodexControl(key,"synthetic queued turn start","web","web:loopback","turn/start",undefined,
+      2,60_000,prepare);
+    const [expired] = db.expireReplies(60_002);
+    expect(expired).toMatchObject({
+      id:reply.id,state:"expired",codexControlStatus:"expired",codexControlReason:"expired",
+    });
+    expect(db.getReplies(key)[0]).toMatchObject({
+      id:reply.id,state:"expired",codexControlStatus:"expired",codexControlReason:"expired",committed:false,
+    });
+  } finally { db.close(); }
+});
 
 test("R1 cancellation includes queued and uncommitted leases but keeps committed replies", () => {
   const db = new DashDB(":memory:");

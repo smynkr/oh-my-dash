@@ -96,9 +96,9 @@ export function fenceMatch(tool: FenceTool, input: unknown, customPhrases: reado
   } else if (!isMcp && !safeTools.has(normalizedTool.toLowerCase())) {
     return { deny: true, rule: "uninspectable" };
   }
-
   // The dialog hook owns AskUserQuestion policy and may release a stop-and-ask prompt to Claude.
   if (normalizedTool.toLowerCase() === "askuserquestion") return { deny: false };
+
   const rawText = [mcpText, ...state.strings].join(isMcp ? " " : "\n");
   const text = normalizedTool === "Bash" ? rawText.replace(/["'`]/g, "") : rawText;
   const rule = matchingRule(normalizedTool, text, customPhrases);

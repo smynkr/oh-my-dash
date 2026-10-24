@@ -37,8 +37,8 @@ export function reduceState(previous: SessionState, event: NormalizedEvent): Ses
       next.status = "working"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null;
       break;
     case "notification": next.lastNotification = event.text ?? null; if (event.detail && Object.hasOwn(promptingNotifications, event.detail) && !(next.status === "needs_input" && next.needsReason === "question")) { next.status = "needs_input"; next.needsReason = event.detail; next.needsText = event.text ?? null; next.pendingQuestionId = null; } break;
-    case "response": next.status = "your_turn"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null; next.backgroundPending = (event.backgroundTasks ?? 0) > 0; break;
-    case "error": next.status = "your_turn"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null; next.lastError = event.text ?? null; break;
+    case "response": next.status = event.harness === "codex" && event.codexControl?.activeTurnId ? "working" : "your_turn"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null; next.backgroundPending = (event.backgroundTasks ?? 0) > 0; break;
+    case "error": next.status = event.harness === "codex" && event.codexControl?.activeTurnId ? "working" : "your_turn"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null; next.lastError = event.text ?? null; break;
     case "session_end": next.status = "ended"; next.needsReason = null; next.needsText = null; next.pendingQuestionId = null; break;
   }
   return next;
