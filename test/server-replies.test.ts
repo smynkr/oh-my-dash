@@ -165,17 +165,17 @@ test("validates wait parameters and the loopback session label", async () => {
 });
 
 test("tailnet reply waits require the mapped host label and time out with 204", async () => {
-  const baseUrl = setup(true, { tailnet: true, peers: "mbp=192.0.2.10" });
+  const baseUrl = setup(true, { tailnet: true, peers: "peer1=192.0.2.10" });
   const remote = `http://127.0.0.1:${app!.tailnetServer!.port}`;
-  const session = seed("claude", "mbp");
-  const headers = { ...remoteHeaders, "X-Dash-Host": "mbp" };
+  const session = seed("claude", "peer1");
+  const headers = { ...remoteHeaders, "X-Dash-Host": "peer1" };
   await expectExactJson(await fetch(remote + waitPath("claude"), { headers: { ...headers, "X-Dash-Host": "other" } }), 403, { error: "forbidden" });
   const start = performance.now();
   const response = await fetch(remote + waitPath("claude"), { headers });
   expect(response.status).toBe(204);
   expect(performance.now() - start).toBeGreaterThanOrEqual(900);
   expect(baseUrl).toStartWith("http://127.0.0.1:");
-  expect(session.key).toBe("mbp|claude|synthetic_session");
+  expect(session.key).toBe("peer1|claude|synthetic_session");
 });
 
 test("Claude web reply reaches a waiting session and gives a text-only response", async () => {
@@ -640,10 +640,10 @@ test("repeated OMP ack emits one terminal SSE event", async () => {
 });
 
 test("OMP commit is peer-bound and legacy waiters can still acknowledge without commit", async () => {
-  const baseUrl = setup(true, { tailnet: true, peers: "mbp=192.0.2.10,mbp=192.0.2.11" });
+  const baseUrl = setup(true, { tailnet: true, peers: "peer1=192.0.2.10,peer1=192.0.2.11" });
   const remote = tailnetBase;
-  const session = seed("omp", "mbp");
-  const tailHeaders = (peer: string, label = "mbp") => ({ Host: "dash.tailnet.test", "X-Forwarded-For": peer, "X-Dash-Host": label });
+  const session = seed("omp", "peer1");
+  const tailHeaders = (peer: string, label = "peer1") => ({ Host: "dash.tailnet.test", "X-Forwarded-For": peer, "X-Dash-Host": label });
   const legacy = enqueue(session.key, "synthetic legacy text");
   const legacyWait = await fetch(remote + waitPath("omp"), { headers: tailHeaders("192.0.2.10") });
   expect(legacyWait.status).toBe(200);
@@ -683,12 +683,12 @@ test("OMP commit is peer-bound and legacy waiters can still acknowledge without 
 });
 
 test("tailnet browser actor comes from the mapped peer label, including legacy bare-IP peers", async () => {
-  const baseUrl = setup(true, { tailnet: true, peers: "mbp=192.0.2.10" });
-  const session = seed("claude", "mbp");
+  const baseUrl = setup(true, { tailnet: true, peers: "peer1=192.0.2.10" });
+  const session = seed("claude", "peer1");
   const headers = { Host: "dash.tailnet.test", "X-Forwarded-For": "192.0.2.10", Origin: "https://dash.tailnet.test", "Content-Type": "application/json" };
   const response = await fetch(tailnetBase + apiReplyPath(session.key), { method: "POST", headers, body: JSON.stringify({ text: "synthetic mapped-label reply" }) });
   expect(response.status).toBe(200);
-  expect(app!.db.sqlite.query("SELECT source, actor, listener FROM reply_audit ORDER BY id DESC LIMIT 1").get()).toEqual({ source: "web", actor: "web:mbp", listener: "tailnet" });
+  expect(app!.db.sqlite.query("SELECT source, actor, listener FROM reply_audit ORDER BY id DESC LIMIT 1").get()).toEqual({ source: "web", actor: "web:peer1", listener: "tailnet" });
 
   app!.close();
   process.env.DASH_ALLOWED_PEERS = "192.0.2.10";

@@ -778,7 +778,6 @@ describe("Codex app-server adapter", () => {
     expect(readRpc(home).filter(request => request.method === "thread/resume")).toHaveLength(1);
     expect(readRpc(home).filter(request => request.method === "turn/steer")).toHaveLength(1);
   }, 10_000);
-
   test("restart clears adapter ownership before steering an unowned thread", async () => {
     const home = makeHome("owned-restart-home"), hub = new FakeControlHub();
     activeHub = hub;

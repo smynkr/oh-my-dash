@@ -104,7 +104,7 @@ const validChatId = (value: unknown): value is string => typeof value === "strin
 const validThreadId = (value: unknown): value is number | null => value === null ||
   (typeof value === "number" && Number.isSafeInteger(value) && value > 0);
 const autopilotDelaySteps: readonly (number|null)[] = [...AUTOPILOT_DELAY_CHOICES, null];
-const isHarness = (dto: SessionDTO) => dto.interactive && ["claude", "omp"].includes(dto.harness);
+const isHarness = (dto: SessionDTO) => dto.interactive && ["claude", "omp", "agy"].includes(dto.harness);
 const cardCode = /^d:([0-9a-z]{1,8}):(0|[1-9]\d?):(0|[1-9]\d?)$/;
 const pickerCode = /^c:([0-9a-z]{1,8}):([0-9a-z]{1,6}):([0-7]|i|x)$/, ideaCode = /^i:([0-9a-z]{1,8}):([sa])$/;
 const PICKER_ROWS = 8;
@@ -157,7 +157,7 @@ function isStoredAlert(value: unknown): value is Alert {
   const { dto, destination } = value;
   if (!dto || typeof dto !== "object" || !destination || typeof destination !== "object") return false;
   return "key" in dto && typeof dto.key === "string" && "displayName" in dto && typeof dto.displayName === "string" &&
-    "host" in dto && typeof dto.host === "string" && "harness" in dto && (dto.harness === "claude" || dto.harness === "omp") &&
+    "host" in dto && typeof dto.host === "string" && "harness" in dto && (dto.harness === "claude" || dto.harness === "omp" || dto.harness === "agy") &&
     (!("sessionKind" in dto) || typeof dto.sessionKind === "string") &&
     "reason" in value && typeof value.reason === "string" && "turn" in value && typeof value.turn === "boolean" &&
     "promptId" in value && typeof value.promptId === "number" && Number.isSafeInteger(value.promptId) && value.promptId >= 0 &&
@@ -487,7 +487,7 @@ export function createTelegram(opts: TelegramOptions) {
     const body = alert.snippet ? `\n\n<b>${bodyLabel}${pages.length > 1 ? ` · Part ${part + 1}/${pages.length}` : ""}</b>\n${pages[part]}` : "";
     const excerpt = alert.truncated && part === pages.length - 1
       ? "\n\n<i>Excerpt limited by DASH_TELEGRAM_SNIPPET_CHARS. Full captured text is in dash.</i>" : "";
-    const terminalOnly = !turn && (dto.harness === "claude" && reason !== "waiting" || dto.harness === "omp" && reason === "permission");
+    const terminalOnly = !turn && ((dto.harness === "claude" || dto.harness === "agy") && reason !== "waiting" || dto.harness === "omp" && reason === "permission");
     const next = alert.resolution || part < pages.length - 1 ? "" :
       `\n\n<b>Next:</b> ${replies && !terminalOnly ? "Reply to this message to continue." : "Open the session in your terminal to continue."}`;
     if (part < pages.length - 1) return `${head}${body}${excerpt}${next}`;
@@ -895,6 +895,7 @@ export function createTelegram(opts: TelegramOptions) {
       case "session_ended": return "That session has ended.";
       case "claude_dialog": return "Claude dialogs can't be answered by a free-text reply. Use AskUserQuestion buttons when available; answer permission prompts in the terminal or Remote Control.";
       case "omp_approval": return "omp tool approvals can't be answered from dash yet.";
+      case "agy_dialog": return "Antigravity ask_question prompts can't be answered by a free-text reply. Use the question card buttons when remote questions are enabled, or answer in Antigravity.";
       case "stale_turn": return "Out of date: the session has moved on";
       case "not_deliverable": return "That session is not ready for this action.";
       case "too_long": return `That message is over ${MAX_MESSAGE_CHARS} characters. Shorten it and send again.`;
@@ -964,7 +965,8 @@ export function createTelegram(opts: TelegramOptions) {
     appendQuestionButton(rows, `${pick.useCustom ? "✓ " : ""}Custom`, `q:${card.id}:${index}:c`);
     if (!questionSendsOnPick(card) && index === card.questions.length - 1)
       appendQuestionButton(rows, "Send", `q:${card.id}:${index}:s`);
-    if (db.getSession(card.key)?.harness === "claude")
+    const qHarness = db.getSession(card.key)?.harness;
+    if (qHarness === "claude" || qHarness === "agy")
       appendQuestionButton(rows, "Terminal", `q:${card.id}:${index}:x`);
     return { inline_keyboard: rows };
   };
@@ -977,8 +979,9 @@ export function createTelegram(opts: TelegramOptions) {
     const dto = db.getSession(key), existing = questionCards.get(id);
     if (!dto || !isHarness(dto) || dto.status !== "needs_input" || dto.needsReason !== "question" ||
         (dto.pendingQuestion?.id ?? dto.pendingQuestionId) !== id || !dto.pendingQuestion?.questions?.length) return undefined;
-    const invocation = dto.harness === "claude" ? db.getQuestionInvocation(id, key) : undefined;
-    if (dto.harness === "claude" && (!invocation || invocation.state !== "pending" || invocation.expiresAt <= now())) return undefined;
+    const usesInvocation = dto.harness === "claude" || dto.harness === "agy";
+    const invocation = usesInvocation ? db.getQuestionInvocation(id, key) : undefined;
+    if (usesInvocation && (!invocation || invocation.state !== "pending" || invocation.expiresAt <= now())) return undefined;
     if (existing && existing.key === key && existing.epoch === pairEpoch && existing.active) return existing;
     const messages = new Map<number, { sent: SentMessage; questionIndex: number }>();
     for (const saved of db.telegramQuestionMessagesForQuestion(id)) {
@@ -1002,7 +1005,7 @@ export function createTelegram(opts: TelegramOptions) {
     const dto = db.getSession(card.key);
     if (!dto || !isHarness(dto) || dto.status !== "needs_input" || dto.needsReason !== "question" ||
         (dto.pendingQuestion?.id ?? dto.pendingQuestionId) !== card.id) return false;
-    if (dto.harness === "claude") {
+    if (dto.harness === "claude" || dto.harness === "agy") {
       const invocation = db.getQuestionInvocation(card.id, card.key);
       return !!invocation && invocation.state === "pending" && invocation.expiresAt > now();
     }
@@ -1030,7 +1033,7 @@ export function createTelegram(opts: TelegramOptions) {
     card.messages.clear();
   };
   const buildQuestionPage = (card: QuestionCard, index: number, part: number, parts: number, chunk: string) =>
-    `<b>${card.questions.length > 1 ? `Question ${index + 1}/${card.questions.length}` : "Claude / OMP question"}` +
+    `<b>${card.questions.length > 1 ? `Question ${index + 1}/${card.questions.length}` : dtoHarness(card) === "agy" ? "Antigravity question" : "Claude / OMP question"}` +
     `${parts > 1 ? ` · Part ${part + 1}/${parts}` : ""}</b>\n<pre>${escapeHtml(chunk)}</pre>`;
   const invalidateQuestionId = (id: string) => {
     const card = questionCards.get(id);
@@ -1098,7 +1101,8 @@ export function createTelegram(opts: TelegramOptions) {
     if (!replies || !questionCardLive(card)) return { refused: true as const, reason: "stale_question" };
     if (!card.questions.every((question, index) => questionSelectionReady(question, card.picks[index]!)))
       return { refused: true as const, reason: "invalid_question" };
-    if (db.getSession(card.key)?.harness === "claude") {
+    const cardHarness = db.getSession(card.key)?.harness;
+    if (cardHarness === "claude" || cardHarness === "agy") {
       const selections = Object.create(null) as Record<string, { selectedOptions: number[]; customInput?: string }>;
       card.questions.forEach((question, index) => {
         const pick = card.picks[index]!;
@@ -1163,8 +1167,9 @@ export function createTelegram(opts: TelegramOptions) {
     clearTelegramQuestionMessage(record);
     if (questionSendsOnPick(card)) {
       const submitted = finishQuestionCard(card);
+      const targetLabel = dtoHarness(card) === "claude" ? "Claude" : dtoHarness(card) === "agy" ? "Antigravity" : "OMP";
       await retrySendAt(destination, "refused" in submitted ? questionRefusal(submitted.reason) :
-        `Answer sent to ${dtoHarness(card) === "claude" ? "Claude" : "OMP"}.`, undefined, message.message_id);
+        `Answer sent to ${targetLabel}.`, undefined, message.message_id);
     } else {
       void updateQuestionKeyboard(card, record.questionIndex);
       await retrySendAt(destination, "Custom answer captured.", undefined, message.message_id);
@@ -1202,7 +1207,8 @@ export function createTelegram(opts: TelegramOptions) {
     const question = card.questions[index]!, pick = card.picks[index]!;
     if (action === "x") {
       const invocation = db.getQuestionInvocation(id, card.key);
-      if (!invocation || dtoHarness(card) !== "claude" || !replies?.cancelQuestion(id, card.key, invocation.toolUseId)) {
+      const h = dtoHarness(card);
+      if (!invocation || (h !== "claude" && h !== "agy") || !replies?.cancelQuestion(id, card.key, invocation.toolUseId)) {
         invalidateQuestionCard(card); await answerCallback(callback, "This question has expired or was replaced."); return;
       }
       invalidateQuestionCard(card);
@@ -1225,7 +1231,7 @@ export function createTelegram(opts: TelegramOptions) {
         return;
       }
       const harness = dtoHarness(card);
-      await answerCallback(callback, harness === "claude" ? "Answers sent to Claude." : "Answers sent to OMP.");
+      await answerCallback(callback, harness === "claude" ? "Answers sent to Claude." : harness === "agy" ? "Answers sent to Antigravity." : "Answers sent to OMP.");
       return;
     }
     const option = Number(action);
@@ -1239,8 +1245,9 @@ export function createTelegram(opts: TelegramOptions) {
     }
     if (questionSendsOnPick(card)) {
       const submitted = finishQuestionCard(card);
+      const targetLabel = dtoHarness(card) === "claude" ? "Claude" : dtoHarness(card) === "agy" ? "Antigravity" : "OMP";
       await answerCallback(callback, "refused" in submitted ? questionRefusal(submitted.reason) :
-        `Answer sent to ${dtoHarness(card) === "claude" ? "Claude" : "OMP"}.`);
+        `Answer sent to ${targetLabel}.`);
       return;
     }
     void updateQuestionKeyboard(card, index);
@@ -1463,7 +1470,7 @@ export function createTelegram(opts: TelegramOptions) {
   };
   // Claude AskUserQuestion options carry their own "(Recommended)" marker; without one the line is omitted.
   const questionRecommendation = (dto: SessionDTO): Rec | undefined => {
-    if (!replies || !snippetChars || dto.harness !== "claude" || dto.needsReason !== "question") return;
+    if (!replies || !snippetChars || (dto.harness !== "claude" && dto.harness !== "agy") || dto.needsReason !== "question") return;
     try {
       const questions: unknown = JSON.parse(db.latestQuestionDetail(dto.key) ?? "[]");
       const labels = (Array.isArray(questions) ? questions : []).flatMap(options => Array.isArray(options) ? options : [])

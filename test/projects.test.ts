@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
 import { resolveProject, ruleErrors, SEED_PROJECT_RULES, topicFor, type TopicBindings } from "../src/projects.ts";
 
-test("the four seed path rules resolve their intended projects and preserve fallback basenames", () => {
+test("the seed path rules resolve their intended projects and preserve fallback basenames", () => {
   expect(resolveProject("/Users/agent/Developer/example-api/task", SEED_PROJECT_RULES)).toBe("example");
   expect(resolveProject("/Users/agent/.example-triage/task", SEED_PROJECT_RULES)).toBe("example");
   expect(resolveProject("/Volumes/ExampleData/tmp/example-123/task", SEED_PROJECT_RULES)).toBe("example");
-  expect(resolveProject("/Users/agent/Documents/Defense", SEED_PROJECT_RULES)).toBe("Defense");
+  expect(resolveProject("/Users/agent/Documents/GitHub/dash", SEED_PROJECT_RULES)).toBe("dash");
+  expect(resolveProject("/Users/agent/Documents/Platform", SEED_PROJECT_RULES)).toBe("Platform");
   expect(resolveProject("/Users/agent/checkouts/unmatched/repo", SEED_PROJECT_RULES)).toBe("repo");
   expect(resolveProject("/Users/agent/projects/alpha/task", SEED_PROJECT_RULES)).toBe("alpha");
   expect(resolveProject("/Users/agent/Documents/beta", SEED_PROJECT_RULES)).toBe("beta");
@@ -15,7 +16,7 @@ test("the four seed path rules resolve their intended projects and preserve fall
     { pattern: "test", project: "first" },
     { pattern: "test", project: "second" },
   ])).toBe("first");
-  expect(resolveProject("/tmp/rogue/", [])).toBe("rogue");
+  expect(resolveProject("/tmp/service/", [])).toBe("service");
   for (const cwd of ["", "/", null, undefined]) expect(resolveProject(cwd, SEED_PROJECT_RULES)).toBe("");
 });
 
@@ -32,8 +33,8 @@ test("topic selection prefers exact, then component, then General bindings", () 
   const bindings: TopicBindings = {
     groupChatId: "-1001234567890",
     topics: {
-      "squad/alpha": 42,
-      "squad/beta": 43,
+      "stack/alpha": 42,
+      "stack/beta": 43,
       alpha: 44,
       general: null,
       urgent: 46,
@@ -41,7 +42,7 @@ test("topic selection prefers exact, then component, then General bindings", () 
   };
 
   expect(topicFor("alpha", bindings)).toEqual({ chatId: "-1001234567890", threadId: 44, name: "alpha" });
-  expect(topicFor("beta", bindings)).toEqual({ chatId: "-1001234567890", threadId: 43, name: "squad/beta" });
+  expect(topicFor("beta", bindings)).toEqual({ chatId: "-1001234567890", threadId: 43, name: "stack/beta" });
   expect(topicFor("unmatched", bindings)).toEqual({ chatId: "-1001234567890", threadId: null, name: "general" });
   expect(topicFor("urgent-project", { ...bindings, topics: { urgent: 46 } })).toBeNull();
   expect(topicFor("unmatched", { ...bindings, topics: { urgent: 46 } })).toBeNull();

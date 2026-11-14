@@ -19,8 +19,10 @@
       <button type="button" class="count working-count" id="working-filter-toggle" aria-pressed="false" title="Show working sessions"><b id="working-count">0</b> working</button>
     </div>
     <div id="telegram-status" class="telegram-status" aria-live="polite" hidden></div>
+    <button id="triage-open" class="button button-secondary" type="button" aria-haspopup="dialog" aria-keyshortcuts="t" title="Triage attention across projects (t)">Triage</button>
     <button id="ideas-open" class="button button-secondary ideas-open" type="button" aria-haspopup="dialog" title="Ideas" hidden>Ideas <span id="ideas-badge" class="ideas-badge">0</span></button>
     <button id="autopilot-open" class="button button-secondary" type="button" aria-haspopup="dialog">Autopilot <span id="autopilot-badge">Off</span></button>
+    <button id="quiet-mode-toggle" class="button button-secondary" type="button" aria-pressed="false" title="Hide repetitive explanatory boilerplate">Quiet hints</button>
     <button id="notification-enable" class="button button-secondary" type="button">Enable desktop notifications</button>
     <button id="mark-all" class="button button-secondary" type="button">Mark all read</button>
   </header>
@@ -78,9 +80,10 @@
 
     <div class="filters" aria-label="Session filters">
       <label class="session-filter session-search-label" for="session-search">Search <input id="session-search" type="search" maxlength="1024" autocomplete="off" placeholder="Session, project, machine, account, path" aria-keyshortcuts="/" title="Search sessions (/)"></label>
+      <button id="search-in-outputs" type="button" class="button button-secondary session-filter" hidden title="Search this query across retained response text">Search in outputs</button>
       <label class="session-filter">Project <select id="project-filter"><option value="">All projects</option></select></label>
       <label>Machine <select id="host-filter"><option value="">All machines</option></select></label>
-      <label>Harness <select id="harness-filter"><option value="">All harnesses</option><option value="claude">Claude Code</option><option value="omp">Oh My Pi</option><option value="codex">Codex</option></select></label>
+      <label>Harness <select id="harness-filter"><option value="">All harnesses</option><option value="claude">Claude Code</option><option value="omp">Oh My Pi</option><option value="codex">Codex</option><option value="agy">Antigravity</option></select></label>
       <label class="session-filter">Account <select id="account-filter"><option value="">All accounts</option></select></label>
       <label class="session-filter">State <select id="status-filter"><option value="">All states</option><option value="needs_input">Needs you</option><option value="unread">Unread</option><option value="working">Working</option><option value="your_turn">Your turn</option><option value="ended">Ended</option><option value="unknown">Unknown</option></select></label>
       <label class="check-label"><input id="headless-filter" type="checkbox"> Show headless</label>
@@ -172,7 +175,7 @@
         </details>
         <button id="console-sort" class="button button-secondary" type="button">Sort by attention</button>
       </div>
-      <div class="console-layout">
+      <div id="console-layout" class="console-layout">
         <div class="console-table-column">
           <div class="console-table-wrap">
             <table class="console-table">
@@ -192,7 +195,9 @@
             </table>
           </div>
           <p id="console-empty" class="empty-state" hidden>No sessions match these filters.</p>
+          <div id="console-empty-actions" class="empty-state-actions" hidden><button id="console-empty-search-outputs" class="button button-secondary" type="button">Search in outputs instead</button></div>
         </div>
+        <div id="console-resizer" class="console-resizer" role="separator" aria-orientation="vertical" aria-label="Resize session list and reading pane" tabindex="0"></div>
         <section class="console-pane" aria-label="Selected session">
           <div class="console-pane-toolbar">
             <div class="console-pane-modes" role="group" aria-label="Reading pane view">
@@ -200,6 +205,7 @@
               <button id="console-pane-timeline" class="button button-secondary console-pane-mode" type="button" aria-pressed="false">Timeline (all clients)</button>
             </div>
             <span id="console-selection-status" aria-live="polite">Select a session</span>
+            <button id="console-wide-toggle" class="button button-secondary" type="button" aria-pressed="false" aria-keyshortcuts="w" title="Toggle wide reading pane (w)">Wide reader</button>
             <button id="console-pin-selected" class="button button-secondary" type="button" aria-pressed="false" disabled>Pin session</button>
             <label id="console-follow-wrap" class="console-follow-label"><input id="console-follow" type="checkbox"> Follow live</label>
             <button id="console-update" class="button button-secondary" type="button" hidden>Show latest</button>
@@ -227,7 +233,7 @@
           </div>
         </section>
       </div>
-      <details id="console-timeline-disclosure" class="output-comparison console-timeline-disclosure" open>
+      <details id="console-timeline-disclosure" class="output-comparison console-timeline-disclosure">
         <summary>Client output timeline <span id="console-timeline-summary-help" class="comparison-hint">All clients · chronological order</span></summary>
         <p class="comparison-guidance">Consolidated chronological feed of outputs across all connected machines, accounts and harnesses (filtered by Machine, Harness and Show headless above). Select any session name to inspect or reply in the console.</p>
         <div id="console-timeline" class="timeline console-timeline" aria-live="polite"></div>
@@ -285,6 +291,7 @@
     <section id="sessions-view" class="view" role="tabpanel" aria-labelledby="sessions-tab" tabindex="0" hidden>
       <div id="sessions" class="card-grid" aria-live="polite"></div>
       <p id="sessions-empty" class="empty-state" hidden>No sessions match these filters.</p>
+      <div id="sessions-empty-actions" class="empty-state-actions" hidden><button id="sessions-empty-search-outputs" class="button button-secondary" type="button">Search in outputs instead</button></div>
     </section>
     <section id="timeline-view" class="view" role="tabpanel" aria-labelledby="timeline-tab" tabindex="0" hidden>
       <div id="timeline" class="timeline"></div>
@@ -310,12 +317,20 @@
       <div><dt><kbd>↓</kbd> / <kbd>↑</kbd></dt><dd>Next / previous row when a row is focused</dd></div>
       <div><dt><kbd>Home</kbd> / <kbd>End</kbd></dt><dd>First / last row when a row is focused</dd></div>
       <div><dt><kbd>r</kbd></dt><dd>Focus the selected session's available reply composer</dd></div>
+      <div><dt><kbd>t</kbd></dt><dd>Open attention triage by project</dd></div>
+      <div><dt><kbd>w</kbd></dt><dd>Toggle wide reading pane in Console</dd></div>
       <div><dt><kbd>?</kbd></dt><dd>Open this reference</dd></div>
       <div><dt><kbd>Ctrl/Cmd K</kbd></dt><dd>Open commands</dd></div>
       <div><dt><kbd>Esc</kbd></dt><dd>Close a dialog and restore focus</dd></div>
     </dl>
     <p class="muted">Global shortcuts are off while editing, choosing an option, composing with an IME, or using a dialog. Commands never send a reply or authorize an action.</p>
     <p class="muted">In Commands: type to filter, use arrows to focus an available action, and Enter to run it. Every action is also available by touch.</p>
+  </dialog>
+  <dialog id="triage-dialog" class="navigation-dialog triage-dialog" aria-labelledby="triage-title">
+    <form method="dialog"><button class="dialog-close" aria-label="Close triage">×</button></form>
+    <h2 id="triage-title">Attention triage</h2>
+    <p id="triage-summary" class="muted" role="status">Grouping sessions needing attention by project…</p>
+    <div id="triage-groups" class="triage-groups"></div>
   </dialog>
   <dialog id="ideas-dialog" class="navigation-dialog ideas-dialog" aria-labelledby="ideas-title">
     <form method="dialog"><button class="dialog-close" aria-label="Close ideas">×</button></form>

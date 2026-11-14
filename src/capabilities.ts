@@ -3,7 +3,7 @@ import type { CodexAction } from "./normalize.ts";
 
 export type CapabilityStatus = "supported" | "unavailable" | "unknown";
 export type CapabilityAction = { status: CapabilityStatus; reason: string; code?: string };
-export type DeliveryProtocol = "claude-waiter" | "omp-commit" | "omp-legacy" | "codex-control";
+export type DeliveryProtocol = "claude-waiter" | "omp-commit" | "omp-legacy" | "codex-control" | "agy-commit";
 export type DeliveryObservation = { observedAt: number; expiresAt: number; protocol: DeliveryProtocol };
 export type SessionCapabilities = {
   evaluatedAt: number;
@@ -21,7 +21,7 @@ export type SessionCapabilities = {
 };
 export type SessionWithCapabilities = SessionDTO & { capabilities: SessionCapabilities };
 export type CapabilitySession = Pick<SessionDTO, "key" | "harness" | "status" | "needsReason" | "codexControl">;
-export type MessageRefusalReason = "disabled" | "invalid_key" | "session_ended" | "claude_dialog" | "omp_approval" | "codex_disabled" | "codex_not_owned";
+export type MessageRefusalReason = "disabled" | "invalid_key" | "session_ended" | "claude_dialog" | "omp_approval" | "agy_dialog" | "codex_disabled" | "codex_not_owned";
 
 const claudeDialogs: Record<string, true> = {
   question: true,
@@ -31,7 +31,7 @@ const claudeDialogs: Record<string, true> = {
   elicitation_url_dialog: true,
 };
 
-const replyKeyPattern = /^[A-Za-z0-9_-]{1,64}\|(claude|omp|codex)\|[A-Za-z0-9_-]{1,128}$/;
+const replyKeyPattern = /^[A-Za-z0-9_-]{1,64}\|(claude|omp|codex|agy)\|[A-Za-z0-9_-]{1,128}$/;
 export function isReplyKey(value: unknown): value is string {
   return typeof value === "string" && replyKeyPattern.test(value);
 }
@@ -49,6 +49,7 @@ export function messageRefusalReason(session: CapabilitySession | null | undefin
   }
   if (session.harness === "claude" && session.status === "needs_input" && claudeDialogs[session.needsReason ?? ""] === true) return "claude_dialog";
   if (session.harness === "omp" && session.status === "needs_input" && session.needsReason === "permission") return "omp_approval";
+  if (session.harness === "agy" && session.status === "needs_input" && session.needsReason === "question") return "agy_dialog";
   return undefined;
 }
 
@@ -81,6 +82,7 @@ export function sessionCapabilities(session: CapabilitySession, enabled: boolean
       : refusal === "session_ended" ? "The session has ended; Dash will not accept a message."
       : refusal === "claude_dialog" ? "Claude's native dialog must be answered in Claude Code or Remote Control; Dash refuses queued text here."
       : refusal === "omp_approval" ? "OMP's native approval must be answered in the session; Dash refuses queued text here."
+      : refusal === "agy_dialog" ? "Antigravity's ask_question prompt is active; answer the structured question card or respond in Antigravity."
       : refusal === "codex_disabled" ? "Codex control is disabled; enable DASH_CODEX on the Dash console server."
       : "This Codex thread is not owned by this app-server; only a listed thread's turn/start may attempt to resume it.",
   } : session.harness === "codex"
@@ -101,9 +103,11 @@ export function sessionCapabilities(session: CapabilitySession, enabled: boolean
     ? unavailable("Codex approval and user-input requests are surfaced, but Dash does not implement native responses; respond in the Codex session.", "codex_user_input_unsupported")
     : session.harness === "omp"
       ? { status: "unknown", code: "feature_unreported", reason: "OMP commit=1 does not report the installed native ask/abort feature or version. Ordinary queued text is not a structured native answer." }
-      : claudeDialog
-        ? unavailable("Claude native question, permission and elicitation dialogs require an answer in Claude Code or Remote Control; Dash has no structured native-answer API.", "claude_dialog")
-        : unavailable("Dash does not expose Claude's structured native question-answer API; ordinary queued text only steers the conversation.");
+      : session.harness === "agy"
+        ? { status: "unknown", code: "agy_question_opt_in", reason: "Antigravity ask_question cards can be answered remotely when the Dash plugin is installed with --remote-questions; otherwise answer in Antigravity." }
+        : claudeDialog
+          ? unavailable("Claude native question, permission and elicitation dialogs require an answer in Claude Code or Remote Control; Dash has no structured native-answer API.", "claude_dialog")
+          : unavailable("Dash does not expose Claude's structured native question-answer API; ordinary queued text only steers the conversation.");
   const delivery = !enabled
     ? { status: "unavailable" as const, reason: "Replies are disabled; Dash does not register delivery waiters." }
     : session.status === "ended"

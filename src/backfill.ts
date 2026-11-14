@@ -1,13 +1,13 @@
-import { hostname } from "node:os";
-import { basename, join } from "node:path";
-import { homedir } from "node:os";
+import { hostname, homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { readdir, stat } from "node:fs/promises";
 import { openSync, fstatSync, readSync, closeSync, statSync } from "node:fs";
-import { describePrompt } from "./normalize.ts";
+import { Database } from "bun:sqlite";
+import { describePrompt, resolveWorkspacePath, stripAgyPromptEnvelope } from "./normalize.ts";
 
 export interface BackfillResponse { ts: number; text: string; prompt?: string }
 export interface BackfillSession {
-  host: string; harness: "claude" | "omp"; sessionId: string; cwd?: string; title?: string;
+  host: string; harness: "claude" | "omp" | "agy"; sessionId: string; cwd?: string; title?: string;
   transcriptPath: string; interactive: boolean; responses: BackfillResponse[];
 }
 
@@ -116,6 +116,173 @@ export async function findClaudeTranscript(sessionId: string): Promise<BackfillS
   return null;
 }
 
+export function defaultAgyRoots(home = homedir(), env = process.env): string[] {
+  const configured = env.DASH_AGY_HOME?.trim();
+  if (configured) return configured.split(":").map(s => s.trim()).filter(Boolean);
+  return [
+    join(home, ".gemini/antigravity-cli"),
+    join(home, ".gemini/antigravity"),
+    join(home, ".gemini/antigravity-ide"),
+  ];
+}
+export function parseAgyTimestamp(value: unknown): number {
+  if (typeof value === "number") return value < 1e12 ? value * 1000 : value;
+  if (typeof value !== "string" || !value.trim()) return NaN;
+  const iso = value.trim()
+    .replace(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/, "$1T$2")
+    .replace(/(\.\d{3})\d+/, "$1");
+  return Date.parse(iso);
+}
+function parseAgyLines(path: string, maxBytes: number, meta?: { sessionId?: string; cwd?: string; title?: string; host?: string }): BackfillSession | null {
+  let fileSize = 0;
+  try { fileSize = statSync(path).size; } catch { return null; }
+  let lines: string[];
+  try { lines = tailLines(path, maxBytes); } catch { return null; }
+  const entries: Record<string, any>[] = [];
+  for (const line of lines) { try { const e = object(JSON.parse(line)); if (e) entries.push(e); } catch { /* partial or malformed line */ } }
+  if (!entries.length) return null;
+  const neededFull = new Set<number>();
+  for (const e of entries) {
+    if ((e.type === "USER_INPUT" || e.type === "PLANNER_RESPONSE") && Number.isInteger(e.step_index) &&
+      Array.isArray(e.truncated_fields) && e.truncated_fields.includes("content")) {
+      neededFull.add(e.step_index);
+    }
+  }
+  const fullContent = new Map<number, string>();
+  if (neededFull.size > 0) {
+    const fullPath = join(dirname(path), "transcript_full.jsonl");
+    try {
+      for (const line of tailLines(fullPath, MAX_TAIL)) {
+        try {
+          const e = object(JSON.parse(line));
+          if (e && Number.isInteger(e.step_index) && neededFull.has(e.step_index) && typeof e.content === "string") {
+            fullContent.set(e.step_index, e.content);
+          }
+        } catch { /* ignore malformed full transcript line */ }
+      }
+    } catch { /* transcript_full.jsonl is optional */ }
+  }
+  const contentOf = (e: Record<string, any>): string => {
+    if (Number.isInteger(e.step_index) && fullContent.has(e.step_index)) return fullContent.get(e.step_index)!;
+    return typeof e.content === "string" ? e.content : "";
+  };
+  const turns: { user: Record<string, any>; promptText: string; planners: { entry: Record<string, any>; text: string }[] }[] = [];
+  for (const e of entries) {
+    if (e.type === "USER_INPUT" && (e.source === "USER_EXPLICIT" || e.source === undefined)) {
+      const stripped = stripAgyPromptEnvelope(contentOf(e));
+      if (stripped) turns.push({ user: e, promptText: stripped, planners: [] });
+    } else if (turns.length && e.type === "PLANNER_RESPONSE") {
+      const text = contentOf(e);
+      if (text.trim()) turns.at(-1)!.planners.push({ entry: e, text });
+    }
+  }
+  const responses: BackfillResponse[] = [];
+  for (const turn of turns.slice(-3)) {
+    const last = turn.planners.at(-1);
+    if (!last) continue;
+    const parsed = parseAgyTimestamp(last.entry.created_at ?? last.entry.timestamp ?? turn.user.created_at ?? turn.user.timestamp);
+    const prompt = describePrompt(turn.promptText);
+    responses.push({ ts: Number.isFinite(parsed) ? parsed : Date.now(), text: last.text, ...(prompt ? { prompt } : {}) });
+  }
+  if (responses.length < 3 && fileSize > INITIAL_TAIL && maxBytes < MAX_TAIL) return parseAgyLines(path, MAX_TAIL, meta);
+  const match = path.match(/\/brain\/([^/]+)\/\.system_generated\/logs\/transcript\.jsonl$/);
+  const sessionId = meta?.sessionId ?? match?.[1] ?? basename(path, ".jsonl");
+  return {
+    host: meta?.host ?? shortHost,
+    harness: "agy",
+    sessionId,
+    ...(meta?.cwd ? { cwd: meta.cwd } : {}),
+    ...(meta?.title ? { title: meta.title } : {}),
+    transcriptPath: path,
+    interactive: true,
+    responses,
+  };
+}
+export function parseAgyTranscript(path: string, meta?: { sessionId?: string; cwd?: string; title?: string; host?: string }): BackfillSession | null {
+  return parseAgyLines(path, INITIAL_TAIL, meta);
+}
+export async function findAgyTranscript(sessionId: string, agyRoots = defaultAgyRoots()): Promise<BackfillSession | null> {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return null;
+  for (const root of agyRoots) {
+    const transcriptPath = join(root, "brain", sessionId, ".system_generated/logs/transcript.jsonl");
+    try { if (!(await stat(transcriptPath)).isFile()) continue; } catch { continue; }
+    let cwd: string | undefined, title: string | undefined;
+    const dbPath = join(root, "conversation_summaries.db");
+    let db: Database | undefined;
+    try {
+      if (statSync(dbPath).isFile()) {
+        db = new Database(dbPath, { readonly: true });
+        const row = db.query("SELECT title, workspace_uris FROM conversation_summaries WHERE conversation_id = ?").get(sessionId) as Record<string, any> | null;
+        if (row) {
+          cwd = resolveWorkspacePath(row.workspace_uris);
+          title = typeof row.title === "string" && row.title.trim() ? row.title.trim() : undefined;
+        }
+      }
+    } catch { /* optional metadata */ }
+    finally { try { db?.close(); } catch { /* ignore */ } }
+    const parsed = parseAgyTranscript(transcriptPath, { sessionId, cwd, title });
+    if (parsed) return parsed;
+  }
+  return null;
+}
+export async function scanAgyBackfill(cutoff: number, agyRoots = defaultAgyRoots()): Promise<BackfillSession[]> {
+  const byId = new Map<string, { mtime: number; session: BackfillSession }>();
+  for (const root of agyRoots) {
+    const seenInRoot = new Set<string>();
+    const dbPath = join(root, "conversation_summaries.db");
+    let hasDb = false;
+    try { hasDb = statSync(dbPath).isFile(); } catch { hasDb = false; }
+    if (hasDb) {
+      let rows: Array<Record<string, any>> = [];
+      let db: Database | undefined;
+      try {
+        db = new Database(dbPath, { readonly: true });
+        rows = db.query(
+          "SELECT conversation_id, title, workspace_uris, last_modified_time, nesting_depth, parent_conversation_id, killed FROM conversation_summaries WHERE killed = 0 AND nesting_depth = 0"
+        ).all() as Array<Record<string, any>>;
+      } catch { rows = []; }
+      finally { try { db?.close(); } catch { /* ignore */ } }
+      for (const row of rows) {
+        const id = typeof row.conversation_id === "string" ? row.conversation_id.trim() : "";
+        if (!id || (typeof row.parent_conversation_id === "string" && row.parent_conversation_id.trim())) continue;
+        seenInRoot.add(id);
+        const modMs = parseAgyTimestamp(row.last_modified_time);
+        if (Number.isFinite(modMs) && modMs < cutoff) continue;
+        const transcriptPath = join(root, "brain", id, ".system_generated/logs/transcript.jsonl");
+        let mtimeMs = modMs;
+        try {
+          const st = await stat(transcriptPath);
+          if (!st.isFile()) continue;
+          if (!Number.isFinite(mtimeMs)) mtimeMs = st.mtimeMs;
+          if (mtimeMs < cutoff && st.mtimeMs < cutoff) continue;
+        } catch { continue; }
+        const cwd = resolveWorkspacePath(row.workspace_uris);
+        const title = typeof row.title === "string" && row.title.trim() ? row.title.trim() : undefined;
+        const parsed = parseAgyTranscript(transcriptPath, { sessionId: id, cwd, title });
+        if (!parsed) continue;
+        const prev = byId.get(id);
+        if (!prev || mtimeMs >= prev.mtime) byId.set(id, { mtime: mtimeMs, session: parsed });
+      }
+    }
+    const brainDir = join(root, "brain");
+    let entries;
+    try { entries = await readdir(brainDir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || seenInRoot.has(entry.name)) continue;
+      if (hasDb) continue;
+      const transcriptPath = join(brainDir, entry.name, ".system_generated/logs/transcript.jsonl");
+      let st;
+      try { st = await stat(transcriptPath); } catch { continue; }
+      if (!st.isFile() || st.mtimeMs < cutoff) continue;
+      const parsed = parseAgyTranscript(transcriptPath, { sessionId: entry.name });
+      if (!parsed) continue;
+      const prev = byId.get(entry.name);
+      if (!prev || st.mtimeMs >= prev.mtime) byId.set(entry.name, { mtime: st.mtimeMs, session: parsed });
+    }
+  }
+  return [...byId.values()].map(v => v.session);
+}
+
 async function filesUnder(dir: string, predicate: (p: string) => boolean): Promise<string[]> {
   const out: string[] = [];
   async function walk(path: string): Promise<void> { let entries; try { entries = await readdir(path, { withFileTypes: true }); } catch { return; }
@@ -123,7 +290,7 @@ async function filesUnder(dir: string, predicate: (p: string) => boolean): Promi
   }
   await walk(dir); return out;
 }
-export async function scanBackfill(hours = Number(process.env.DASH_BACKFILL_HOURS ?? 12), options: { roots?: { path: string; omp: boolean; sessionsDepth?: boolean }[]; now?: number } = {}): Promise<BackfillSession[]> {
+export async function scanBackfill(hours = Number(process.env.DASH_BACKFILL_HOURS ?? 12), options: { roots?: { path: string; omp: boolean; sessionsDepth?: boolean }[]; agyRoots?: string[]; now?: number } = {}): Promise<BackfillSession[]> {
   const cutoff = (options.now ?? Date.now()) - Math.max(0, hours) * 3600_000;
   const roots = options.roots ?? [
     { path: join(homedir(), ".claude/projects"), omp: false },
@@ -140,5 +307,7 @@ export async function scanBackfill(hours = Number(process.env.DASH_BACKFILL_HOUR
     const parsed = await parseLines(path, root.omp, INITIAL_TAIL);
     if (parsed) results.push(parsed);
   }
+  const agyRoots = options.agyRoots ?? (options.roots ? [] : defaultAgyRoots());
+  if (agyRoots.length) results.push(...await scanAgyBackfill(cutoff, agyRoots));
   return results;
 }

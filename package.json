@@ -1,7 +1,7 @@
 {
   "name": "oh-my-dash",
   "version": "0.1.0",
-  "description": "A local-first session dashboard for Claude Code and Oh My Pi, with optional Telegram alerts and replies.",
+  "description": "A local-first session dashboard for Claude Code, Antigravity, Oh My Pi, and Codex, with optional Telegram alerts and replies.",
   "license": "MIT",
   "private": true,
   "repository": {
@@ -15,6 +15,8 @@
   "scripts": {
     "start": "bun run src/server.ts",
     "codex:source": "bun run scripts/codex-source.ts",
+    "install:agy": "bun run scripts/install-agy-plugin.ts",
+    "export:public": "bun run scripts/export-public.ts",
     "test": "bun test"
   },
   "dependencies": {

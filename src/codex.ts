@@ -547,6 +547,7 @@ export function createCodexAdapter(options: CodexAdapterOptions): CodexAdapter {
 
   const appServerOwned = (profile: typeof profiles[number], threadId: string) =>
     profile.loaded.has(threadId) || profile.adapterOwnedThreads.has(threadId);
+
   const markAdapterOwned = (profile: typeof profiles[number], threadId: string) => {
     profile.adapterOwnedThreads.add(threadId);
     profile.adapterOwnedGenerationByThread.set(threadId, ++profile.adapterOwnershipGeneration);

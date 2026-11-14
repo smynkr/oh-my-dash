@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 // Runs the whole dashboard script against a permissive stub DOM, so a helper that is out of scope for its
-// caller (the AXI-448 port left the project-filter helpers inside loadSessions) fails here, not in the browser.
+// caller (an earlier port left the project-filter helpers inside loadSessions) fails here, not in the browser.
 // Every stubbed property is another stub; fetch never settles, so only the synchronous init path runs.
 function stub(): any {
   const target = function () {};
@@ -42,6 +42,23 @@ test("browser validator accepts persisted Codex harness filters", () => {
     search: "", host: "", project: null, account: null, harness: "codex", status: "", headless: false,
     ended: false, group: "", density: "comfortable", columns: [],
   })).toBe(true);
+  expect(valid({
+    search: "", host: "", project: null, account: null, harness: "agy", status: "", headless: false,
+    ended: false, group: "", density: "compact", columns: ["project", "harness"],
+  })).toBe(true);
+});
+
+test("index.html and app.js expose Antigravity filter, collapsed bottom timeline, and UX controls", () => {
+  const html = readFileSync(join(import.meta.dir, "../public/index.html"), "utf8");
+  expect(html).toContain('<option value="agy">Antigravity</option>');
+  expect(html).toContain('id="quiet-mode-toggle"');
+  expect(html).toContain('id="console-wide-toggle"');
+  expect(html).toContain('id="console-resizer"');
+  expect(html).toContain('id="triage-open"');
+  expect(html).toContain('id="triage-dialog"');
+  expect(html).toContain('id="search-in-outputs"');
+  expect(html).toContain('<details id="console-timeline-disclosure" class="output-comparison console-timeline-disclosure">');
+  expect(html).not.toContain('id="console-timeline-disclosure" class="output-comparison console-timeline-disclosure" open');
 });
 test("Codex controls with an expired receipt are shown as outcome unknown", () => {
   const script = readFileSync(join(import.meta.dir, "../public/app.js"), "utf8");

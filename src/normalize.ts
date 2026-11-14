@@ -1,6 +1,7 @@
 import { hostname } from "node:os";
+import { fileURLToPath } from "node:url";
 
-export type Harness = "claude" | "omp" | "codex";
+export type Harness = "claude" | "omp" | "codex" | "agy";
 export type CodexAction = "turn/start" | "turn/steer" | "turn/interrupt";
 export type EventKind = "session_start" | "prompt" | "question" | "question_answered" | "permission" | "notification" | "response" | "error" | "session_end";
 
@@ -87,9 +88,22 @@ export function normalizeAccountAlias(value: unknown): string | undefined {
   return /^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(alias) ? alias : undefined;
 }
 
+export function stripAgyPromptEnvelope(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const requestMatch = value.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+  if (requestMatch) return requestMatch[1]!;
+  const cleaned = value
+    .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/g, "")
+    .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, "")
+    .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/g, "")
+    .trim();
+  return cleaned || undefined;
+}
+
 export function describePrompt(text: string | undefined | null): string | null {
   if (text == null) return null;
-  const trimmed = text.trimStart();
+  const unwrapped = text.includes("<USER_REQUEST>") ? (stripAgyPromptEnvelope(text) ?? text) : text;
+  const trimmed = unwrapped.trimStart();
   if (/^<task-notification(?:\s|>)/.test(trimmed)) {
     const summary = trimmed.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim();
     return `⟲ Background task update${summary ? `: ${summary.slice(0, 160)}` : ""}`;
@@ -101,7 +115,7 @@ export function describePrompt(text: string | undefined | null): string | null {
     return `/${name}${args ? ` ${args}` : ""}`;
   }
   if (/^(?:<system-reminder(?:\s|>)|<local-command-stdout(?:\s|>)|Caveat:)/.test(trimmed)) return null;
-  return text;
+  return unwrapped;
 }
 
 function questionFields(input: Data | null) {
@@ -363,4 +377,205 @@ export function normalizeCodex(payload: unknown, headers: Headers, ts = Date.now
     responseSource: data.responseSource === "backfill" ? "backfill" : undefined,
     ...(codexControl ? { codexControl } : {}),
   };
+}
+
+export function normalizeAgyQuestions(value: unknown): AskQuestion[] | undefined {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) return undefined;
+  const questions: AskQuestion[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    const question = obj(entry);
+    if (!question) return undefined;
+    const text = boundedQuestionString(question.question, 8192);
+    if (text === undefined || !text.trim() || seen.has(text) ||
+        !Array.isArray(question.options) || question.options.length < 1 || question.options.length > 64) return undefined;
+    seen.add(text);
+    const options: AskOption[] = [];
+    const markedRecommended: number[] = [];
+    for (let idx = 0; idx < question.options.length; idx++) {
+      const rawOption = question.options[idx];
+      if (typeof rawOption === "string") {
+        const bounded = boundedQuestionString(rawOption, 2048);
+        if (bounded === undefined || !bounded.trim()) return undefined;
+        const trimmed = bounded.trim();
+        const prefixMatch = trimmed.match(/^\(recommended\)\s+(.+)$/i);
+        const suffixMatch = !prefixMatch ? trimmed.match(/^(.+?)\s+\(recommended\)$/i) : null;
+        if (prefixMatch || suffixMatch) markedRecommended.push(idx);
+        const cleanLabel = (prefixMatch?.[1] ?? suffixMatch?.[1] ?? trimmed).trim();
+        if (!cleanLabel) return undefined;
+        options.push({ label: cleanLabel });
+        continue;
+      }
+      const option = obj(rawOption);
+      if (!option) return undefined;
+      const label = boundedQuestionString(option.label, 2048);
+      if (label === undefined || !label.trim()) return undefined;
+      if (/^\(recommended\)\s+/i.test(label) || /\s+\(recommended\)$/i.test(label)) markedRecommended.push(idx);
+      const cleanLabel = label.replace(/^\(recommended\)\s+/i, "").replace(/\s+\(recommended\)$/i, "").trim() || label.trim();
+      const normalizedOption: AskOption = { label: cleanLabel };
+      for (const key of ["description", "preview"] as const) {
+        if (option[key] === undefined) continue;
+        const bounded = boundedQuestionString(option[key], key === "description" ? 4096 : 8192);
+        if (bounded === undefined) return undefined;
+        normalizedOption[key] = bounded;
+      }
+      options.push(normalizedOption);
+    }
+    const id = boundedQuestionString(question.id, 256) ?? String(questions.length);
+    const normalized: AskQuestion = { id, question: text, options };
+    if (question.header !== undefined) {
+      const header = boundedQuestionString(question.header, 256);
+      if (header === undefined) return undefined;
+      normalized.header = header;
+    }
+    const rawMulti = question.is_multi_select ?? question.multiSelect ?? question.multi;
+    if (rawMulti !== undefined) {
+      if (typeof rawMulti !== "boolean") return undefined;
+      normalized.multi = rawMulti;
+    }
+    if (Number.isInteger(question.recommended) && Number(question.recommended) >= 0 &&
+        Number(question.recommended) < options.length) {
+      normalized.recommended = Number(question.recommended);
+    } else if (normalized.multi !== true && markedRecommended.length === 1) {
+      normalized.recommended = markedRecommended[0];
+    }
+    questions.push(normalized);
+  }
+  return Buffer.byteLength(JSON.stringify(questions), "utf8") <= questionDataByteLimit ? questions : undefined;
+}
+
+export function resolveWorkspacePath(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) {
+    const raw = value.trim();
+    if (raw.startsWith("file://")) {
+      try { return fileURLToPath(raw); } catch { return undefined; }
+    }
+    if (raw.startsWith("[")) {
+      try { return resolveWorkspacePath(JSON.parse(raw)); } catch { return undefined; }
+    }
+    return raw;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const resolved = resolveWorkspacePath(item);
+      if (resolved) return resolved;
+    }
+  }
+  return undefined;
+}
+
+export function normalizeAgy(payload: unknown, headers: Headers, ts = Date.now()): NormalizedEvent | null {
+  const data = obj(payload);
+  if (!data) return null;
+  const sessionId = str(data.conversationId ?? data.sessionId ?? data.conversation_id ?? data.session_id);
+  if (!sessionId || !/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return null;
+  const headerHost = headers.get("X-Dash-Host");
+  const rawHost = (headerHost || str(data.host) || localHost()).split(".")[0]!.slice(0, 64);
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(rawHost)) return null;
+  if (headerHost !== null && typeof data.host === "string" && data.host && data.host.split(".")[0] !== headerHost.split(".")[0]) {
+    return null;
+  }
+  const name = str(data.hookEventName ?? data.hook_event_name ?? data.kind);
+  const cwd = clip(resolveWorkspacePath(data.cwd) ?? resolveWorkspacePath(data.workspacePaths) ?? resolveWorkspacePath(data.workspace_uris), 4096);
+  const transcriptPath = clip(data.transcriptPath ?? data.transcript_path, 4096);
+  const nestingDepth = typeof data.nestingDepth === "number" ? data.nestingDepth : typeof data.nesting_depth === "number" ? data.nesting_depth : undefined;
+  const interactive = typeof data.interactive === "boolean"
+    ? data.interactive
+    : nestingDepth !== undefined
+      ? nestingDepth === 0
+      : headers.get("X-Dash-Entrypoint") !== "headless";
+  const sessionKind = clip(headers.get("X-Dash-Kind") ?? data.sessionKind ?? (nestingDepth !== undefined && nestingDepth > 0 ? "bg" : undefined), 255);
+  const accountAlias = normalizeAccountAlias(headers.get("X-Dash-Account-Alias") ?? data.accountAlias ?? data.account_alias);
+  const toolCall = obj(data.toolCall);
+  const rawToolId = str(toolCall?.id ?? data.tool_use_id ?? data.toolUseId);
+  const toolUseId = rawToolId && /^[A-Za-z0-9_-]{1,256}$/.test(rawToolId) ? rawToolId : undefined;
+  const rawQuestionIdentity = str(data.questionIdentity ?? data.questionId);
+  const questionIdentity = rawQuestionIdentity && questionIdentityPattern.test(rawQuestionIdentity)
+    ? rawQuestionIdentity
+    : (toolUseId && questionIdentityPattern.test(toolUseId) ? toolUseId : undefined);
+  const eventTs = typeof data.ts === "number" && Number.isSafeInteger(data.ts) && data.ts >= 0 ? data.ts : ts;
+  const base: Omit<NormalizedEvent, "kind"> = {
+    host: rawHost,
+    harness: "agy",
+    sessionId,
+    ts: eventTs,
+    cwd,
+    title: clip(data.title, 4096),
+    transcriptPath,
+    interactive,
+    sessionKind,
+    accountAlias,
+    ...(toolUseId ? { toolUseId } : {}),
+  };
+  const toolName = str(toolCall?.name ?? data.tool_name);
+  const toolArgs = obj(toolCall?.args ?? data.tool_input);
+  switch (name) {
+    case "SessionStart":
+    case "session_start":
+      return { ...base, kind: "session_start", detail: clip(data.source ?? data.detail ?? data.modelName, detailLimit) };
+    case "PreInvocation":
+    case "UserPromptSubmit":
+    case "prompt": {
+      const promptText = stripAgyPromptEnvelope(data.lastUserInput ?? data.userPrompt ?? data.prompt ?? data.text);
+      return { ...base, kind: "prompt", text: clip(promptText) };
+    }
+    case "PreToolUse":
+    case "question": {
+      if (name === "PreToolUse" && toolName !== "ask_question" && toolName !== "AskUserQuestion") return null;
+      const rawQuestions = toolArgs?.questions ?? data.questionData ?? data.questions;
+      const questionData = normalizeAgyQuestions(rawQuestions) ?? normalizeQuestions(rawQuestions);
+      const summary = questionData?.map(q => q.question).join("\n") ?? questionFields(toolArgs).text;
+      const detail = questionData ? json(questionData.map(q => q.options)) : questionFields(toolArgs).detail;
+      return {
+        ...base,
+        kind: "question",
+        text: clip(summary),
+        detail,
+        ...(questionData ? { questionData } : {}),
+        ...(questionIdentity ? { questionIdentity } : {}),
+      };
+    }
+    case "PostToolUse":
+    case "question_answered": {
+      if (name === "PostToolUse" && toolName !== "ask_question" && toolName !== "AskUserQuestion") return null;
+      return { ...base, kind: "question_answered", ...(questionIdentity ? { questionIdentity } : {}) };
+    }
+    case "PermissionRequest":
+    case "permission":
+      return { ...base, kind: "permission", detail: clip(toolName ?? data.detail, detailLimit), text: clip(data.text ?? json(toolArgs, 2048)) };
+    case "Notification":
+    case "notification":
+      return { ...base, kind: "notification", text: clip(data.message ?? data.text), detail: clip(data.notification_type ?? data.detail, detailLimit) };
+    case "Stop":
+    case "response": {
+      const canceled = str(data.terminationReason) === "USER_CANCELED";
+      const responseText = canceled ? undefined : str(data.response ?? data.last_assistant_message ?? data.text);
+      const errVal = data.error;
+      const hasError = typeof errVal === "string" ? errVal.trim().length > 0 : Boolean(errVal && typeof errVal === "object");
+      if (hasError && !responseText?.trim()) {
+        const errText = typeof errVal === "string" ? errVal : str(obj(errVal)?.message) ?? json(errVal, 2048);
+        return { ...base, kind: "error", text: clip(errText) };
+      }
+      if (data.continuationActive === true && !responseText?.trim()) return null;
+      return {
+        ...base,
+        kind: "response",
+        text: clip(responseText),
+        prompt: clip(stripAgyPromptEnvelope(data.prompt ?? data.lastUserInput ?? data.userPrompt)),
+        backgroundTasks: data.fullyIdle === false ? 1 : (typeof data.backgroundTasks === "number" ? data.backgroundTasks : 0),
+        responseSource: data.responseSource === "backfill" ? "backfill" : undefined,
+      };
+    }
+    case "StopFailure":
+    case "error": {
+      const errVal = data.error ?? data.text ?? data.last_assistant_message;
+      const errText = typeof errVal === "string" ? errVal : str(obj(errVal)?.message) ?? json(errVal, 2048);
+      return { ...base, kind: "error", text: clip(errText) };
+    }
+    case "SessionEnd":
+    case "session_end":
+      return { ...base, kind: "session_end", detail: clip(data.reason ?? data.detail, detailLimit) };
+    default:
+      return null;
+  }
 }

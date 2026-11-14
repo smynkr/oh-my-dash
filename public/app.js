@@ -459,8 +459,20 @@
   function nameOf(s) { return byId(s,'displayName','display_name') || byId(s,'title') || (byId(s,'cwd') || '').split('/').filter(Boolean).pop() || byId(s,'sessionId','session_id') || 'Session'; }
   function statusOf(s) { return byId(s,'status') || 'unknown'; }
   function appendPill(parent, cls, text) { parent.append(el('span', `pill ${cls}`, text)); }
+  const harnessShortLabel = h => h === 'omp' ? 'OMP' : h === 'codex' ? 'Codex' : h === 'agy' ? 'Antigravity' : 'Claude';
+  const harnessFullLabel = h => h === 'omp' ? 'OMP' : h === 'codex' ? 'Codex' : h === 'agy' ? 'Antigravity' : h === 'claude' ? 'Claude Code' : 'Harness unavailable';
+  function compactCwd(cwd) {
+    const trimmed = String(cwd || '').trim();
+    if (!trimmed) return '';
+    if (/^\/+$/.test(trimmed)) return '/';
+    const raw = trimmed.replace(/\/+$/, '');
+    const home = raw.replace(/^\/Users\/[^/]+/, '~').replace(/^\/home\/[^/]+/, '~');
+    const parts = home.split('/').filter(Boolean);
+    if (home.startsWith('~')) return parts.length <= 3 ? home : `~/…/${parts.slice(-2).join('/')}`;
+    return parts.length <= 2 ? raw : `…/${parts.slice(-2).join('/')}`;
+  }
   const identityDrafts = new Map(), identityPending = new Set(), identityNotices = new Map();
-  const identityText = s => `${byId(s,'host') || 'Unknown host'} · ${byId(s,'accountAlias') || 'Unassigned account'} · ${byId(s,'harness') === 'omp' ? 'OMP' : byId(s,'harness') === 'codex' ? 'Codex' : 'Claude'} · ${byId(s,'sessionId','session_id') || ''}`;
+  const identityText = s => `${byId(s,'host') || 'Unknown host'} · ${byId(s,'accountAlias') || 'Unassigned account'} · ${harnessShortLabel(byId(s,'harness'))} · ${byId(s,'sessionId','session_id') || ''}`;
 
   const capabilityReceiptAnchors = new WeakMap();
   function recordCapabilityReceipt(capabilities) {
@@ -613,7 +625,7 @@
     const observedAt = capabilityTime(delivery.observedAt), expiresAt = capabilityTime(delivery.expiresAt);
     if (observedAt) timestamps.push(`Hub receipt ${observedAt}`);
     if (expiresAt) timestamps.push(`expires ${expiresAt}`);
-    if (delivery.protocol) timestamps.push(`protocol ${delivery.protocol}`);
+    if (delivery.protocol) timestamps.push(`protocol ${delivery.protocol === 'agy-commit' ? 'Antigravity hook (agy-commit)' : delivery.protocol}`);
     if (timestamps.length) details.append(el('p', 'capability-timestamps', timestamps.join(' · ')));
     details.append(el('p', 'capability-note', 'When Queue message is supported, Send accepts text into Dash’s bounded queue; this does not confirm delivery. Delivery is a snapshot, not a connection indicator.'));
     const pending = state.capabilityRefreshPending.has(key);
@@ -671,15 +683,18 @@
   }
   function replyDialogCopy(s) {
     if (statusOf(s) !== 'needs_input') return '';
-    const reason = byId(s, 'needsReason', 'needs_reason');
-    if (byId(s, 'harness') === 'claude' && reason === 'question') {
+    const reason = byId(s, 'needsReason', 'needs_reason'), harness = byId(s, 'harness');
+    if ((harness === 'claude' || harness === 'agy') && reason === 'question') {
       const id = s.pendingQuestion?.id ?? s.pendingQuestionId;
       if (id && s.pendingQuestion?.id === id) return '';
-      return 'Answer in the terminal or Remote Control (remote questions are opt-in)';
+      return harness === 'agy'
+        ? 'Answer in Antigravity (remote questions are opt-in via --remote-questions)'
+        : 'Answer in the terminal or Remote Control (remote questions are opt-in)';
     }
-    if (byId(s, 'harness') === 'claude' && ['permission','permission_prompt','elicitation_dialog','elicitation_url_dialog'].includes(reason)) return 'Answer in the terminal or Remote Control (dialog answering: Step 6)';
-    if (byId(s, 'harness') === 'omp' && reason === 'permission') return 'Approve in the terminal (dialog answering: Step 6)';
-    if (byId(s, 'harness') === 'codex' && reason === 'permission')
+    if (harness === 'claude' && ['permission','permission_prompt','elicitation_dialog','elicitation_url_dialog'].includes(reason)) return 'Answer in the terminal or Remote Control (dialog answering: Step 6)';
+    if (harness === 'agy' && ['permission','permission_prompt','elicitation_dialog','elicitation_url_dialog'].includes(reason)) return 'Approve or answer in Antigravity (terminal/UI dialog)';
+    if (harness === 'omp' && reason === 'permission') return 'Approve in the terminal (dialog answering: Step 6)';
+    if (harness === 'codex' && reason === 'permission')
       return 'Codex approval or user-input is unsupported; respond in the Codex session. Dash does not answer or approve it.';
     return '';
   }
@@ -952,7 +967,9 @@
       : reply.committed === false
         ? ['Sending', 'A delivery worker has the reply; cancellation is still available until commitment.']
         : ['Sending', 'Delivery is in progress; cancellation availability is unknown.'];
-    if (reply.state === 'delivered') return ['Delivered', 'Delivery was recorded, not task completion. A committed OMP handoff may be recorded after its receipt times out.'];
+    if (reply.state === 'delivered') return reply.protocol === 'agy-commit'
+      ? ['Delivered', 'Delivered via Antigravity hook; task completion is not confirmed.']
+      : ['Delivered', 'Delivery was recorded, not task completion. A committed OMP handoff may be recorded after its receipt times out.'];
     if (reply.state === 'expired') return ['Expired', 'The queue deadline passed without delivery; nothing will be sent.'];
     if (reply.state === 'cancelled') return ['Cancelled', reply.cancelReason === 'stale'
       ? 'The session moved to another turn; this reply will not be sent.'
@@ -1010,7 +1027,7 @@
   async function submitQuestion(key, questionId, answers) {
     if (state.replyPending.has(key)) return;
     const session = state.sessions.find(item => responseKey(item) === key);
-    if (!session || statusOf(session) !== 'needs_input' || byId(session, 'harness') !== 'claude' ||
+    if (!session || statusOf(session) !== 'needs_input' || !['claude', 'agy'].includes(byId(session, 'harness')) ||
         replyDialogCopy(session) || (session.pendingQuestion?.id ?? session.pendingQuestionId) !== questionId) {
       await loadSessions().catch(() => {});
       replyNotice(key, 'Out of date: the question has been answered or replaced');
@@ -1047,7 +1064,7 @@
   async function releaseQuestionToTerminal(key, questionId) {
     if (state.replyPending.has(key)) return;
     const session = state.sessions.find(item => responseKey(item) === key);
-    if (!session || statusOf(session) !== 'needs_input' || byId(session, 'harness') !== 'claude' ||
+    if (!session || statusOf(session) !== 'needs_input' || !['claude', 'agy'].includes(byId(session, 'harness')) ||
         (session.pendingQuestion?.id ?? session.pendingQuestionId) !== questionId) {
       await loadSessions().catch(() => {});
       replyNotice(key, 'Out of date: the question has been answered or replaced');
@@ -1086,16 +1103,17 @@
     const message = steerCapability
       ? { ...steerCapability, allowed: steerCapability.status === 'supported' && state.repliesEnabled }
       : baseMessage;
+    const structuredHarness = harness === 'claude' || harness === 'agy';
     const pendingId = harness === 'omp' && status === 'needs_input' && !dialogCopy
       ? s.pendingQuestion?.id ?? s.pendingQuestionId
-      : harness === 'claude' && status === 'needs_input' && reason === 'question' &&
+      : structuredHarness && status === 'needs_input' && reason === 'question' &&
         s.pendingQuestion && s.pendingQuestion.id === s.pendingQuestionId ? s.pendingQuestion.id : undefined;
-    const pending = pendingId ? s.pendingQuestion : undefined, claudeQuestion = harness === 'claude' && Boolean(pending);
+    const pending = pendingId ? s.pendingQuestion : undefined, structuredQuestion = structuredHarness && Boolean(pending);
     const draftKey = pendingId ? `${key}#${pendingId}` : key, allowed = message.allowed && !dialogCopy;
     controls.append(el('p', 'reply-target', `Target locked · ${nameOf(s)} · ${identityText(s)}`));
     if (pending) controls.append(renderPendingQuestion(key, pending, busy, harness));
     const actions = el('div', 'reply-actions');
-    if (!claudeQuestion) {
+    if (!structuredQuestion) {
       const ompQuestion = harness === 'omp' && status === 'needs_input' && reason === 'question';
       const structured = ompQuestion ? actionCapability(s, 'structuredQuestion') : null;
       const hint = !message.allowed ? message.reason : dialogCopy || (ompQuestion
@@ -1112,7 +1130,7 @@
           if (!textarea.disabled && textarea.value.trim()) submitReply(key, textarea.value, undefined, pendingId, codexAction, activeTurnId);
         }
       });
-      label.append(textarea); controls.append(label, el('p', `reply-hint${allowed ? '' : ' reply-dialog-note'}`, hint));
+      label.append(textarea); controls.append(label);
       const recoveryLabel = el('label', 'reply-recovery-toggle'), recovery = el('input');
       recovery.type = 'checkbox'; recovery.checked = draftRecovery.enabled; recovery.dataset.replyFocus = 'recovery';
       recoveryLabel.append(recovery, document.createTextNode(' Recover drafts after reload in this tab'));
@@ -1127,14 +1145,37 @@
         persistDraftRecovery();
         for (const session of replySessions()) patchSessionCard(session, session);
       });
-      controls.append(recoveryLabel, recoveryNote);
       const send = el('button', 'button button-primary', harness === 'codex' ? activeTurnId ? 'Steer turn' : 'Start turn' : 'Send reply');
       send.type = 'button'; send.disabled = !allowed || busy || !textarea.value.trim(); send.dataset.replyFocus = 'send';
-      textarea.addEventListener('input', () => {
+      const syncComposerDraft = () => {
         saveDraft(draftKey, textarea.value);
         recoveryNote.textContent = draftRecoveryNote(draftKey);
         send.disabled = !allowed || state.replyPending.has(key) || !textarea.value.trim();
-      });
+      };
+      if (allowed) {
+        const quickRow = el('div', 'reply-quick-chips');
+        quickRow.setAttribute('role', 'group');
+        quickRow.setAttribute('aria-label', 'Quick draft snippets');
+        for (const [chipLabel, snippet] of [
+          ['+ Run tests & verify', 'Run the test suite and verify there are no regressions before finishing.'],
+          ['+ Summarize status', 'Summarize current progress, what remains, and any open questions.'],
+          ['+ Commit cleanly', 'Stage and commit the changes on the current branch with a concise commit message; do not push.'],
+          ['+ Explain blocker', 'Explain the exact blocker, what you tried, and the safest options to resolve it.'],
+        ]) {
+          const chip = el('button', 'button button-secondary reply-quick-chip', chipLabel);
+          chip.type = 'button'; chip.disabled = busy;
+          chip.addEventListener('click', () => {
+            const existing = textarea.value.trim();
+            textarea.value = existing ? `${textarea.value.replace(/\s+$/, '')}\n\n${snippet}` : snippet;
+            syncComposerDraft();
+            textarea.focus();
+          });
+          quickRow.append(chip);
+        }
+        controls.append(quickRow);
+      }
+      controls.append(el('p', `reply-hint${allowed ? '' : ' reply-dialog-note'}`, hint), recoveryLabel, recoveryNote);
+      textarea.addEventListener('input', syncComposerDraft);
       send.addEventListener('click', () => submitReply(key, textarea.value, undefined, pendingId, codexAction, activeTurnId)); actions.append(send);
       if (harness === 'codex') {
         const interruptCapability = actionCapability(s, 'interrupt');
@@ -1196,27 +1237,28 @@
   }
 
   function renderPendingQuestion(key, pending, busy, harness) {
-    const isClaude = harness === 'claude', pickKey = `${key}#${pending.id}`, questions = pending.questions;
+    const isStructured = harness === 'claude' || harness === 'agy', pickKey = `${key}#${pending.id}`, questions = pending.questions;
     let answers = questionPicks.get(pickKey);
     if (!answers) {
       answers = questions.map(() => ({ selected: new Set(), other: false, custom: '' }));
       questionPicks.set(pickKey, answers);
     }
     const box = el('div', 'decisions');
-    if (isClaude) box.dataset.claudeQuestionId = pending.id;
+    if (isStructured) box.dataset.claudeQuestionId = pending.id;
     else box.dataset.ompQuestionId = pending.id;
+    if (harness === 'agy') box.dataset.agyQuestionId = pending.id;
     box.setAttribute('role', 'group');
-    box.setAttribute('aria-label', `Pending ${isClaude ? 'Claude' : 'OMP'} questions`);
+    box.setAttribute('aria-label', `Pending ${harness === 'agy' ? 'Antigravity' : harness === 'claude' ? 'Claude' : 'OMP'} questions`);
     const send = el('button', 'button button-primary', questions.length === 1 ? 'Send answer' : 'Send answers');
     send.type = 'button';
-    if (isClaude) send.dataset.claudeQuestionSubmit = ''; else send.dataset.ompSubmit = '';
+    if (isStructured) send.dataset.claudeQuestionSubmit = ''; else send.dataset.ompSubmit = '';
     send.dataset.replyFocus = `question-${pending.id}-send`;
     const ready = () => questions.every((question, index) => question.multi === true ||
       answers[index].selected.size === 1 || answers[index].other && answers[index].custom.trim());
     const refreshSend = () => { send.disabled = busy || !ready(); };
     const submit = () => {
       if (!ready()) return;
-      if (isClaude) {
+      if (isStructured) {
         const selections = Object.create(null);
         questions.forEach((question, index) => {
           const answer = answers[index];
@@ -1240,7 +1282,7 @@
     };
     questions.forEach((question, index) => {
       const answer = answers[index], group = el('div', 'omp-question'), options = el('div', 'decision-options');
-      group.dataset[isClaude ? 'claudeQuestionIndex' : 'ompQuestionIndex'] = String(index);
+      group.dataset[isStructured ? 'claudeQuestionIndex' : 'ompQuestionIndex'] = String(index);
       group.setAttribute('role', 'group'); group.setAttribute('aria-label', question.question);
       if (question.header) group.append(el('p', 'reply-hint', question.header));
       group.append(el('p', 'decision-title', question.question));
@@ -1255,7 +1297,7 @@
         const recommended = question.multi !== true && question.recommended === optionIndex;
         const button = el('button', 'button button-secondary decision-option', `${option.label}${recommended && !option.label.endsWith(' (Recommended)') ? ' (Recommended)' : ''}`);
         button.type = 'button'; button.disabled = busy;
-        button.dataset[isClaude ? 'claudeOptionIndex' : 'ompOptionIndex'] = String(optionIndex);
+        button.dataset[isStructured ? 'claudeOptionIndex' : 'ompOptionIndex'] = String(optionIndex);
         button.dataset.replyFocus = `question-${pending.id}-${index}-${optionIndex}`;
         if (option.description) button.append(el('span', 'omp-option-description', option.description));
         button.addEventListener('click', () => {
@@ -1278,12 +1320,12 @@
       });
       const other = el('button', 'button button-secondary decision-option', 'Other (type your own)');
       other.type = 'button'; other.disabled = busy;
-      if (isClaude) other.dataset.claudeOther = ''; else other.dataset.ompOther = '';
+      if (isStructured) other.dataset.claudeOther = ''; else other.dataset.ompOther = '';
       other.dataset.replyFocus = `question-${pending.id}-${index}-other`;
       other.setAttribute('aria-pressed', String(answer.other));
       const custom = el('textarea', 'reply-input');
       custom.rows = 2; custom.value = answer.custom; custom.hidden = !answer.other; custom.disabled = busy; custom.maxLength = 4000;
-      if (isClaude) custom.dataset.claudeCustom = ''; else custom.dataset.ompCustom = '';
+      if (isStructured) custom.dataset.claudeCustom = ''; else custom.dataset.ompCustom = '';
       custom.dataset.replyFocus = `question-${pending.id}-${index}-custom`;
       custom.setAttribute('aria-label', `Custom answer: ${question.question}`);
       other.addEventListener('click', () => {
@@ -1299,7 +1341,7 @@
       box.append(group); refreshOptions();
     });
     send.addEventListener('click', submit); refreshSend(); box.append(send);
-    if (isClaude) {
+    if (isStructured) {
       const release = el('button', 'button button-secondary', 'Release to terminal');
       release.type = 'button'; release.disabled = busy; release.dataset.replyFocus = `question-${pending.id}-release`;
       release.addEventListener('click', () => releaseQuestionToTerminal(key, pending.id));
@@ -1383,14 +1425,32 @@
     header.append(title);
     const badges = el('div','badges');
     appendPill(badges, `status-pill ${status}`, `${historical ? 'Current: ' : ''}${statusLabel(s)}`);
-    appendPill(badges,'host-pill',byId(s,'host') || 'local'); appendPill(badges,`harness-pill ${byId(s,'harness')}`,byId(s,'harness') === 'omp' ? 'OMP' : byId(s,'harness') === 'codex' ? 'Codex' : 'Claude');
+    appendPill(badges,'host-pill',byId(s,'host') || 'local'); appendPill(badges,`harness-pill ${byId(s,'harness')}`,harnessShortLabel(byId(s,'harness')));
     appendPill(badges, 'account-pill', byId(s,'accountAlias') || 'Unassigned account');
     if (byId(s,'sessionKind','session_kind') === 'bg') appendPill(badges,'kind-pill','bg');
     header.append(badges); card.append(header);
     const meta = el('div','card-meta'), resolvedProject = byId(s,'project');
     const projectLabel = resolvedProject === undefined || resolvedProject === null ? (byId(s,'cwd') || '').split('/').filter(Boolean).pop() || 'Project unknown' : String(resolvedProject) || 'Project unknown';
-    meta.append(el('span','project-name',projectLabel));
-    meta.append(el('span','activity-time',relative(byId(s,'lastActivity','last_activity')))); card.append(meta);
+    const metaLeft = el('div', 'card-meta-group');
+    metaLeft.append(el('span', 'project-name', projectLabel));
+    const fullCwd = String(byId(s, 'cwd') || '').trim();
+    if (fullCwd) {
+      const chip = el('span', 'cwd-chip');
+      chip.title = fullCwd;
+      chip.append(el('span', 'cwd-chip-text', compactCwd(fullCwd)));
+      const copyCwd = el('button', 'cwd-copy', 'Copy');
+      copyCwd.type = 'button';
+      copyCwd.title = `Copy workspace path: ${fullCwd}`;
+      copyCwd.setAttribute('aria-label', `Copy workspace path ${fullCwd}`);
+      copyCwd.addEventListener('click', async event => {
+        event.stopPropagation();
+        try { await navigator.clipboard.writeText(fullCwd); copyCwd.textContent = 'Copied'; setTimeout(() => { copyCwd.textContent = 'Copy'; }, 1200); }
+        catch { copyCwd.textContent = 'Failed'; setTimeout(() => { copyCwd.textContent = 'Copy'; }, 1200); }
+      });
+      chip.append(copyCwd);
+      metaLeft.append(chip);
+    }
+    meta.append(metaLeft, el('span','activity-time',relative(byId(s,'lastActivity','last_activity')))); card.append(meta);
     card.append(renderIdentity(s, key));
     if (status === 'needs_input') {
       const box = el('div','needs-box');
@@ -1431,7 +1491,8 @@
     }
     if (byId(s, 'harness') !== 'codex') {
       const copy = el('button','button button-secondary','Copy resume cmd'); copy.type='button'; copy.addEventListener('click', async () => {
-        const id = byId(s,'sessionId','session_id') || ''; const command = `${byId(s,'harness') === 'omp' ? 'omp' : 'claude'} --resume ${JSON.stringify(String(id))}`;
+        const id = String(byId(s,'sessionId','session_id') || ''), h = byId(s,'harness');
+        const command = h === 'agy' ? `agy --conversation ${JSON.stringify(id)}` : `${h === 'omp' ? 'omp' : 'claude'} --resume ${JSON.stringify(id)}`;
         try { await navigator.clipboard.writeText(command); copy.textContent='Copied'; setTimeout(() => copy.textContent='Copy resume cmd',1200); } catch { copy.textContent='Clipboard unavailable'; setTimeout(() => copy.textContent='Copy resume cmd',1600); }
       }); actions.append(copy);
     }
@@ -2042,7 +2103,7 @@
         el('span', '', String(result.project || 'Unassigned project')),
         el('span', '', String(result.host || 'Unknown machine')),
         el('span', '', String(result.accountAlias || 'Unassigned account')),
-        el('span', '', result.harness === 'omp' ? 'OMP' : result.harness === 'codex' ? 'Codex' : 'Claude Code'),
+        el('span', '', harnessFullLabel(result.harness || 'claude')),
         el('span', 'output-search-match', result.match === 'identity' ? 'Session identity' : 'Response text'),
       );
       const ts = Number(result.ts), date = new Date(ts);
@@ -2187,7 +2248,7 @@
       typeof config.host === 'string' && config.host.length <= 1024 &&
       (config.project === null || typeof config.project === 'string' && config.project.length <= 1024) &&
       (config.account === null || typeof config.account === 'string' && config.account.length <= 1024) &&
-      ['','claude','omp','codex'].includes(config.harness) &&
+      ['','claude','omp','codex','agy'].includes(config.harness) &&
       ['','needs_input','your_turn','working','ended','unread','unknown'].includes(config.status) &&
       typeof config.headless === 'boolean' && typeof config.ended === 'boolean' &&
       ['','project','host','account','harness'].includes(config.group) &&
@@ -2407,6 +2468,7 @@
     if (config.project !== null) ensureConsoleFilterOption('project', config.project);
     if (config.account !== null) ensureConsoleFilterOption('account', config.account);
     $('#session-search').value = config.search;
+    syncSearchInOutputsButton();
     $('#host-filter').value = config.host;
     $('#project-filter').value = config.project === null ? '' : projectOptionValue('project', config.project);
     $('#account-filter').value = config.account === null ? '' : JSON.stringify(config.account);
@@ -2546,7 +2608,7 @@
     const account = result.accountAlias ?? byId(session, 'accountAlias') ?? byId(response, 'accountAlias') ?? 'Unassigned account';
     const harness = result.harness ?? byId(session, 'harness') ?? byId(response, 'harness');
     const details = [project, host || 'Unknown machine', account || 'Unassigned account',
-      harness === 'omp' ? 'OMP' : harness === 'codex' ? 'Codex' : harness === 'claude' ? 'Claude Code' : 'Harness unavailable'].join(' · ');
+      harnessFullLabel(harness)].join(' · ');
     return el('p', 'historical-response-note',
       `Historical output match · ${name} · response ${target.responseId}. ${details}. Reply and decision actions are disabled.`);
   }
@@ -2590,7 +2652,7 @@
         row.dataset.key = key; row.dataset.selected = String(selected); row.className = `status-${statusOf(s)}`;
         const values = [['state', statusLabel(s)], ['project', byId(s, 'project') || 'Unassigned'], ['session', nameOf(s)],
           ['host', byId(s, 'host') || 'Unknown'], ['account', byId(s, 'accountAlias') || 'Unassigned'],
-          ['harness', byId(s, 'harness') === 'omp' ? 'OMP' : byId(s, 'harness') === 'codex' ? 'Codex' : 'Claude'], ['age', relative(byId(s, 'lastActivity', 'last_activity'))]];
+          ['harness', harnessShortLabel(byId(s, 'harness'))], ['age', relative(byId(s, 'lastActivity', 'last_activity'))]];
         for (const [column, value] of values) {
           let cell = row.querySelector(`[data-cell="${column}"]`);
           if (!cell) {
@@ -2627,6 +2689,7 @@
     updateConsolePinButtons();
     if (focusedRow) $('#console-rows').querySelector(`[data-key="${CSS.escape(focusedRow)}"] button`)?.focus({ preventScroll: true });
     $('#console-empty').hidden = rows.length > 0;
+    $('#console-empty-actions').hidden = rows.length > 0 || !$('#session-search').value.trim();
     const target = consoleState.historicalTarget?.key === consoleState.selectedKey ? consoleState.historicalTarget : null;
     const current = state.sessions.find(s => responseKey(s) === consoleState.selectedKey) || target?.session || null;
     renderReadBoundary();
@@ -2782,7 +2845,9 @@
     cardSizes.disconnect();
     sessionsNode.replaceChildren(...filtered.map(session => renderCard(session)));
     sizeSessionCards([...sessionsNode.children]);
-    $('#sessions-empty').hidden=filtered.length>0; window.scrollTo(0,oldScroll);
+    $('#sessions-empty').hidden=filtered.length>0;
+    $('#sessions-empty-actions').hidden=filtered.length>0 || !$('#session-search').value.trim();
+    window.scrollTo(0,oldScroll);
     if (focus) restoreCardFocus(focus, sessionsNode.querySelector(`[data-key="${CSS.escape(focus.key)}"]`));
     updateCounts();
   }
@@ -2849,7 +2914,7 @@
   // repository-filter helpers end
   const dimensionLabels = { project: 'Project', host: 'Machine', account: 'Account', harness: 'Harness' };
   const dimensionValue = (session, dimension) => String(byId(session, dimension === 'account' ? 'accountAlias' : dimension) || '');
-  const dimensionLabel = (dimension, value) => value ? dimension === 'harness' ? value === 'omp' ? 'OMP' : value === 'codex' ? 'Codex' : 'Claude Code' : value : `Unassigned ${dimensionLabels[dimension].toLowerCase()}`;
+  const dimensionLabel = (dimension, value) => value ? dimension === 'harness' ? value === 'omp' ? 'OMP' : value === 'codex' ? 'Codex' : value === 'agy' ? 'Antigravity' : 'Claude Code' : value : `Unassigned ${dimensionLabels[dimension].toLowerCase()}`;
   function visibleSessions(ignoreStatus = false) {
     const host = $('#host-filter').value, harness = $('#harness-filter').value;
     const project = $('#project-filter').value, account = $('#account-filter').value, status = $('#status-filter').value;
@@ -2875,7 +2940,7 @@
     if (state.view === 'console') { renderConsole(key); updateCounts(); return; }
     if (state.view !== 'sessions') { updateCounts(); return; }
     if (old) cardSizes.unobserve(old);
-    if (!visibleSessions().some(s=>responseKey(s)===key)) { old?.remove(); $('#sessions-empty').hidden=sessionsNode.children.length>0; updateCounts(); return; }
+    if (!visibleSessions().some(s=>responseKey(s)===key)) { old?.remove(); $('#sessions-empty').hidden=sessionsNode.children.length>0; $('#sessions-empty-actions').hidden=sessionsNode.children.length>0 || !$('#session-search').value.trim(); updateCounts(); return; }
     const focus = focusSnapshot(old);
     const replacement=renderCard(dto);
     if (old) replacement.style.setProperty('--session-rows', old.style.getPropertyValue('--session-rows'));
@@ -2890,6 +2955,7 @@
     sizeSessionCards([replacement]);
     restoreCardFocus(focus, replacement);
     $('#sessions-empty').hidden=sessionsNode.children.length>0;
+    $('#sessions-empty-actions').hidden=sessionsNode.children.length>0 || !$('#session-search').value.trim();
     updateCounts();
   }
   function updateCounts() {
@@ -2901,6 +2967,9 @@
       $(`#${id}-filter-toggle`).setAttribute('aria-pressed', String(selected === status));
     }
     $('#next-unresolved').disabled = !needs.length;
+    const attentionTotal = base.filter(s => statusOf(s) === 'needs_input' || Boolean(byId(s, 'lastError', 'last_error')) || (statusOf(s) !== 'ended' && Number(byId(s, 'unreadCount', 'unread_count') || 0) > 0)).length;
+    $('#triage-open').textContent = attentionTotal ? `Triage · ${attentionTotal}` : 'Triage';
+    if ($('#triage-dialog')?.open) renderTriageDialog();
     const visible = visibleSessions().length;
     $('#filter-summary').textContent = `${visible} session${visible === 1 ? '' : 's'} shown. Attention counts use search, source and headless/ended filters, independent of State.`;
   }
@@ -2936,6 +3005,128 @@
     selectConsoleSession(responseKey(needs[(index + 1) % needs.length]));
   }
 
+  let quietMode = false, consoleWide = false, consoleSplitRatio = 0.6;
+  function setQuietMode(enabled, persist = true) {
+    quietMode = Boolean(enabled);
+    document.body.dataset.quiet = quietMode ? '1' : '0';
+    const button = $('#quiet-mode-toggle');
+    if (button) {
+      button.setAttribute('aria-pressed', String(quietMode));
+      button.textContent = quietMode ? 'Quiet hints: On' : 'Quiet hints';
+    }
+    if (persist) { try { localStorage.setItem('dash.ui.quiet', quietMode ? '1' : '0'); } catch {} }
+  }
+  function setConsoleWide(wide, persist = true) {
+    consoleWide = Boolean(wide);
+    const layout = $('#console-layout');
+    if (layout) layout.dataset.wide = consoleWide ? '1' : '0';
+    const button = $('#console-wide-toggle');
+    if (button) {
+      button.setAttribute('aria-pressed', String(consoleWide));
+      button.textContent = consoleWide ? 'Exit wide reader' : 'Wide reader';
+    }
+    if (persist) { try { localStorage.setItem('dash.console.wide', consoleWide ? '1' : '0'); } catch {} }
+  }
+  function applyConsoleSplit(ratio, persist = true) {
+    const clamped = Math.max(0.22, Math.min(0.78, Number(ratio) || 0.6));
+    consoleSplitRatio = clamped;
+    const layout = $('#console-layout'), resizer = $('#console-resizer');
+    if (layout) layout.style.setProperty('--console-split', `${(clamped / (1 - clamped)).toFixed(3)}fr`);
+    if (resizer) {
+      resizer.setAttribute('aria-valuemin', '22');
+      resizer.setAttribute('aria-valuemax', '78');
+      resizer.setAttribute('aria-valuenow', String(Math.round(clamped * 100)));
+    }
+    if (persist) { try { localStorage.setItem('dash.console.split', String(clamped)); } catch {} }
+  }
+  function syncSearchInOutputsButton() {
+    const hasQuery = state.view !== 'timeline' && Boolean($('#session-search').value.trim());
+    $('#search-in-outputs').hidden = !hasQuery;
+  }
+  function bridgeSessionSearchToOutputs() {
+    const query = $('#session-search').value.trim().slice(0, 256);
+    if (!query) return;
+    if (state.view === 'timeline') setFeedView('console');
+    const disclosure = $('#output-search-disclosure');
+    disclosure.hidden = false;
+    disclosure.open = true;
+    $('#output-search-query').value = query;
+    runOutputSearch();
+    $('#output-search-query').scrollIntoView?.({ block: 'nearest' });
+  }
+  function renderTriageDialog() {
+    const groupsRoot = $('#triage-groups'), summary = $('#triage-summary');
+    const candidates = sortSessions(state.sessions.filter(s => {
+      const status = statusOf(s);
+      if (status === 'ended') return false;
+      return status === 'needs_input' || Boolean(byId(s, 'lastError', 'last_error')) || Number(byId(s, 'unreadCount', 'unread_count') || 0) > 0;
+    }));
+    groupsRoot.replaceChildren();
+    if (!candidates.length) {
+      summary.textContent = 'All clear — no active sessions currently need input, have unread responses, or report an error.';
+      groupsRoot.append(el('p', 'empty-state', 'Nothing needs attention right now.'));
+      return;
+    }
+    const byProject = new Map();
+    for (const s of candidates) {
+      const project = projectFilterLabel(s);
+      if (!byProject.has(project)) byProject.set(project, []);
+      byProject.get(project).push(s);
+    }
+    const sortedProjects = [...byProject.entries()].sort(([, a], [, b]) => {
+      const aNeeds = a.filter(s => statusOf(s) === 'needs_input').length, bNeeds = b.filter(s => statusOf(s) === 'needs_input').length;
+      if (aNeeds !== bNeeds) return bNeeds - aNeeds;
+      return b.length - a.length;
+    });
+    const totalNeeds = candidates.filter(s => statusOf(s) === 'needs_input').length;
+    const totalErrors = candidates.filter(s => Boolean(byId(s, 'lastError', 'last_error'))).length;
+    const totalUnread = candidates.filter(s => Number(byId(s, 'unreadCount', 'unread_count') || 0) > 0).length;
+    summary.textContent = `${candidates.length} session${candidates.length === 1 ? '' : 's'} across ${sortedProjects.length} project${sortedProjects.length === 1 ? '' : 's'} · ${totalNeeds} needs you · ${totalErrors} with errors · ${totalUnread} with unread output.`;
+    for (const [project, items] of sortedProjects) {
+      const section = el('section', 'triage-group');
+      const header = el('div', 'triage-group-header');
+      header.append(el('h3', '', project));
+      const needsCount = items.filter(s => statusOf(s) === 'needs_input').length;
+      const errCount = items.filter(s => Boolean(byId(s, 'lastError', 'last_error'))).length;
+      const unreadSum = items.reduce((n, s) => n + Number(byId(s, 'unreadCount', 'unread_count') || 0), 0);
+      const countParts = [];
+      if (needsCount) countParts.push(`${needsCount} needs you`);
+      if (errCount) countParts.push(`${errCount} error${errCount === 1 ? '' : 's'}`);
+      if (unreadSum) countParts.push(`${unreadSum} unread`);
+      header.append(el('span', 'triage-group-counts', countParts.join(' · ')));
+      section.append(header);
+      const list = el('ul', 'triage-items');
+      for (const s of items) {
+        const key = responseKey(s), status = statusOf(s), unread = Number(byId(s, 'unreadCount', 'unread_count') || 0), lastErr = byId(s, 'lastError', 'last_error');
+        const li = el('li', 'triage-item'), main = el('div', 'triage-item-main');
+        const titleRow = el('div', 'badges');
+        titleRow.style.justifyContent = 'flex-start';
+        titleRow.append(el('span', 'triage-item-title', nameOf(s)));
+        appendPill(titleRow, `status-pill ${status}`, statusLabel(s));
+        appendPill(titleRow, `harness-pill ${byId(s, 'harness')}`, harnessShortLabel(byId(s, 'harness')));
+        const detailParts = [byId(s, 'host') || 'local', byId(s, 'accountAlias') || 'Unassigned', relative(byId(s, 'lastActivity', 'last_activity'))];
+        if (status === 'needs_input') detailParts.push(byId(s, 'needsReason', 'needs_reason') === 'permission' ? 'Permission requested' : 'Waiting for your input');
+        if (lastErr) detailParts.push(`Error: ${String(lastErr).slice(0, 80)}`);
+        if (unread > 0) detailParts.push(`${unread} unread`);
+        main.append(titleRow, el('span', 'triage-item-meta', detailParts.join(' · ')));
+        const openBtn = el('button', 'button button-secondary', 'Open in Console');
+        openBtn.type = 'button';
+        openBtn.addEventListener('click', () => {
+          navigationDialogs.get($('#triage-dialog')).action = () => {
+            if (byId(s, 'interactive') === false || byId(s, 'interactive') === 0) $('#headless-filter').checked = true;
+            setConsoleWide(false);
+            setFeedView('console', true);
+            selectConsoleSession(key);
+          };
+          $('#triage-dialog').close();
+        });
+        li.append(main, openBtn);
+        list.append(li);
+      }
+      section.append(list);
+      groupsRoot.append(section);
+    }
+  }
   const navigationDialogs = new Map();
   let composing = false;
   const selectedComposer = () => state.view === 'console' ? $('#console-detail textarea.reply-input:not(:disabled)') : null;
@@ -2961,6 +3152,7 @@
     const dialog = $('#'+id), node = document.activeElement;
     navigationDialogs.set(dialog, { node, row: node?.closest?.('#console-rows [data-key]')?.dataset.key, action: null });
     if (id === 'command-dialog') { $('#command-search').value = ''; renderCommandPalette(); }
+    if (id === 'triage-dialog') renderTriageDialog();
     dialog.showModal();
     (id === 'command-dialog' ? $('#command-search') : dialog.querySelector('.dialog-close')).focus();
   }
@@ -2970,8 +3162,12 @@
       return { id, label, enabled: Boolean(node && !node.disabled && !node.closest('[hidden]')), run: () => node.click() };
     };
     return [
+      { id: 'triage', label: 'Open attention triage by project', hint: 't', enabled: true, run: () => showNavigationDialog('triage-dialog') },
       { id: 'search', label: 'Search sessions', hint: '/', enabled: true, run: focusSessionSearch },
+      { id: 'searchOutputs', label: 'Search current query in retained outputs', enabled: Boolean($('#session-search').value.trim()), run: bridgeSessionSearchToOutputs },
       { id: 'reply', label: 'Focus selected reply composer', hint: 'r', enabled: Boolean(selectedComposer()), run: () => selectedComposer()?.focus() },
+      { id: 'wideReader', label: consoleWide ? 'Exit wide reading pane' : 'Toggle wide reading pane', hint: 'w', enabled: state.view === 'console', run: () => setConsoleWide(!consoleWide) },
+      { id: 'quietHints', label: quietMode ? 'Show explanatory hints' : 'Quiet hints: hide repetitive boilerplate', enabled: true, run: () => setQuietMode(!quietMode) },
       { id: 'console', label: 'Show Console', enabled: true, run: () => { setFeedView('console', true); $('#console-tab').focus(); } },
       { id: 'feed', label: 'Show Feed', enabled: true, run: () => { setFeedView('sessions', true); $('#sessions-tab').focus(); } },
       { id: 'timeline', label: 'Show Timeline', enabled: true, run: () => { setFeedView('timeline', true); $('#timeline-tab').focus(); } },
@@ -3009,7 +3205,7 @@
       return button;
     }));
   }
-  for (const id of ['command-dialog', 'shortcut-dialog', 'ideas-dialog']) {
+  for (const id of ['command-dialog', 'shortcut-dialog', 'ideas-dialog', 'triage-dialog']) {
     const dialog = $('#'+id);
     dialog.addEventListener('close', () => {
       const saved = navigationDialogs.get(dialog);
@@ -3047,6 +3243,8 @@
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (event.key === '/') { event.preventDefault(); focusSessionSearch(); }
     else if (event.key === '?') { event.preventDefault(); showNavigationDialog('shortcut-dialog'); }
+    else if (event.key === 't') { event.preventDefault(); showNavigationDialog('triage-dialog'); }
+    else if (event.key === 'w' && state.view === 'console') { event.preventDefault(); setConsoleWide(!consoleWide); }
     else if (event.key === 'r' && selectedComposer()) { event.preventDefault(); selectedComposer().focus(); }
     else if (state.view === 'console') {
       const rowFocused = target.closest?.('#console-rows [data-key]');
@@ -3131,7 +3329,7 @@
   function renderSourceSession(session, hostLabel, accountLabel, snapshot) {
     const key = typeof session?.key === 'string' ? session.key : '';
     const name = typeof session?.displayName === 'string' && session.displayName.trim() ? session.displayName.trim() : 'Session';
-    const harness = session?.harness === 'omp' ? 'OMP' : session?.harness === 'codex' ? 'Codex' : session?.harness === 'claude' ? 'Claude' : 'Harness unknown';
+    const harness = session?.harness === 'omp' ? 'OMP' : session?.harness === 'codex' ? 'Codex' : session?.harness === 'agy' ? 'Antigravity' : session?.harness === 'claude' ? 'Claude' : 'Harness unknown';
     const status = typeof session?.status === 'string' && session.status.trim() ? session.status.trim() : 'unknown';
     const mode = session?.interactive === true ? 'Interactive' : session?.interactive === false ? 'Headless' : 'Mode unknown';
     const activity = sourceTimestamp(session?.lastActivity) ? sourceRelativeTime(session.lastActivity, snapshot) : 'time unknown';
@@ -3468,7 +3666,7 @@
       header.append(el('strong', '', name));
     }
     const meta = el('span', 'timeline-meta');
-    const parts = [row.project || '', row.host || '', row.accountAlias || 'Unassigned account', row.harness === 'omp' ? 'OMP' : row.harness === 'codex' ? 'Codex' : 'Claude'].filter(Boolean);
+    const parts = [row.project || '', row.host || '', row.accountAlias || 'Unassigned account', harnessShortLabel(row.harness)].filter(Boolean);
     meta.textContent = `${parts.join(' · ')} · `;
     const ts = Number(byId(row, 'ts')), date = new Date(ts);
     const time = el('time', 'timeline-time', relative(ts));
@@ -3524,7 +3722,7 @@
       renderTimeline(append && !preserveLoadedPages);
     } finally { state.timelineLoading=false; }
   }
-  // Ideas inbox (AXI-445 step 5, C6). Its routes return 404 while replies are off, so the header button stays hidden then.
+  // Ideas inbox: its routes return 404 while replies are off, so the header button stays hidden then.
   const ideasState = { open: 0, failed: false, showAll: false, items: [], version: 0, busy: new Set(), adding: false, picks: new Map() };
   const ideaSessions = () => state.sessions.filter(session => byId(session, 'harness') !== 'codex' && messageCapability(session).allowed);
   const ideaOptionLabel = session => `${nameOf(session)} · ${byId(session, 'host') || 'Unknown host'}`;
@@ -3728,6 +3926,7 @@
     renderSessions();
     $('#ended-filter-label').hidden = isTimeline;
     for (const node of document.querySelectorAll('.session-filter')) node.hidden = isTimeline;
+    syncSearchInOutputsButton();
     $('#output-search-disclosure').hidden = isTimeline;
     $('#timeline-filter-note').hidden = !isTimeline;
     refreshVisibleReplyLists();
@@ -3751,7 +3950,10 @@
     tabs[next].focus();
     tabs[next].click();
   });
-  $('#session-search').addEventListener('input', () => { renderSessions(); refreshVisibleReplyLists(); });
+  $('#session-search').addEventListener('input', () => { syncSearchInOutputsButton(); renderSessions(); refreshVisibleReplyLists(); });
+  $('#search-in-outputs').addEventListener('click', bridgeSessionSearchToOutputs);
+  $('#console-empty-search-outputs').addEventListener('click', bridgeSessionSearchToOutputs);
+  $('#sessions-empty-search-outputs').addEventListener('click', bridgeSessionSearchToOutputs);
   $('#output-search-form').addEventListener('submit', event => { event.preventDefault(); runOutputSearch(); });
   $('#output-search-query').addEventListener('input', () => invalidateOutputSearch('Query changed. Search again to view matching output.'));
   $('#output-search-more').addEventListener('click', () => runOutputSearch(true));
@@ -3782,6 +3984,7 @@
     for (const id of ['project', 'host', 'account', 'harness', 'status']) $(`#${id}-filter`).value = '';
     persistProjectFilter();
     $('#session-search').value = '';
+    syncSearchInOutputsButton();
     $('#headless-filter').checked = false; $('#ended-filter').checked = false;
     invalidateOutputSearch('Output filters changed. Search again to apply them.');
     renderSessions(); refreshVisibleReplyLists(); loadSessions().catch(()=>{});
@@ -3969,6 +4172,47 @@
     if (!document.hidden) expireDraftRecovery();
     else if (draftRecovery.timer !== null) persistDraftRecovery();
   });
+  $('#triage-open').addEventListener('click', () => showNavigationDialog('triage-dialog'));
+  $('#quiet-mode-toggle').addEventListener('click', () => setQuietMode(!quietMode));
+  $('#console-wide-toggle').addEventListener('click', () => setConsoleWide(!consoleWide));
+  (() => {
+    const resizer = $('#console-resizer'), layout = $('#console-layout');
+    if (!resizer || !layout) return;
+    resizer.addEventListener('dblclick', () => applyConsoleSplit(0.6, true));
+    resizer.addEventListener('keydown', event => {
+      if (event.key === 'ArrowLeft') { event.preventDefault(); applyConsoleSplit(consoleSplitRatio - 0.05, true); }
+      else if (event.key === 'ArrowRight') { event.preventDefault(); applyConsoleSplit(consoleSplitRatio + 0.05, true); }
+      else if (event.key === 'Home') { event.preventDefault(); applyConsoleSplit(0.25, true); }
+      else if (event.key === 'End') { event.preventDefault(); applyConsoleSplit(0.75, true); }
+    });
+    resizer.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      resizer.classList.add('dragging');
+      resizer.setPointerCapture?.(event.pointerId);
+      const onMove = moveEvent => {
+        const rect = layout.getBoundingClientRect();
+        if (rect.width > 0) applyConsoleSplit((moveEvent.clientX - rect.left) / rect.width, true);
+      };
+      const onUp = () => {
+        resizer.classList.remove('dragging');
+        resizer.removeEventListener('pointermove', onMove);
+        resizer.removeEventListener('pointerup', onUp);
+        resizer.removeEventListener('pointercancel', onUp);
+      };
+      resizer.addEventListener('pointermove', onMove);
+      resizer.addEventListener('pointerup', onUp);
+      resizer.addEventListener('pointercancel', onUp);
+    });
+  })();
+  try {
+    setQuietMode(localStorage.getItem('dash.ui.quiet') === '1', false);
+    setConsoleWide(localStorage.getItem('dash.console.wide') === '1', false);
+    const savedSplit = localStorage.getItem('dash.console.split');
+    const splitRatio = typeof savedSplit === 'string' && savedSplit ? Number(savedSplit) : 0.6;
+    applyConsoleSplit(Number.isFinite(splitRatio) ? splitRatio : 0.6, false);
+  } catch {}
+  syncSearchInOutputsButton();
   restoreProjectFilter();
   loadConsolePreferences();
   loadConsolePreferencesRemote();

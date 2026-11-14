@@ -19,7 +19,7 @@ const helpers = (() => {
 const a = { host: "mac", cwd: "/work/dash", project: "dash" };
 const b = { host: "win", cwd: "C:/work/dash", project: "dash" };
 const c = { host: "mac", cwd: "/other/dash/", project: "dash" };
-const noCwd = { host: "mac", project: "invest" };
+const noCwd = { host: "mac", project: "billing" };
 
 test("same project label on different host or folder yields distinct options with disambiguated labels", () => {
   const choices = helpers.repositoryFilterChoices([a, b, c, { ...a }], "");
@@ -35,7 +35,7 @@ test("same project label on different host or folder yields distinct options wit
 
 test("a session without cwd falls back to its project label", () => {
   const choices = helpers.repositoryFilterChoices([noCwd, a], "");
-  expect(choices).toContainEqual([JSON.stringify(["mac", "project", "invest"]), "invest"]);
+  expect(choices).toContainEqual([JSON.stringify(["mac", "project", "billing"]), "billing"]);
   expect(choices).toContainEqual([helpers.projectFilterIdentity(a), "dash"]);
 });
 
@@ -55,7 +55,7 @@ test("output search keeps repository identity for folders without a live matchin
   const noLongerLive = JSON.stringify(["offline-host", "cwd", "/work/archived"]);
   expect(helpers.repositorySearchFilter(noLongerLive)).toEqual({ repositoryHost: "offline-host", cwd: "/work/archived" });
   expect(helpers.repositorySearchFilter(helpers.projectFilterIdentity(noCwd))).toEqual({
-    repositoryHost: "mac", project: "invest",
+    repositoryHost: "mac", project: "billing",
   });
   expect(helpers.repositorySearchFilter(helpers.projectFilterIdentity({ host: "mac" }))).toEqual({
     repositoryHost: "mac", cwd: "",

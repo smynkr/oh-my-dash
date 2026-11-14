@@ -15,7 +15,7 @@ const token = `123456789:${"A".repeat(32)}`;
 const owner = 712345;
 const chat = 812345;
 const group = -100812345;
-const defaultTopics = { invest: 42, general: null, "squad/rogue": 74, urgent: 90, defense: 56 };
+const defaultTopics = { intake: 42, general: null, "stack/relay": 74, urgent: 90, devices: 56 };
 const ok = (result: unknown = true) => ({ ok: true, result });
 type Call = { method: string; body: Record<string, any> };
 
@@ -472,7 +472,7 @@ describe("Telegram alerts", () => {
   });
   test("restores alert updates after restart and edits the actual delivery chat", async () => {
     const f = await topicFixture();
-    const row = seedTopicQuestion(f.db, "answered-restart", "invest", f.clock.now);
+    const row = seedTopicQuestion(f.db, "answered-restart", "intake", f.clock.now);
     f.bot.nextSend = { status: 400, body: { ok: false, error_code: 400 } };
     f.telegram.observe(row);
     await eventually(() => !!f.db.alertFor(String(group), 2));
@@ -921,8 +921,8 @@ describe("Telegram topic delivery", () => {
 
   test("sends a project alert to its bound topic", async () => {
     const f = await topicFixture();
-    f.telegram.observe(dto("needs_input", { project: "invest" }));
-    await apiSettled(() => sendCalls(f.bot).length === 1, "invest alert");
+    f.telegram.observe(dto("needs_input", { project: "intake" }));
+    await apiSettled(() => sendCalls(f.bot).length === 1, "intake alert");
 
     const call = sendCalls(f.bot)[0];
     expect(call.method).toBe("sendMessage");
@@ -944,7 +944,7 @@ describe("Telegram topic delivery", () => {
 
   test.each([false, true])("withholds unmatched alerts and urgent bodies without General (group bound: %s)", async bound => {
     const f = await pairedFixture({ topicsEnabled: true,
-      bindings: bound ? { groupChatId: String(group), topics: { invest: 42 } } : undefined });
+      bindings: bound ? { groupChatId: String(group), topics: { intake: 42 } } : undefined });
     f.telegram.observe(dto("needs_input", { project: "unbound" }));
     expect(await f.telegram.sendUrgent("unbound", "Synthetic urgent body")).toBe(false);
     expect(sendCalls(f.bot)).toEqual([]);
@@ -955,42 +955,42 @@ describe("Telegram topic delivery", () => {
     const alert = (name: string, project: string) => dto("needs_input", {
       key: `synthetic-host|claude|${name}`, displayName: name, project,
     });
-    f.telegram.observe(alert("Defense one", "defense"));
-    f.telegram.observe(alert("Invest one", "invest"));
-    f.telegram.observe(alert("Defense two", "defense"));
-    f.telegram.observe(alert("Invest two", "invest"));
-    f.telegram.observe(alert("Invest three", "invest"));
+    f.telegram.observe(alert("Devices one", "devices"));
+    f.telegram.observe(alert("Intake one", "intake"));
+    f.telegram.observe(alert("Devices two", "devices"));
+    f.telegram.observe(alert("Intake two", "intake"));
+    f.telegram.observe(alert("Intake three", "intake"));
     await apiSettled(() => sendCalls(f.bot).length === 3, "topic alert buckets");
 
     const calls = sendCalls(f.bot);
     expect(calls.map(call => call.method)).toEqual(["sendMessage", "sendMessage", "sendMessage"]);
     expect(calls[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 56 });
-    expect(visibleText(calls[0].body.text)).toContain("Defense one");
+    expect(visibleText(calls[0].body.text)).toContain("Devices one");
     expect(calls[1].body).toMatchObject({ chat_id: String(group), message_thread_id: 56 });
-    expect(visibleText(calls[1].body.text)).toContain("Defense two");
+    expect(visibleText(calls[1].body.text)).toContain("Devices two");
     expect(calls[2].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
     expect(visibleText(calls[2].body.text)).toMatch(/3 sessions need you/);
-    expect(visibleText(calls[2].body.text)).toContain("Invest three");
+    expect(visibleText(calls[2].body.text)).toContain("Intake three");
   });
 
   test("preserves a historical DM alert with the same numeric ID as a new group alert", async () => {
     const f = await topicFixture();
     f.bot.sendSequence = [{ status: 200, body: ok({ message_id: 7 }) }];
-    const invest = dto("needs_input", { key: "synthetic-host|claude|invest-alert", project: "invest" });
+    const intake = dto("needs_input", { key: "synthetic-host|claude|intake-alert", project: "intake" });
     const dm = dto("needs_input", { key: "synthetic-host|claude|dm-alert", project: "unbound" });
     f.db.rememberAlert(String(chat), 7, dm.key, "alert", f.clock.now);
-    f.telegram.observe(invest);
-    await apiSettled(() => f.db.alertFor(String(group), 7)?.sessionKey === invest.key, "group alert");
+    f.telegram.observe(intake);
+    await apiSettled(() => f.db.alertFor(String(group), 7)?.sessionKey === intake.key, "group alert");
 
     expect(sendCalls(f.bot).map(call => call.body.chat_id)).toEqual([String(group)]);
-    expect(f.db.alertFor(String(group), 7)?.sessionKey).toBe(invest.key);
+    expect(f.db.alertFor(String(group), 7)?.sessionKey).toBe(intake.key);
     expect(f.db.alertFor(String(chat), 7)?.sessionKey).toBe(dm.key);
   });
 
   test("falls back from a topic 400 to one General send", async () => {
     const f = await topicFixture();
     f.bot.sendSequence = [failed(400)];
-    f.telegram.observe(dto("needs_input", { project: "invest" }));
+    f.telegram.observe(dto("needs_input", { project: "intake" }));
     await apiSettled(() => sendCalls(f.bot).length === 2, "General fallback");
 
     const calls = sendCalls(f.bot);
@@ -1003,7 +1003,7 @@ describe("Telegram topic delivery", () => {
   test("falls back from a topic 403 to General", async () => {
     const f = await topicFixture();
     f.bot.sendSequence = [failed(403)];
-    f.telegram.observe(dto("needs_input", { project: "invest" }));
+    f.telegram.observe(dto("needs_input", { project: "intake" }));
     await apiSettled(() => sendCalls(f.bot).length === 2, "403 General fallback");
 
     expect(sendCalls(f.bot).map(call => call.method)).toEqual(["sendMessage", "sendMessage"]);
@@ -1014,7 +1014,7 @@ describe("Telegram topic delivery", () => {
 
   test("drops a reply confirmation when its topic and General reject it, without sending a DM", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    const row = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "replyable", cwd: "/projects/invest/reply", kind: "question", ts: f.clock.now, text: "Synthetic question", interactive: true });
+    const row = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "replyable", cwd: "/projects/intake/reply", kind: "question", ts: f.clock.now, text: "Synthetic question", interactive: true });
     f.db.sqlite.query("UPDATE sessions SET needs_reason='waiting' WHERE key=?").run(row.key);
     f.db.rememberAlert(String(group), 9, row.key, "alert", f.clock.now);
     f.bot.sendSequence = [failed(400), failed(400)];
@@ -1032,9 +1032,9 @@ describe("Telegram topic delivery", () => {
   });
 
   test("sends the complete urgent body to General in numbered Telegram-safe parts when no urgent binding exists", async () => {
-    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { invest: 42, general: null } } });
+    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { intake: 42, general: null } } });
     const body = `${"🧪".repeat(3_500)} FINAL-URGENT-TAIL`;
-    expect(await f.telegram.sendUrgent("invest", body)).toBe(true);
+    expect(await f.telegram.sendUrgent("intake", body)).toBe(true);
     await apiSettled(() => sendCalls(f.bot).length === 3, "all urgent General parts");
 
     const calls = sendCalls(f.bot);
@@ -1045,7 +1045,7 @@ describe("Telegram topic delivery", () => {
     expect(parts.every(text => text.length <= 4096)).toBe(true);
     expect(parts[0]).toMatch(/urgent/i);
     expect(parts[0]).toMatch(/project/i);
-    expect(parts[0]).toContain("invest");
+    expect(parts[0]).toContain("intake");
     expect(parts.join("\n")).toContain("FINAL-URGENT-TAIL");
     expect(parts.map(text => text.match(/🧪/gu)?.length ?? 0).reduce((total, count) => total + count, 0)).toBe(3_500);
   });
@@ -1053,7 +1053,7 @@ describe("Telegram topic delivery", () => {
   test("falls back from a rejected urgent topic through General", async () => {
     const f = await topicFixture();
     f.bot.sendSequence = [failed(400)];
-    expect(await f.telegram.sendUrgent("invest", "Synthetic urgent body")).toBe(true);
+    expect(await f.telegram.sendUrgent("intake", "Synthetic urgent body")).toBe(true);
     await apiSettled(() => sendCalls(f.bot).length === 2, "urgent General fallback");
 
     const calls = sendCalls(f.bot);
@@ -1067,13 +1067,13 @@ describe("Telegram topic delivery", () => {
 
   test("routes an error event to one escaped urgent message without a routine alert", async () => {
     const f = await topicFixture();
-    f.telegram.observe(dto("your_turn", { project: "Invest <one>", displayName: "Session <one>" }), "error");
+    f.telegram.observe(dto("your_turn", { project: "Intake <one>", displayName: "Session <one>" }), "error");
     await apiSettled(() => sendCalls(f.bot).length === 1, "urgent error message");
 
     const call = sendCalls(f.bot)[0];
     expect(call.method).toBe("sendMessage");
     expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 90 });
-    expect(call.body.text).toContain("Invest &lt;one&gt;");
+    expect(call.body.text).toContain("Intake &lt;one&gt;");
     expect(call.body.text).toContain("Session &lt;one&gt;");
     expect(visibleText(call.body.text)).toContain("Session error:");
     expect(visibleText(call.body.text)).not.toContain("Turn finished");
@@ -1090,7 +1090,7 @@ describe("Telegram topic delivery", () => {
   test.each(["mute", "mode off", "normal"] as const)("sets urgent notification silence for %s", async condition => {
     const f = await topicFixture({ mode: condition === "mode off" ? "off" : undefined });
     if (condition === "mute") f.db.setSetting("telegram.mute_until", String(f.clock.now + 60_000));
-    expect(await f.telegram.sendUrgent("invest", "Synthetic alert")).toBe(true);
+    expect(await f.telegram.sendUrgent("intake", "Synthetic alert")).toBe(true);
     await apiSettled(() => sendCalls(f.bot).length === 1, "urgent message");
 
     const call = sendCalls(f.bot)[0];
@@ -1105,7 +1105,7 @@ describe("Telegram topic delivery", () => {
     let sweep = () => {};
     let interval = 0;
     const f = await topicFixture({ clock, setTimer: (fn, ms) => { sweep = fn; interval = ms; return () => {}; } });
-    const row = seedTopicQuestion(f.db, "urgent-sweep", "invest", clock.now);
+    const row = seedTopicQuestion(f.db, "urgent-sweep", "intake", clock.now);
     f.telegram.observe(row);
     await apiSettled(() => sendCalls(f.bot).length === 1, "initial routine alert");
     const startedAt = Number((f.db.sqlite.query("SELECT started_at FROM tg_urgent_episodes WHERE session_key=?").get(row.key) as { started_at: number }).started_at);
@@ -1139,7 +1139,7 @@ describe("Telegram topic delivery", () => {
     const clock = { now: 1_000_000 };
     let sweep = () => {};
     const f = await topicFixture({ clock, setTimer: fn => { sweep = fn; return () => {}; } });
-    const row = seedTopicQuestion(f.db, "urgent-fresh", "invest", clock.now);
+    const row = seedTopicQuestion(f.db, "urgent-fresh", "intake", clock.now);
     f.telegram.observe(row);
     await apiSettled(() => sendCalls(f.bot).length === 1, "initial routine alert");
     clock.now = row.lastActivity + 30 * 60_000 + 1;
@@ -1168,7 +1168,7 @@ describe("Telegram topic delivery", () => {
     let sweep = () => {};
     const f = await topicFixture({ clock, setTimer: fn => { sweep = fn; return () => {}; } });
     const row = f.db.applyEvent({ host: "synthetic-host", harness: "omp", sessionId: "missing-omp",
-      cwd: "/projects/invest/omp", kind: "question", ts: clock.now, text: "Synthetic question", interactive: true });
+      cwd: "/projects/intake/omp", kind: "question", ts: clock.now, text: "Synthetic question", interactive: true });
     f.telegram.observe(row);
     await apiSettled(() => sendCalls(f.bot).length === 1, "initial OMP alert");
     f.db.sqlite.query("UPDATE sessions SET alive=0,dead_since=? WHERE key=?").run(clock.now, row.key);
@@ -1184,7 +1184,7 @@ describe("Telegram topic delivery", () => {
     let sweep = () => {};
     const f = await topicFixture({ clock, setTimer: fn => { sweep = fn; return () => {}; } });
     const row = f.db.applyEvent({ host: "synthetic-host", harness: "omp", sessionId: "hook-only-omp",
-      cwd: "/projects/invest/omp", kind: "question", ts: clock.now, text: "Synthetic question", interactive: true });
+      cwd: "/projects/intake/omp", kind: "question", ts: clock.now, text: "Synthetic question", interactive: true });
     f.telegram.observe(row);
     await apiSettled(() => sendCalls(f.bot).length === 1, "initial OMP alert");
     f.db.sqlite.query("UPDATE sessions SET alive=0,dead_since=NULL WHERE key=?").run(row.key);
@@ -1200,7 +1200,7 @@ describe("Telegram topic delivery", () => {
   test.each([401, 404])("does not fall back after a topic send returns %i", async status => {
     const f = await topicFixture();
     f.bot.sendSequence = [failed(status)];
-    f.telegram.observe(dto("needs_input", { project: "invest" }));
+    f.telegram.observe(dto("needs_input", { project: "intake" }));
     await eventually(() => f.telegram.health().state === "bad_token", "bad token state");
 
     expect(sendCalls(f.bot)).toHaveLength(1);
@@ -1211,7 +1211,7 @@ describe("Telegram topic delivery", () => {
   test.each([401, 404])("stops at General when a fallback send returns %i", async status => {
     const f = await topicFixture();
     f.bot.sendSequence = [failed(400), failed(status)];
-    f.telegram.observe(dto("needs_input", { project: "invest" }));
+    f.telegram.observe(dto("needs_input", { project: "intake" }));
     await eventually(() => f.telegram.health().state === "bad_token", "General bad token");
 
     const calls = sendCalls(f.bot);
@@ -1240,7 +1240,7 @@ describe("Telegram topic delivery", () => {
       reports.push({ area, name: error instanceof Error ? error.name : "", code: safe.code, message: error instanceof Error ? error.message : "" });
     } });
     f.bot.sendSequence = [failed(400)];
-    f.telegram.observe(dto("needs_input", { project: "invest" }));
+    f.telegram.observe(dto("needs_input", { project: "intake" }));
     await apiSettled(() => sendCalls(f.bot).length === 2, "reported fallback");
 
     expect(sendCalls(f.bot).map(call => call.method)).toEqual(["sendMessage", "sendMessage"]);
@@ -1290,45 +1290,45 @@ describe("Telegram DM command and retry behavior", () => {
 });
 
 describe("Telegram topic binding and forum replies", () => {
-  test.each(["/bind@DASH_TEST_BOT invest", "/bind invest"])("bootstraps an unbound supergroup with %s", async command => {
+  test.each(["/bind@DASH_TEST_BOT intake", "/bind intake"])("bootstraps an unbound supergroup with %s", async command => {
     const f = await pairedFixture({ topicsEnabled: true });
     f.bot.enqueue(groupMessage(command, 42));
     await eventually(() => !!f.db.getSetting("telegram.topics"), "saved topic binding");
     await apiSettled(() => sendCalls(f.bot).length === 1, "binding confirmation");
 
-    expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { invest: 42 } });
+    expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { intake: 42 } });
     const call = sendCalls(f.bot)[0];
     expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
   });
 
   test("binds from inside a topic when Telegram marks the command as a reply to the topic root", async () => {
     const f = await pairedFixture({ topicsEnabled: true });
-    f.bot.enqueue(groupMessage("/bind@DASH_TEST_BOT invest", 42, { is_topic_message: true,
-      reply_to_message: { message_id: 42, forum_topic_created: { name: "invest" } } }));
+    f.bot.enqueue(groupMessage("/bind@DASH_TEST_BOT intake", 42, { is_topic_message: true,
+      reply_to_message: { message_id: 42, forum_topic_created: { name: "intake" } } }));
     await eventually(() => !!f.db.getSetting("telegram.topics"), "saved topic binding");
     await apiSettled(() => sendCalls(f.bot).length === 1, "binding confirmation");
 
-    expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { invest: 42 } });
+    expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { intake: 42 } });
     expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
   });
 
   test("answers /status in a bound topic when Telegram marks it as a reply to the topic root", async () => {
     const f = await topicFixture();
-    seedTopicQuestion(f.db, "invest-root", "invest", f.clock.now);
+    seedTopicQuestion(f.db, "intake-root", "intake", f.clock.now);
     f.bot.enqueue(groupMessage("/status@DASH_TEST_BOT", 42, { is_topic_message: true,
-      reply_to_message: { message_id: 42, forum_topic_created: { name: "invest" } } }));
+      reply_to_message: { message_id: 42, forum_topic_created: { name: "intake" } } }));
     await apiSettled(() => sendCalls(f.bot).length === 1, "topic status");
 
     expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
-    expect(visibleText(sendCalls(f.bot)[0].body.text)).toContain("Session invest-root");
+    expect(visibleText(sendCalls(f.bot)[0].body.text)).toContain("Session intake-root");
   });
 
   test("still ignores plain owner text that only replies to the topic root", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    const row = seedTopicQuestion(f.db, "root-text", "invest", f.clock.now);
+    const row = seedTopicQuestion(f.db, "root-text", "intake", f.clock.now);
     f.db.rememberAlert(String(group), 42, row.key, "alert", f.clock.now);
     f.bot.enqueue(groupMessage("hello there", 42, { is_topic_message: true,
-      reply_to_message: { message_id: 42, forum_topic_created: { name: "invest" } } }));
+      reply_to_message: { message_id: 42, forum_topic_created: { name: "intake" } } }));
     await eventually(() => f.db.getSetting("telegram.offset") === "2", "root text ignored");
 
     expect(f.db.queuedReplies()).toHaveLength(0);
@@ -1338,14 +1338,14 @@ describe("Telegram topic binding and forum replies", () => {
   test("ignores untrusted bootstrap commands and refuses a second group", async () => {
     const f = await pairedFixture({ topicsEnabled: true });
     f.bot.enqueue(groupMessage("/status", 42));
-    f.bot.enqueue(groupMessage("/bind invest", 42, { from: { id: owner + 1 } }));
-    f.bot.enqueue(groupMessage("/bind@OtherBot invest", 42));
-    f.bot.enqueue(groupMessage("/bind invest", 42));
-    f.bot.enqueue(groupMessage("/bind defense", 56, { chat: { id: group - 1, type: "supergroup", title: "Other group" } }));
+    f.bot.enqueue(groupMessage("/bind intake", 42, { from: { id: owner + 1 } }));
+    f.bot.enqueue(groupMessage("/bind@OtherBot intake", 42));
+    f.bot.enqueue(groupMessage("/bind intake", 42));
+    f.bot.enqueue(groupMessage("/bind devices", 56, { chat: { id: group - 1, type: "supergroup", title: "Other group" } }));
     await eventually(() => f.db.getSetting("telegram.offset") === "6", "bootstrap updates");
     await apiSettled(() => sendCalls(f.bot).length === 1, "only the authorized bind confirmation");
 
-    expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { invest: 42 } });
+    expect(JSON.parse(f.db.getSetting("telegram.topics")!)).toEqual({ groupChatId: String(group), topics: { intake: 42 } });
     expect(sendCalls(f.bot).map(call => call.method)).toEqual(["sendMessage"]);
     expect(sendCalls(f.bot)[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
   });
@@ -1363,38 +1363,38 @@ describe("Telegram topic binding and forum replies", () => {
 
   test("normalizes inbound General thread ID one to a null binding", async () => {
     const f = await topicFixture();
-    f.bot.enqueue(groupMessage("/bind rogue", 1));
-    await eventually(() => JSON.parse(f.db.getSetting("telegram.topics")!).topics.rogue === null, "thread one normalized");
+    f.bot.enqueue(groupMessage("/bind relay", 1));
+    await eventually(() => JSON.parse(f.db.getSetting("telegram.topics")!).topics.relay === null, "thread one normalized");
     await apiSettled(() => sendCalls(f.bot).length === 1, "thread one confirmation");
 
     const call = sendCalls(f.bot)[0];
     expect(call.body.chat_id).toBe(String(group));
     expect(call.body).not.toHaveProperty("message_thread_id");
-    expect(JSON.parse(f.db.getSetting("telegram.topics")!).topics).toMatchObject({ rogue: null });
+    expect(JSON.parse(f.db.getSetting("telegram.topics")!).topics).toMatchObject({ relay: null });
   });
 
   test("unbinds one topic and replies in the command topic", async () => {
     const f = await topicFixture();
-    f.bot.enqueue(groupMessage("/unbind invest", 42));
-    await eventually(() => !Object.hasOwn(JSON.parse(f.db.getSetting("telegram.topics")!).topics, "invest"), "invest unbound");
+    f.bot.enqueue(groupMessage("/unbind intake", 42));
+    await eventually(() => !Object.hasOwn(JSON.parse(f.db.getSetting("telegram.topics")!).topics, "intake"), "intake unbound");
     await apiSettled(() => sendCalls(f.bot).length === 1, "unbind confirmation");
 
-    expect(JSON.parse(f.db.getSetting("telegram.topics")!).topics).toEqual({ general: null, "squad/rogue": 74, urgent: 90, defense: 56 });
+    expect(JSON.parse(f.db.getSetting("telegram.topics")!).topics).toEqual({ general: null, "stack/relay": 74, urgent: 90, devices: 56 });
     const call = sendCalls(f.bot)[0];
     expect(call.method).toBe("sendMessage");
     expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 42,
-      text: "Unbound <b>invest</b>.", parse_mode: "HTML", disable_web_page_preview: true });
+      text: "Unbound <b>intake</b>.", parse_mode: "HTML", disable_web_page_preview: true });
   });
 
   test("clears the group binding after unbinding its final topic", async () => {
-    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { invest: 42 } } });
-    f.bot.enqueue(groupMessage("/unbind invest", 42));
+    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { intake: 42 } } });
+    f.bot.enqueue(groupMessage("/unbind intake", 42));
     await eventually(() => f.db.getSetting("telegram.topics") === undefined, "last binding removed");
     await apiSettled(() => sendCalls(f.bot).length === 1, "last unbind confirmation");
 
     const call = sendCalls(f.bot)[0];
     expect(call.method).toBe("sendMessage");
-    expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 42, text: "Unbound <b>invest</b>." });
+    expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 42, text: "Unbound <b>intake</b>." });
   });
 
   test("bounds an unknown unbind response after HTML escaping", async () => {
@@ -1414,11 +1414,11 @@ describe("Telegram topic binding and forum replies", () => {
 
   test("clears topic bindings and scoped modes on unpair", async () => {
     const f = await topicFixture();
-    f.db.setSetting("telegram.mode.invest", "turns");
+    f.db.setSetting("telegram.mode.intake", "turns");
     f.telegram.unpair();
 
     expect(f.db.getSetting("telegram.topics")).toBeUndefined();
-    expect(f.db.getSetting("telegram.mode.invest")).toBeUndefined();
+    expect(f.db.getSetting("telegram.mode.intake")).toBeUndefined();
     expect(f.bot.calls.filter(call => call.method === "sendMessage")).toEqual([]);
   });
 
@@ -1449,7 +1449,7 @@ describe("Telegram topic binding and forum replies", () => {
 
   test("answers an authorized bound-group mute callback with the Bot API body", async () => {
     const f = await topicFixture();
-    const row = seedTopicQuestion(f.db, "group-callback", "invest", f.clock.now);
+    const row = seedTopicQuestion(f.db, "group-callback", "intake", f.clock.now);
     f.telegram.observe(row);
     await apiSettled(() => sendCalls(f.bot).length === 1, "topic alert");
     const callbackData = sendCalls(f.bot)[0].body.reply_markup.inline_keyboard[0][0].callback_data;
@@ -1476,7 +1476,7 @@ describe("Telegram topic binding and forum replies", () => {
 
   test("ignores topic creation service replies without enqueueing or sending", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    const row = seedTopicQuestion(f.db, "service-reply", "invest", f.clock.now);
+    const row = seedTopicQuestion(f.db, "service-reply", "intake", f.clock.now);
     f.db.rememberAlert(String(group), 9, row.key, "alert", f.clock.now);
     f.bot.enqueue(groupMessage("", 42, { reply_to_message: { message_id: 9, forum_topic_created: { name: "Synthetic topic" } } }));
     await eventually(() => f.db.getSetting("telegram.offset") === "2", "service update ignored");
@@ -1495,7 +1495,7 @@ describe("Telegram topic binding and forum replies", () => {
 
   test("routes a real topic alert reply with the topic and owner message ID", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    const row = seedTopicQuestion(f.db, "group-reply", "invest", f.clock.now);
+    const row = seedTopicQuestion(f.db, "group-reply", "intake", f.clock.now);
     f.db.rememberAlert(String(group), 9, row.key, "alert", f.clock.now);
     f.bot.enqueue(groupMessage("Synthetic owner answer", 42, { message_id: 55, reply_to_message: { message_id: 9 } }));
     await eventually(() => f.db.queuedReplies().length === 1, "group reply queued");
@@ -1514,7 +1514,7 @@ describe("Telegram topic binding and forum replies", () => {
   test("ignores historical DM replies and resolves a same-numbered group alert in its own chat", async () => {
     const f = await topicFixture({ repliesEnabled: true });
     const dm = seedTopicQuestion(f.db, "dm-alert", "unbound", f.clock.now);
-    const groupRow = seedTopicQuestion(f.db, "group-alert", "invest", f.clock.now + 1);
+    const groupRow = seedTopicQuestion(f.db, "group-alert", "intake", f.clock.now + 1);
     f.db.rememberAlert(String(chat), 9, dm.key, "alert", f.clock.now);
     f.db.rememberAlert(String(group), 9, groupRow.key, "alert", f.clock.now);
     f.bot.enqueue(message("DM answer", { message_id: 56, reply_to_message: { message_id: 9 } }));
@@ -1531,7 +1531,7 @@ describe("Telegram topic binding and forum replies", () => {
 
   test("edits a persisted reply confirmation in its actual group chat after restart", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    const row = seedTopicQuestion(f.db, "restart-reply", "invest", f.clock.now);
+    const row = seedTopicQuestion(f.db, "restart-reply", "intake", f.clock.now);
     f.db.rememberAlert(String(group), 9, row.key, "alert", f.clock.now);
     f.bot.enqueue(groupMessage("Synthetic answer", 42, { message_id: 55, reply_to_message: { message_id: 9 } }));
     await eventually(() => f.db.queuedReplies().length === 1, "queued reply");
@@ -1556,7 +1556,7 @@ describe("Telegram topic binding and forum replies", () => {
 
   test("rejects a basic group bind request with a same-chat Bot API reply", async () => {
     const f = await pairedFixture({ topicsEnabled: true });
-    f.bot.enqueue(message("/bind invest", { chat: { id: group, type: "group", title: "Basic <group>" } }));
+    f.bot.enqueue(message("/bind intake", { chat: { id: group, type: "group", title: "Basic <group>" } }));
     await apiSettled(() => sendCalls(f.bot).length === 1, "basic group refusal");
 
     expect(f.db.getSetting("telegram.topics")).toBeUndefined();
@@ -1568,30 +1568,30 @@ describe("Telegram topic binding and forum replies", () => {
 });
 
 describe("Telegram topic-scoped status, replies, and mode", () => {
-  test("filters squad/rogue status and numbers needs-input before your-turn sessions", async () => {
+  test("filters stack/relay status and numbers needs-input before your-turn sessions", async () => {
     const f = await topicFixture();
-    const rogue = seedTopicQuestion(f.db, "rogue-session", "rogue", f.clock.now - 1_000);
-    const squad = seedTopicQuestion(f.db, "squad-session", "squad", f.clock.now - 2_000);
-    const turn = seedTopicQuestion(f.db, "squad-turn", "squad", f.clock.now - 3_000);
+    const relay = seedTopicQuestion(f.db, "relay-session", "relay", f.clock.now - 1_000);
+    const stack = seedTopicQuestion(f.db, "stack-session", "stack", f.clock.now - 2_000);
+    const turn = seedTopicQuestion(f.db, "stack-turn", "stack", f.clock.now - 3_000);
     f.db.sqlite.query("UPDATE sessions SET status='your_turn',needs_reason=NULL,needs_text=NULL WHERE key=?").run(turn.key);
-    seedTopicQuestion(f.db, "invest-session", "invest", f.clock.now - 4_000);
+    seedTopicQuestion(f.db, "intake-session", "intake", f.clock.now - 4_000);
     f.bot.enqueue(groupMessage("/status", 74));
-    await apiSettled(() => sendCalls(f.bot).length === 1, "squad/rogue status");
+    await apiSettled(() => sendCalls(f.bot).length === 1, "stack/relay status");
 
     const call = sendCalls(f.bot)[0];
     expect(call.method).toBe("sendMessage");
     expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 74 });
     const status = visibleText(call.body.text);
-    expect(status).toMatch(/1\.\s+Session rogue-session\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
-    expect(status).toMatch(/2\.\s+Session squad-session\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
-    expect(status).toMatch(/3\.\s+Session squad-turn\n(?=[^\n]*synthetic-host)(?=[^\n]*Your turn)[^\n]*/);
-    expect(status).not.toContain("invest-session");
+    expect(status).toMatch(/1\.\s+Session relay-session\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
+    expect(status).toMatch(/2\.\s+Session stack-session\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
+    expect(status).toMatch(/3\.\s+Session stack-turn\n(?=[^\n]*synthetic-host)(?=[^\n]*Your turn)[^\n]*/);
+    expect(status).not.toContain("intake-session");
   });
 
-  test("moves a project out of squad/rogue when it has an exact topic binding", async () => {
-    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { ...defaultTopics, rogue: 75 } } });
-    seedTopicQuestion(f.db, "rogue-exact", "rogue", f.clock.now);
-    seedTopicQuestion(f.db, "squad-exact", "squad", f.clock.now - 1);
+  test("moves a project out of stack/relay when it has an exact topic binding", async () => {
+    const f = await topicFixture({ bindings: { groupChatId: String(group), topics: { ...defaultTopics, relay: 75 } } });
+    seedTopicQuestion(f.db, "relay-exact", "relay", f.clock.now);
+    seedTopicQuestion(f.db, "stack-exact", "stack", f.clock.now - 1);
     f.bot.enqueue(groupMessage("/status", 74));
     await apiSettled(() => sendCalls(f.bot).length === 1, "specific-topic status");
 
@@ -1599,16 +1599,16 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
     expect(call.method).toBe("sendMessage");
     expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 74 });
     const status = visibleText(call.body.text);
-    expect(status).toMatch(/1\.\s+Session squad-exact\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
-    expect(status).not.toContain("Session rogue-exact");
+    expect(status).toMatch(/1\.\s+Session stack-exact\n(?=[^\n]*synthetic-host)(?=[^\n]*Waiting for you)[^\n]*/);
+    expect(status).not.toContain("Session relay-exact");
   });
 
   test("keeps project status topic-scoped and global status in General, never in DM", async () => {
     const f = await topicFixture();
-    seedTopicQuestion(f.db, "invest-status", "invest", f.clock.now);
-    seedTopicQuestion(f.db, "defense-status", "defense", f.clock.now - 1);
+    seedTopicQuestion(f.db, "intake-status", "intake", f.clock.now);
+    seedTopicQuestion(f.db, "devices-status", "devices", f.clock.now - 1);
     f.bot.enqueue(groupMessage("/status", 42));
-    await apiSettled(() => sendCalls(f.bot).length === 1, "invest status");
+    await apiSettled(() => sendCalls(f.bot).length === 1, "intake status");
     f.bot.enqueue(message("/status"));
     await eventually(() => f.db.getSetting("telegram.offset") === "3", "ignored DM status");
     expect(sendCalls(f.bot)).toHaveLength(1);
@@ -1618,14 +1618,14 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
     const calls = sendCalls(f.bot);
     expect(calls.map(call => call.method)).toEqual(["sendMessage", "sendMessage"]);
     expect(calls[0].body).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
-    const investStatus = visibleText(calls[0].body.text);
-    expect(investStatus).toContain("invest-status");
-    expect(investStatus).not.toContain("defense-status");
+    const intakeStatus = visibleText(calls[0].body.text);
+    expect(intakeStatus).toContain("intake-status");
+    expect(intakeStatus).not.toContain("devices-status");
     const globalStatus = visibleText(calls[1].body.text);
     expect(calls[1].body.chat_id).toBe(String(group));
     expect(calls[1].body).not.toHaveProperty("message_thread_id");
-    expect(globalStatus).toContain("invest-status");
-    expect(globalStatus).toContain("defense-status");
+    expect(globalStatus).toContain("intake-status");
+    expect(globalStatus).toContain("devices-status");
   });
   test("caps status at 15 numbered sessions and reports the total shown", async () => {
     const f = await pairedFixture();
@@ -1642,8 +1642,8 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
 
   test("routes addressed /r to the numbered session from its topic status", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    const rogue = seedTopicQuestion(f.db, "rogue-index", "rogue", f.clock.now - 1_000);
-    const squad = seedTopicQuestion(f.db, "squad-index", "squad", f.clock.now - 2_000);
+    const relay = seedTopicQuestion(f.db, "relay-index", "relay", f.clock.now - 1_000);
+    const stack = seedTopicQuestion(f.db, "stack-index", "stack", f.clock.now - 2_000);
     const submitArgs: unknown[] = [];
     const submit = f.replies!.submit.bind(f.replies);
     f.replies!.submit = args => { submitArgs.push(args); return submit(args); };
@@ -1653,24 +1653,24 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
     await eventually(() => f.db.queuedReplies().length === 1, "topic indexed reply");
     await apiSettled(() => sendCalls(f.bot).length === 2, "topic reply confirmation");
 
-    expect(f.db.queuedReplies()[0].sessionKey).toBe(squad.key);
-    expect(f.db.queuedReplies()[0].sessionKey).not.toBe(rogue.key);
-    expect(submitArgs).toEqual([{ key: squad.key, text: "hi", source: "telegram", actor: `telegram:${owner}`, listener: "telegram" }]);
+    expect(f.db.queuedReplies()[0].sessionKey).toBe(stack.key);
+    expect(f.db.queuedReplies()[0].sessionKey).not.toBe(relay.key);
+    expect(submitArgs).toEqual([{ key: stack.key, text: "hi", source: "telegram", actor: `telegram:${owner}`, listener: "telegram" }]);
     const call = sendCalls(f.bot)[1];
     expect(call).toEqual({ method: "sendMessage", body: {
       chat_id: String(group), message_thread_id: 74,
-      text: "📨 Queued for <b>Session squad-index</b> · synthetic-host", parse_mode: "HTML", disable_web_page_preview: true,
+      text: "📨 Queued for <b>Session stack-index</b> · synthetic-host", parse_mode: "HTML", disable_web_page_preview: true,
       reply_parameters: { message_id: 101, allow_sending_without_reply: true },
     } });
   });
 
-  test("does not reuse the squad snapshot for /r in invest", async () => {
+  test("does not reuse the stack snapshot for /r in intake", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    seedTopicQuestion(f.db, "squad-only-index", "squad", f.clock.now);
+    seedTopicQuestion(f.db, "stack-only-index", "stack", f.clock.now);
     f.bot.enqueue(groupMessage("/status", 74));
-    await apiSettled(() => sendCalls(f.bot).length === 1, "squad snapshot");
+    await apiSettled(() => sendCalls(f.bot).length === 1, "stack snapshot");
     f.bot.enqueue(groupMessage("/r 1 hi", 42, { message_id: 102 }));
-    await apiSettled(() => sendCalls(f.bot).length === 2, "missing invest snapshot response");
+    await apiSettled(() => sendCalls(f.bot).length === 2, "missing intake snapshot response");
 
     expect(f.db.queuedReplies()).toHaveLength(0);
     const call = sendCalls(f.bot)[1];
@@ -1682,9 +1682,9 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
   test("expires a topic reply index after 30 minutes", async () => {
     const clock = { now: 1_000_000 };
     const f = await topicFixture({ clock, repliesEnabled: true });
-    seedTopicQuestion(f.db, "expired-index", "invest", clock.now);
+    seedTopicQuestion(f.db, "expired-index", "intake", clock.now);
     f.bot.enqueue(groupMessage("/status", 42));
-    await apiSettled(() => sendCalls(f.bot).length === 1, "invest snapshot");
+    await apiSettled(() => sendCalls(f.bot).length === 1, "intake snapshot");
     clock.now += 30 * 60_000;
     f.bot.enqueue(groupMessage("/r 1 hi", 42, { message_id: 103 }));
     await apiSettled(() => sendCalls(f.bot).length === 2, "expired index response");
@@ -1696,30 +1696,30 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
 
   test("keeps reply indexes independent between topics in one group chat", async () => {
     const f = await topicFixture({ repliesEnabled: true });
-    const invest = seedTopicQuestion(f.db, "invest-index", "invest", f.clock.now);
-    seedTopicQuestion(f.db, "defense-index", "defense", f.clock.now - 1);
+    const intake = seedTopicQuestion(f.db, "intake-index", "intake", f.clock.now);
+    seedTopicQuestion(f.db, "devices-index", "devices", f.clock.now - 1);
     f.bot.enqueue(groupMessage("/status", 42));
-    await apiSettled(() => sendCalls(f.bot).length === 1, "invest snapshot");
+    await apiSettled(() => sendCalls(f.bot).length === 1, "intake snapshot");
     f.bot.enqueue(groupMessage("/status", 56));
-    await apiSettled(() => sendCalls(f.bot).length === 2, "defense snapshot");
+    await apiSettled(() => sendCalls(f.bot).length === 2, "devices snapshot");
     f.bot.enqueue(groupMessage("/r 1 hi", 42, { message_id: 104 }));
-    await eventually(() => f.db.queuedReplies().length === 1, "invest reply after defense status");
-    await apiSettled(() => sendCalls(f.bot).length === 3, "invest confirmation");
+    await eventually(() => f.db.queuedReplies().length === 1, "intake reply after devices status");
+    await apiSettled(() => sendCalls(f.bot).length === 3, "intake confirmation");
 
-    expect(f.db.queuedReplies()[0].sessionKey).toBe(invest.key);
+    expect(f.db.queuedReplies()[0].sessionKey).toBe(intake.key);
     const call = sendCalls(f.bot)[2];
     expect(call.method).toBe("sendMessage");
     expect(call.body).toMatchObject({ chat_id: String(group), message_thread_id: 42,
-      text: "📨 Queued for <b>Session invest-index</b> · synthetic-host" });
+      text: "📨 Queued for <b>Session intake-index</b> · synthetic-host" });
   });
 
   test("stores scoped topic mode and changes global mode only from the group", async () => {
     const f = await topicFixture();
     f.bot.enqueue(groupMessage("/mode turns", 42));
-    await eventually(() => f.db.getSetting("telegram.mode.invest") === "turns", "invest mode override");
-    await apiSettled(() => sendCalls(f.bot).length === 1, "invest mode confirmation");
+    await eventually(() => f.db.getSetting("telegram.mode.intake") === "turns", "intake mode override");
+    await apiSettled(() => sendCalls(f.bot).length === 1, "intake mode confirmation");
     f.bot.enqueue(groupMessage("/mode", 56));
-    await apiSettled(() => sendCalls(f.bot).length === 2, "inherited defense mode");
+    await apiSettled(() => sendCalls(f.bot).length === 2, "inherited devices mode");
     f.bot.enqueue(message("/mode off"));
     await eventually(() => f.db.getSetting("telegram.offset") === "4", "ignored DM mode");
     expect(f.db.getSetting("telegram.mode")).toBeUndefined();
@@ -1728,8 +1728,8 @@ describe("Telegram topic-scoped status, replies, and mode", () => {
     await apiSettled(() => sendCalls(f.bot).length === 3, "global mode confirmation");
 
     expect(f.db.getSetting("telegram.mode")).toBe("off");
-    expect(f.db.getSetting("telegram.mode.defense")).toBeUndefined();
-    expect(f.db.getSetting("telegram.mode.invest")).toBe("turns");
+    expect(f.db.getSetting("telegram.mode.devices")).toBeUndefined();
+    expect(f.db.getSetting("telegram.mode.intake")).toBe("turns");
     expect(sendCalls(f.bot).map(call => [call.body.chat_id, call.body.message_thread_id ?? null])).toEqual([
       [String(group), 42], [String(group), 56], [String(group), null],
     ]);
@@ -2146,7 +2146,7 @@ describe("Telegram turn alerts and card lifecycle", () => {
     await apiSettled(() => dm.bot.sent.length === 4 && dm.db.cardForTurn(lost.key, lost.turnSeq)?.state === "failed", "failed card");
     const f = await topicFixture({ repliesEnabled: true, decisionsEnabled: true });
     f.bot.sendSequence = [failed];
-    const row = respond(f, "fallback", ask, "/projects/invest/synthetic");
+    const row = respond(f, "fallback", ask, "/projects/intake/synthetic");
     await apiSettled(() => f.bot.sent.length === 2 && f.db.cardForTurn(row.key, row.turnSeq)?.state === "active", "General card");
     expect(f.bot.sent[0]).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
     expect(f.db.cardForTurn(row.key, row.turnSeq)).toMatchObject({ chatId: String(group), threadId: null, messageId: 2 });
@@ -2535,13 +2535,13 @@ describe("Telegram decision cards", () => {
   test("a card goes to the project topic and a topic failure persists the General fallback", async () => {
     const f = await topicFixture(decisionsOn);
     const failed = { status: 400, body: { ok: false, error_code: 400, description: "synthetic failure text" } };
-    const row = respond(f, "topic", single, "/projects/invest/synthetic");
+    const row = respond(f, "topic", single, "/projects/intake/synthetic");
     await apiSettled(() => f.bot.sent.length === 1);
     expect(f.bot.sent[0]).toMatchObject({ chat_id: String(group), message_thread_id: 42 });
-    expect(f.bot.sent[0].text).toContain("<i>Decision · invest</i>");
+    expect(f.bot.sent[0].text).toContain("<i>Decision · intake</i>");
     expect(f.db.cardForTurn(row.key, row.turnSeq)).toMatchObject({ chatId: String(group), threadId: 42, messageId: 1, state: "active" });
     f.bot.sendSequence = [failed];
-    const next = respond(f, "topic", single, "/projects/invest/synthetic");
+    const next = respond(f, "topic", single, "/projects/intake/synthetic");
     await apiSettled(() => f.bot.sent.length === 3 && f.db.cardForTurn(next.key, next.turnSeq)?.state === "active", "General card");
     expect(f.bot.sent[2]).toMatchObject({ chat_id: String(group) });
     expect(f.bot.sent[2].message_thread_id).toBeUndefined();
@@ -2908,7 +2908,7 @@ describe("Telegram decision cards", () => {
 
   test("a card reply-to stays free text in its own chat and outcome edits use the saved card message after unbind", async () => {
     const f = await topicFixture(decisionsOn);
-    const row = respond(f, "routed", single, "/projects/invest/synthetic");
+    const row = respond(f, "routed", single, "/projects/intake/synthetic");
     await apiSettled(() => f.bot.sent.length === 1);
     f.bot.enqueue(message("free text from dm", { message_id: 31, reply_to_message: { message_id: 1 } }));
     f.bot.enqueue(groupMessage("free text from topic", 42, { message_id: 32, reply_to_message: { message_id: 1 } }));
@@ -2916,7 +2916,7 @@ describe("Telegram decision cards", () => {
     expect(f.bot.sent.every(body => body.chat_id === String(group))).toBe(true);
     expect(f.db.queuedReplies().map(reply => [reply.sessionKey, reply.text, reply.answersTurn ?? null])).toEqual([[row.key, "free text from topic", null]]);
     f.replies!.cancelAll();
-    const next = respond(f, "routed", single, "/projects/invest/synthetic");
+    const next = respond(f, "routed", single, "/projects/intake/synthetic");
     await eventually(() => f.db.cardForTurn(next.key, next.turnSeq)?.state === "active");
     const card = f.db.cardForTurn(next.key, next.turnSeq)!;
     groupTap(f, `d:${card.id.toString(36)}:0:0`, card.messageId!);
@@ -3229,7 +3229,7 @@ describe("Telegram native question answers", () => {
     };
     const f = await topicFixture({ repliesEnabled: true, clock, sleep });
     const rateLimitRow = f.db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: "rate-limit",
-      cwd: "/projects/invest/synthetic", kind: "question", ts: clock.now, text: "Synthetic waiting text", interactive: true });
+      cwd: "/projects/intake/synthetic", kind: "question", ts: clock.now, text: "Synthetic waiting text", interactive: true });
     f.telegram.observe(rateLimitRow);
     await apiSettled(() => f.bot.sent.length === 1, "prior paced send");
 
@@ -3244,7 +3244,7 @@ describe("Telegram native question answers", () => {
     f.telegram.observe(row, "question");
     await sleepStarted;
     f.db.setSetting("telegram.mute_until", String(clock.now + 60_000));
-    const marker = f.telegram.sendUrgent("invest", "Synthetic queue synchronization marker");
+    const marker = f.telegram.sendUrgent("intake", "Synthetic queue synchronization marker");
     releaseSleep!();
     expect(await marker).toBe(true);
     expect(questionMessages(f.bot)).toHaveLength(0);
@@ -3497,7 +3497,7 @@ describe("Telegram server routes", () => {
   });
 });
 
-describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
+describe("Telegram compose, pick and Ideas", () => {
   const seedAt = (db: DashDB, name: string, status: "needs_input" | "your_turn" | "working" | "ended", activity: number, display = name) => {
     const row = db.applyEvent({ host: "synthetic-host", harness: "claude", sessionId: name, kind: "question", ts: 1_000_000, text: "Synthetic question", interactive: true });
     db.sqlite.query("UPDATE sessions SET status=?,needs_reason=?,display_name=?,last_activity=? WHERE key=?")
@@ -3655,35 +3655,35 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
 
   test("/to queues directly on exact, unique prefix and space-to-dash matches", async () => {
     const f = await pairedFixture({ repliesEnabled: true });
-    seedAt(f.db, "a", "your_turn", 3, "invest-5a");
+    seedAt(f.db, "a", "your_turn", 3, "intake-5a");
     seedAt(f.db, "b", "your_turn", 2, "Dash Board");
-    seedAt(f.db, "c", "working", 1, "invest-5ab");
-    f.bot.enqueue(message("/to invest-5a exact text"));
+    seedAt(f.db, "c", "working", 1, "intake-5ab");
+    f.bot.enqueue(message("/to intake-5a exact text"));
     f.bot.enqueue(message("/to dash-b prefix text", { message_id: 11 }));
     f.bot.enqueue(message("/to DASH_BOARD variant text", { message_id: 12 }));
     await eventually(() => f.db.queuedReplies().length === 3);
     const rows = f.db.queuedReplies().map(r => [f.db.getSession(r.sessionKey)!.displayName, r.kind, r.text]);
-    expect(rows).toEqual([["invest-5a", "message", "exact text"], ["Dash Board", "message", "prefix text"], ["Dash Board", "message", "variant text"]]);
+    expect(rows).toEqual([["intake-5a", "message", "exact text"], ["Dash Board", "message", "prefix text"], ["Dash Board", "message", "variant text"]]);
     await apiSettled(() => f.bot.sent.length === 3);
-    expect(f.bot.sent[0]!.text).toBe("📨 Queued for <b>invest-5a</b> · synthetic-host");
+    expect(f.bot.sent[0]!.text).toBe("📨 Queued for <b>intake-5a</b> · synthetic-host");
   });
 
   test("/to shows a picker of the matches, the full picker, the ended refusal, and usage", async () => {
     const f = await pairedFixture({ repliesEnabled: true });
-    seedAt(f.db, "a", "your_turn", 3, "invest-1");
-    seedAt(f.db, "b", "your_turn", 2, "invest-2");
+    seedAt(f.db, "a", "your_turn", 3, "intake-1");
+    seedAt(f.db, "b", "your_turn", 2, "intake-2");
     seedAt(f.db, "c", "working", 1, "other");
     seedAt(f.db, "d", "ended", 4, "old-5a");
-    f.bot.enqueue(message("/to invest hi"));
+    f.bot.enqueue(message("/to intake hi"));
     await apiSettled(() => f.bot.sent.length === 1);
-    expect(f.bot.sent[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
+    expect(f.bot.sent[0]!.text).toBe("&quot;intake&quot; matches 2 sessions:");
     expect(buttons(f.bot.sent[0]!)).toHaveLength(4);
     f.bot.enqueue(message("/to nobody hi", { message_id: 11 }));
     await apiSettled(() => f.bot.sent.length === 2);
     expect(f.bot.sent[1]!.text).toBe("No session matches &quot;nobody&quot;.");
     expect(buttons(f.bot.sent[1]!)).toHaveLength(5);
     f.bot.enqueue(message("/to old-5a hi", { message_id: 12 }));
-    f.bot.enqueue(message("/to invest-1", { message_id: 13 }));
+    f.bot.enqueue(message("/to intake-1", { message_id: 13 }));
     await apiSettled(() => f.bot.sent.length === 4);
     expect(f.bot.sent[2]!.text).toBe("<b>old-5a</b> has ended.");
     expect(f.bot.sent[3]!.text).toBe("Use /to &lt;session-name&gt; your text");
@@ -3692,11 +3692,11 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
 
   test("/to keeps its match header when a stale target rebuilds the picker", async () => {
     const f = await pairedFixture({ repliesEnabled: true });
-    const first = seedAt(f.db, "invest-one", "your_turn", 3);
-    seedAt(f.db, "invest-two", "your_turn", 2);
-    f.bot.enqueue(message("/to invest synthetic text"));
+    const first = seedAt(f.db, "intake-one", "your_turn", 3);
+    seedAt(f.db, "intake-two", "your_turn", 2);
+    f.bot.enqueue(message("/to intake synthetic text"));
     await apiSettled(() => f.bot.sent.length === 1);
-    expect(f.bot.sent[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
+    expect(f.bot.sent[0]!.text).toBe("&quot;intake&quot; matches 2 sessions:");
 
     f.db.applyEvent({ host: first.host, harness: first.harness, sessionId: first.sessionId,
       kind: "session_end", ts: f.clock.now, interactive: true });
@@ -3704,9 +3704,9 @@ describe("Telegram compose, pick and Ideas (AXI-445 C3)", () => {
     await apiSettled(() => answers(f.bot).length === 1 && edits(f.bot).length === 1);
 
     expect(answers(f.bot)[0]).toBe("That session has ended.");
-    expect(edits(f.bot)[0]!.text).toBe("&quot;invest&quot; matches 2 sessions:");
+    expect(edits(f.bot)[0]!.text).toBe("&quot;intake&quot; matches 2 sessions:");
     expect(buttons(edits(f.bot)[0]!).map(button => button.text)).toEqual([
-      "🟢 invest-two · synthetic-host", "💡 Save to Ideas", "✖️ Cancel",
+      "🟢 intake-two · synthetic-host", "💡 Save to Ideas", "✖️ Cancel",
     ]);
   });
 
@@ -3908,7 +3908,7 @@ describe("Telegram autopilot commands", () => {
     f.bot.enqueueUpdate({ callback_query: { id: "never-delay", from: { id: owner },
       message: { chat: { id: group, type: "supergroup" }, message_thread_id: 42 }, data: "ap:delay:1" } });
     await eventually(() => changes.length === 1);
-    expect(changes).toEqual([["invest", null]]);
+    expect(changes).toEqual([["intake", null]]);
     expect(sendCalls(f.bot).some(call => String(call.body.text).includes("Never"))).toBe(true);
   });
 
@@ -3929,7 +3929,7 @@ describe("Telegram autopilot commands", () => {
   });
   test("renders autopilot notices through the Markdown formatter", async () => {
     const f = await topicFixture();
-    const session = { ...dto("working"), displayName:"Session <one>", project:"invest" };
+    const session = { ...dto("working"), displayName:"Session <one>", project:"intake" };
     const notice = {
       session,goal:{id:1,goalText:"Complete <one>"},
       decision:{id:1,sessionKey:session.key,project:session.project,goalId:1,status:"pending",
@@ -3946,8 +3946,8 @@ describe("Telegram autopilot commands", () => {
     expect(visibleText(text)).toContain("Continue <one>");
   });
   test("routes interactive urgent fallback to General in topic mode", async () => {
-    const f = await topicFixture({bindings:{groupChatId:String(group),topics:{invest:42,general:null}}});
-    expect(await f.telegram.sendUrgent("invest","Synthetic urgent fallback",{inline_keyboard:[[{text:"Resume",callback_data:"ap:resume:1"}]]})).toBe(true);
+    const f = await topicFixture({bindings:{groupChatId:String(group),topics:{intake:42,general:null}}});
+    expect(await f.telegram.sendUrgent("intake","Synthetic urgent fallback",{inline_keyboard:[[{text:"Resume",callback_data:"ap:resume:1"}]]})).toBe(true);
     expect(sendCalls(f.bot)[0]!.body).toMatchObject({chat_id:String(group),parse_mode:"HTML"});
     expect(sendCalls(f.bot)[0]!.body).not.toHaveProperty("message_thread_id");
   });

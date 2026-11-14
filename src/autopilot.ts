@@ -556,8 +556,8 @@ export function createAutopilot({ db, store, replies, judge, now = Date.now, tim
 
   function dialogReleased(session: SessionDTO): SchedulerActionResult {
     const current = db.getSession(session.key);
-    if (!current || !["claude","omp"].includes(current.harness) || current.status !== "needs_input" ||
-        current.harness === "claude" && current.needsReason !== "question" ||
+    if (!current || !["claude","omp","agy"].includes(current.harness) || current.status !== "needs_input" ||
+        (current.harness === "claude" || current.harness === "agy") && current.needsReason !== "question" ||
         current.turnSeq !== session.turnSeq || current.pendingQuestionId !== session.pendingQuestionId)
       return { ok: false, reason: "not_current_dialog" };
     cancelWake(current.key);
