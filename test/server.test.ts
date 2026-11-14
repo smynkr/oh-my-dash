@@ -805,14 +805,14 @@ test("remote Claude pushes track liveness, absence, recovery and health age", as
   let clock = 1_000_000;
   startTailnet(() => clock);
   const record = { sessionId: "s1", pid: 10, cwd: "/synthetic", name: "n", status: "idle" };
-  const remoteKey = "mbp|claude|s1";
-  const push = (body: unknown, host = "mbp") => fetch(`${tailnetBase}/ingest/liveness/claude`, {
+  const remoteKey = "peer1|claude|s1";
+  const push = (body: unknown, host = "peer1") => fetch(`${tailnetBase}/ingest/liveness/claude`, {
     method: "POST", headers: { ...remoteHeaders, "Content-Type": "application/json", "X-Dash-Host": host }, body: JSON.stringify(body),
   });
   expect(await (await push([record])).text()).toBe("{}");
-  expect(app.db.getSession(remoteKey)).toMatchObject({ host: "mbp", alive: true, status: "your_turn" });
+  expect(app.db.getSession(remoteKey)).toMatchObject({ host: "peer1", alive: true, status: "your_turn" });
   expect(app.db.getSession(remoteKey)?.displayName).toBe("n");
-  expect((await getJson("/healthz")).remoteHosts.mbp).toBe(0);
+  expect((await getJson("/healthz")).remoteHosts.peer1).toBe(0);
   clock += 1_000;
   await push([]);
   expect(app.db.getSession(remoteKey)?.alive).toBe(false);
@@ -828,7 +828,7 @@ test("remote Claude pushes track liveness, absence, recovery and health age", as
   await push([]);
   expect(app.db.getSession(remoteKey)).toMatchObject({ alive: false, status: "ended" });
   clock += 3_000;
-  expect((await getJson("/healthz")).remoteHosts.mbp).toBe(3);
+  expect((await getJson("/healthz")).remoteHosts.peer1).toBe(3);
 });
 
 test("remote liveness rejects bad hosts, bad bodies and disallowed peers without changing local rows", async () => {
@@ -840,40 +840,40 @@ test("remote liveness rejects bad hosts, bad bodies and disallowed peers without
     method: "POST", headers: { ...remoteHeaders, "Content-Type": "application/json", ...(host ? { "X-Dash-Host": host } : {}), ...extra }, body: JSON.stringify(body),
   });
   for (const host of [undefined, "bad host", "a".repeat(65)]) expect(await (await push(host, [])).text()).toBe("{}");
-  await push("mbp", { foo: 1 });
+  await push("peer1", { foo: 1 });
   await push(local, []);
   expect(app.malformedCount).toBe(4);
   expect(app.rejectedCount).toBe(1);
   expect(app.db.getSession(localKey)?.alive).toBe(true);
-  const plain = await fetch(`${tailnetBase}/ingest/liveness/claude`, { method: "POST", headers: { ...remoteHeaders, "Content-Type": "text/plain", "X-Dash-Host": "mbp" }, body: "[]" });
+  const plain = await fetch(`${tailnetBase}/ingest/liveness/claude`, { method: "POST", headers: { ...remoteHeaders, "Content-Type": "text/plain", "X-Dash-Host": "peer1" }, body: "[]" });
   expect(await plain.text()).toBe("{}");
   expect(app.rejectedCount).toBe(2);
-  const response = await push("mbp", [{ sessionId: "blocked", pid: 10 }], { "X-Forwarded-For": "1.2.3.4" });
+  const response = await push("peer1", [{ sessionId: "blocked", pid: 10 }], { "X-Forwarded-For": "1.2.3.4" });
   expect(await response.text()).toBe("{}");
   expect(app.rejectedCount).toBe(3);
-  expect(app.db.getSession("mbp|claude|blocked")).toBeNull();
+  expect(app.db.getSession("peer1|claude|blocked")).toBeNull();
 });
 
 test("authoritative remote absence ends a session without a PID after two minutes", async () => {
   let clock = 1_000_000;
   startTailnet(() => clock);
   const push = (body: unknown) => fetch(`${tailnetBase}/ingest/liveness/claude`, {
-    method: "POST", headers: { ...remoteHeaders, "Content-Type": "application/json", "X-Dash-Host": "mbp" }, body: JSON.stringify(body),
+    method: "POST", headers: { ...remoteHeaders, "Content-Type": "application/json", "X-Dash-Host": "peer1" }, body: JSON.stringify(body),
   });
   await push([{ sessionId: "no-pid", status: "busy" }]);
   clock += 1_000;
   await push([]);
-  expect(app.db.getSession("mbp|claude|no-pid")).toMatchObject({ alive: false, status: "working" });
+  expect(app.db.getSession("peer1|claude|no-pid")).toMatchObject({ alive: false, status: "working" });
   clock += 120_000;
   await push([]);
-  expect(app.db.getSession("mbp|claude|no-pid")?.status).toBe("ended");
+  expect(app.db.getSession("peer1|claude|no-pid")?.status).toBe("ended");
 });
 
 test("local liveness backfill guard skips remote DTOs", async () => {
   app.close();
   app = createDashServer({ port: 0, dataPath: ":memory:", backfill: false, liveness: false,
     pollClaude: async () => [], pollOmp: async () => null });
-  const remote = app.db.markLiveness("claude", [{ host: "mbp", harness: "claude", sessionId: "s1", pid: 10 }], "mbp", Date.now(), () => false)[0];
+  const remote = app.db.markLiveness("claude", [{ host: "peer1", harness: "claude", sessionId: "s1", pid: 10 }], "peer1", Date.now(), () => false)[0];
   app.db.markLiveness = (() => [remote]) as typeof app.db.markLiveness;
   let checked = false;
   app.db.hasResponses = (() => { checked = true; return false; }) as typeof app.db.hasResponses;
@@ -1144,7 +1144,7 @@ test("a StopFailure event urgently pages once even when its DTO was already dedu
   const scratch = mkdtempSync(join(tmpdir(), "dash-step4a-server-"));
   const dataPath = join(scratch, "dash.sqlite");
   const stamp = 1_000_000;
-  const cwd = "/projects/invest/run";
+  const cwd = "/projects/billing/run";
   const seeded = new DashDB(dataPath, { topicsEnabled: true });
   seeded.setSetting("telegram.chat_id", "812345");
   seeded.setSetting("telegram.user_id", "712345");
@@ -1447,27 +1447,27 @@ test("source inventory groups unassigned sessions and exposes metadata, not reta
 test("empty remote heartbeats recover stale inventory while malformed reports never refresh or end sessions", async () => {
   let clock = 1_000_000;
   startTailnet(() => clock);
-  const remoteKey = "mbp|claude|inventory-session";
+  const remoteKey = "peer1|claude|inventory-session";
   const push = (body: unknown, forwarded = remoteHeaders["X-Forwarded-For"]) => fetch(`${tailnetBase}/ingest/liveness/claude`, {
-    method: "POST", headers: { ...remoteHeaders, "X-Forwarded-For": forwarded, "Content-Type": "application/json", "X-Dash-Host": "mbp" }, body: JSON.stringify(body),
+    method: "POST", headers: { ...remoteHeaders, "X-Forwarded-For": forwarded, "Content-Type": "application/json", "X-Dash-Host": "peer1" }, body: JSON.stringify(body),
   });
   const record = { sessionId: "inventory-session", pid: 10, status: "idle" };
   await push([record]);
   let inventory = await getJson("/api/sources") as SourceInventoryForTest;
-  let source = inventory.sources.find(entry => entry.host === "mbp");
+  let source = inventory.sources.find(entry => entry.host === "peer1");
   expect(source).toMatchObject({ status: "reporting", lastReportAt: clock, lastHeartbeatAt: clock });
   clock += 1_000;
   await push([]);
   expect(app.db.getSession(remoteKey)).toMatchObject({ alive: false, status: "your_turn" });
   clock += 120_001;
   inventory = await getJson("/api/sources") as SourceInventoryForTest;
-  source = inventory.sources.find(entry => entry.host === "mbp");
+  source = inventory.sources.find(entry => entry.host === "peer1");
   expect(source).toMatchObject({ status: "stale", lastReportAt: 1_001_000, lastHeartbeatAt: 1_001_000 });
   expect(app.db.getSession(remoteKey)?.status).toBe("your_turn");
   await push({ invalid: true });
   expect(app.malformedCount).toBe(1);
   inventory = await getJson("/api/sources") as SourceInventoryForTest;
-  source = inventory.sources.find(entry => entry.host === "mbp");
+  source = inventory.sources.find(entry => entry.host === "peer1");
   expect(source).toMatchObject({ status: "stale", lastReportAt: 1_001_000, lastHeartbeatAt: 1_001_000 });
   expect(app.db.getSession(remoteKey)?.status).toBe("your_turn");
   const forged = await push([], "1.2.3.4");
@@ -1475,12 +1475,12 @@ test("empty remote heartbeats recover stale inventory while malformed reports ne
   expect(await forged.text()).toBe("{}");
   expect(app.rejectedCount).toBe(1);
   inventory = await getJson("/api/sources") as SourceInventoryForTest;
-  source = inventory.sources.find(entry => entry.host === "mbp");
+  source = inventory.sources.find(entry => entry.host === "peer1");
   expect(source).toMatchObject({ status: "stale", lastReportAt: 1_001_000, lastHeartbeatAt: 1_001_000 });
   clock += 1;
   await push([]);
   inventory = await getJson("/api/sources") as SourceInventoryForTest;
-  source = inventory.sources.find(entry => entry.host === "mbp");
+  source = inventory.sources.find(entry => entry.host === "peer1");
   expect(source).toMatchObject({ status: "reporting", lastReportAt: clock, lastHeartbeatAt: clock });
   expect(app.db.getSession(remoteKey)?.status).toBe("ended");
 });

@@ -7,7 +7,7 @@ import { normalizeQuestionSelections, normalizeRecommendedQuestionAnswers } from
 
 export type { ReplySource };
 export type AutopilotDelivery = { goal_id: number; expires_at: number; remaining_ttl_ms: number };
-type Harness = "claude" | "omp" | "codex";
+type Harness = "claude" | "omp" | "codex" | "agy";
 type Outcome = "delivered" | "expired" | "cancelled";
 type Listener = "loopback" | "tailnet" | "telegram" | "internal";
 type WaitResult = { status: 200; reply: string | { id: number; text: string; source: ReplySource; target?: string;
@@ -25,7 +25,7 @@ export type SubmitArgs = { key: string; text: string; source: ReplySource; actor
   kind?: ReplyKind; /** The idea this message sends; it must be open and is marked sent with the queued reply. */ ideaId?: number };
 export type RefusalReason = "disabled" | "invalid_key" | "invalid_source" | "invalid_actor" |
   "invalid_text" | "empty_text" | "invalid_turn" | "invalid_question" | "stale_turn" | "stale_question" | "session_not_found" |
-  "session_ended" | "claude_dialog" | "omp_approval" | "not_deliverable" | "too_long" | "idea_not_open" |
+  "session_ended" | "claude_dialog" | "omp_approval" | "agy_dialog" | "not_deliverable" | "too_long" | "idea_not_open" |
   "codex_disabled" | "codex_not_owned" | "unsupported_control" | "turn_active" | "stale_codex_turn";
 export type SubmitResult = { ok: true; replyId: number } | { refused: true; reason: RefusalReason };
 export type RegisterQuestionArgs = { event: NormalizedEvent; id: string; toolUseId: string; timeoutMs: number };
@@ -133,7 +133,7 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
     const dto = db.getSession(key);
     if (!dto || dto.status === "ended") return;
     while (waiter.pending) {
-      const includeAutopilot = waiter.harness === "claude" || waiter.harness === "omp" && waiter.commitCapable;
+      const includeAutopilot = waiter.harness === "claude" || (waiter.harness === "omp" || waiter.harness === "agy") && waiter.commitCapable;
       const reply = db.nextQueuedReply(key, includeAutopilot);
       if (!reply) return;
       let delivery: AutopilotDelivery | null = null;
@@ -149,7 +149,9 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
         ? db.takeQueuedForClaude(key, reply.id, dto.turnSeq, now())
         : waiter.harness === "codex"
           ? db.leaseQueuedForCodex(key, reply.id, waiter.waiterId, now(), waiter.commitCapable)
-          : db.leaseQueuedForOmp(key, reply.id, waiter.waiterId, dto.turnSeq, now(), waiter.commitCapable);
+          : waiter.harness === "agy"
+            ? db.leaseQueuedForAgy(key, reply.id, waiter.waiterId, dto.turnSeq, now(), waiter.commitCapable)
+            : db.leaseQueuedForOmp(key, reply.id, waiter.waiterId, dto.turnSeq, now(), waiter.commitCapable);
       if (result.kind === "stale") { outcome(result.reply!, "cancelled", db.getSession(key)); continue; }
       if (result.kind === "unavailable" && reply.expiresAt <= now()) {
         for (const expired of db.expireReplies(now())) outcome(expired, "expired", db.getSession(expired.sessionKey));
@@ -172,7 +174,7 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
         finish(waiter, { status: 200, reply: { id: result.reply.id, target: key, action, text: result.reply.text,
           ...(result.reply.codexExpectedTurnId ? { expectedTurnId: result.reply.codexExpectedTurnId } : {}), source: result.reply.source } });
       } else {
-        leases.set(result.reply.id, { key, waiterId: waiter.waiterId, peer: waiter.peer, harness: "omp" });
+        leases.set(result.reply.id, { key, waiterId: waiter.waiterId, peer: waiter.peer, harness: waiter.harness });
         finish(waiter, { status: 200, reply: { id: result.reply.id, text: result.reply.text, source: result.reply.source,
           ...(delivery ? { autopilot: delivery } : {}) } });
       }
@@ -198,6 +200,7 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       signal?.addEventListener("abort", pending.abort, { once: true });
       waiter.pending = pending;
       tryDispatch(key);
+      if (waiter.pending && waitMs === 0) finish(waiter, { status: 204 });
       if (waiter.pending) onWaiterChange?.(key);
     });
   };
@@ -283,11 +286,11 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
     const { event,id,toolUseId,timeoutMs } = args, questions = event.questionData;
     let token: Buffer;
     try { token = Buffer.from(id,"base64url"); } catch { return { refused:true,reason:"invalid_question" }; }
-    if (event.harness !== "claude" || event.kind !== "question" || !event.interactive ||
+    if ((event.harness !== "claude" && event.harness !== "agy") || event.kind !== "question" || !event.interactive ||
         !event.toolUseId || event.toolUseId !== toolUseId || !toolUseIdPattern.test(toolUseId) ||
         !claudeQuestionIdentityPattern.test(id) || token.byteLength !== 32 || token.toString("base64url") !== id ||
         !Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000 ||
-        !questions?.length || !isReplyKey(`${event.host}|claude|${event.sessionId}`))
+        !questions?.length || !isReplyKey(`${event.host}|${event.harness}|${event.sessionId}`))
       return { refused:true,reason:"invalid_question" };
     const registeredAt = now();
     const result = db.registerQuestion(event,id,toolUseId,questions,registeredAt,timeoutMs);
@@ -533,7 +536,7 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       if (!dto) return refuseQuestion("session_not_found",args,listener);
       if (dto.status === "ended") return refuseQuestion("session_ended",args,listener);
       const invocation = db.getQuestionInvocation(args.questionId,args.key);
-      if (!invocation || invocation.state !== "pending" || dto.harness !== "claude" ||
+      if (!invocation || invocation.state !== "pending" || (dto.harness !== "claude" && dto.harness !== "agy") ||
           dto.status !== "needs_input" || dto.needsReason !== "question" || dto.pendingQuestionId !== args.questionId)
         return refuseQuestion("stale_question",args,listener);
       const answers = args.source === "autopilot"
@@ -584,6 +587,28 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       }
       return result.ok;
     },
+    commitAgy(id: number, waiterId: string, peer = "loopback") {
+      const lease = leases.get(id);
+      if (!lease || lease.harness !== "agy" || lease.waiterId !== waiterId || lease.peer !== peer) return false;
+      const reply = db.getReply(id);
+      if (reply?.source === "autopilot") {
+        const goalId = reply.actor ? actorGoalId(reply.actor) : null;
+        let active = false;
+        try { active = !!goalId && !!autopilotDelivery?.(reply) && !!autopilotAllowed?.(reply.sessionKey, goalId); }
+        catch { active = false; }
+        if (!active) {
+          leases.delete(id);
+          cancelled(db.cancelReplies({ key: reply.sessionKey, id, source: "autopilot", reason: "inactive_goal" }, now()), db.getSession(reply.sessionKey));
+          return false;
+        }
+      }
+      const result = db.commitAgy(id, waiterId, now());
+      if (!result.ok && result.reason === "stale" && result.reply) {
+        leases.delete(id);
+        outcome(result.reply, "cancelled", db.getSession(result.reply.sessionKey));
+      }
+      return result.ok;
+    },
     commitCodex(id: number, waiterId: string, target: string, peer = "loopback") {
       const lease = leases.get(id);
       if (!lease || lease.harness !== "codex" || lease.key !== target || lease.waiterId !== waiterId || lease.peer !== peer) return false;
@@ -616,19 +641,38 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       wait("omp", key, waiterId, started, waitMs, signal, commitCapable, peer),
     waitCodex: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal, peer = "loopback") =>
       wait("codex", key, waiterId, started, waitMs, signal, true, peer),
+    waitAgy: (key: string, waiterId: string, started: number, waitMs: number, signal?: AbortSignal, peer = "loopback") =>
+      wait("agy", key, waiterId, started, waitMs, signal, true, peer),
     deliveryObservation(key: string): DeliveryObservation | undefined {
       const waiter = waiters.get(key);
       const pending = waiter?.pending;
       if (!waiter || !pending || pending.signal?.aborted || pending.expiresAt <= now()) return undefined;
       return { observedAt: pending.observedAt, expiresAt: pending.expiresAt,
         protocol: waiter.harness === "claude" ? "claude-waiter" : waiter.harness === "codex" ? "codex-control" :
-          waiter.commitCapable ? "omp-commit" : "omp-legacy" };
+          waiter.harness === "agy" ? "agy-commit" : waiter.commitCapable ? "omp-commit" : "omp-legacy" };
     },
     ackOmp(id: number, waiterId: string, answer: "sent" | "deferred", peer = "loopback") {
       const ackKey = `${id}:${waiterId}:${peer}:${answer}`;
       if (acks.has(ackKey)) return true;
       const lease = leases.get(id);
       if (!lease || lease.harness !== "omp" || lease.waiterId !== waiterId || lease.peer !== peer) return false;
+      const reply = answer === "sent" ? db.ackReply(id, now()) : db.deferReply(id, now());
+      if (!reply) return false;
+      leases.delete(id);
+      acks.add(ackKey);
+      if (acks.size > 1000) acks.delete(acks.values().next().value!);
+      if (answer === "sent") {
+        const dto = db.getSession(reply.sessionKey);
+        outcome(reply, "delivered", dto);
+        syntheticPrompt(dto, reply.source);
+      } else tryDispatch(reply.sessionKey);
+      return true;
+    },
+    ackAgy(id: number, waiterId: string, answer: "sent" | "deferred", peer = "loopback") {
+      const ackKey = `${id}:${waiterId}:${peer}:${answer}`;
+      if (acks.has(ackKey)) return true;
+      const lease = leases.get(id);
+      if (!lease || lease.harness !== "agy" || lease.waiterId !== waiterId || lease.peer !== peer) return false;
       const reply = answer === "sent" ? db.ackReply(id, now()) : db.deferReply(id, now());
       if (!reply) return false;
       leases.delete(id);
@@ -670,7 +714,8 @@ export function createReplies({ db, enabled = true, codexEnabled = false, now = 
       const active = [...waiters.values()].filter(w => w.pending && !w.pending.signal?.aborted && w.pending.expiresAt > at);
       return { enabled, queued: count.queued, leased: count.leased,
         waiters: { claude: active.filter(w => w.harness === "claude").length,
-          omp: active.filter(w => w.harness === "omp").length, codex: active.filter(w => w.harness === "codex").length }, ...counts };
+          omp: active.filter(w => w.harness === "omp").length, codex: active.filter(w => w.harness === "codex").length,
+          agy: active.filter(w => w.harness === "agy").length }, ...counts };
     },
     close() {
       stopTimer();

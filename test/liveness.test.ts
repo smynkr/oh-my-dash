@@ -3,10 +3,10 @@ import { parseClaudeAgents, pollClaudeAgents, resolveClaudeBin } from "../src/li
 
 test("Claude agent parser accepts both response shapes and rejects other data", () => {
   const agent = { sessionId: "synthetic-s1", pid: 10, cwd: "/synthetic", name: "Test", status: "idle" };
-  const expected = [{ host: "mbp", harness: "claude", sessionId: "synthetic-s1", pid: 10, cwd: "/synthetic", name: "Test", detail: "idle" }];
-  expect(parseClaudeAgents([agent, { pid: 12 }], "mbp")).toEqual(expected);
-  expect(parseClaudeAgents({ agents: [agent] }, "mbp")).toEqual(expected);
-  expect(() => parseClaudeAgents({ foo: 1 }, "mbp")).toThrow("Invalid Claude agents response");
+  const expected = [{ host: "peer1", harness: "claude", sessionId: "synthetic-s1", pid: 10, cwd: "/synthetic", name: "Test", detail: "idle" }];
+  expect(parseClaudeAgents([agent, { pid: 12 }], "peer1")).toEqual(expected);
+  expect(parseClaudeAgents({ agents: [agent] }, "peer1")).toEqual(expected);
+  expect(() => parseClaudeAgents({ foo: 1 }, "peer1")).toThrow("Invalid Claude agents response");
 });
 
 test("a failed Claude poll rejects instead of reporting an empty successful list", async () => {

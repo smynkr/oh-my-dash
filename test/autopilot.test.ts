@@ -602,12 +602,12 @@ describe("autopilot scheduler", () => {
       if (reviewed) f.store.markReviewed(decision.id,decidedAt+1);
       return decision;
     };
-    record("squad",f.clock.now);
-    record("rogue",f.clock.now+1,true);
+    record("stack",f.clock.now);
+    record("core",f.clock.now+1,true);
     record("other",f.clock.now+2,true);
-    expect(f.store.listDecisions({unreviewedOnly:true,limit:10}).map(decision => decision.project)).toEqual(["squad"]);
-    expect(f.store.listDecisions({projects:["squad","rogue"],limit:10}).map(decision => decision.project).sort())
-      .toEqual(["rogue","squad"]);
+    expect(f.store.listDecisions({unreviewedOnly:true,limit:10}).map(decision => decision.project)).toEqual(["stack"]);
+    expect(f.store.listDecisions({projects:["stack","core"],limit:10}).map(decision => decision.project).sort())
+      .toEqual(["core","stack"]);
   });
 
 

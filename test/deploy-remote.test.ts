@@ -58,7 +58,7 @@ describe("remote OMP environment", () => {
   test("creates missing zshenv.local with mode 600 and zshenv with mode 644", async () => {
     const file = join(scratch, ".zshenv.local");
     const zshenv = join(scratch, ".zshenv");
-    await updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "mbp", zshenv });
+    await updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "peer1", zshenv });
     expect(await (await stat(file)).mode & 0o777).toBe(0o600);
     expect(await (await stat(zshenv)).mode & 0o777).toBe(0o644);
   });
@@ -70,7 +70,7 @@ describe("remote OMP environment", () => {
     await writeFile(zshenv, bootstrap);
     const inode = (await stat(zshenv)).ino;
 
-    expect(await updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "mbp", zshenv })).toBe(true);
+    expect(await updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "peer1", zshenv })).toBe(true);
     expect(await readFile(zshenv, "utf8")).toBe(bootstrap);
     expect((await stat(zshenv)).ino).toBe(inode);
   });
@@ -81,7 +81,7 @@ describe("remote OMP environment", () => {
     const comment = "# source \"$HOME/.zshenv.local\"\n";
     await writeFile(zshenv, comment);
 
-    expect(await updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "mbp", zshenv })).toBe(true);
+    expect(await updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "peer1", zshenv })).toBe(true);
     const result = await readFile(zshenv, "utf8");
     expect(result).toContain(comment);
     expect(result.split("# >>> dash zshenv.local loader >>>")).toHaveLength(2);
@@ -104,7 +104,7 @@ describe("remote OMP environment", () => {
     const zshenv = join(scratch, ".zshenv");
     await symlink(target, file);
 
-    await expect(updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "mbp", zshenv }))
+    await expect(updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "peer1", zshenv }))
       .rejects.toThrow(`Dangling symlink at ${file}`);
     expect((await lstat(file)).isSymbolicLink()).toBe(true);
     await expect(stat(target)).rejects.toThrow();
@@ -117,7 +117,7 @@ describe("remote OMP environment", () => {
     const target = join(scratch, "missing-zshenv-target");
     await symlink(target, zshenv);
 
-    await expect(updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "mbp", zshenv }))
+    await expect(updateRemoteOmpEnv(file, { url: "https://hub.example/ingest/omp", host: "peer1", zshenv }))
       .rejects.toThrow(`Dangling symlink at ${zshenv}`);
     expect((await lstat(zshenv)).isSymbolicLink()).toBe(true);
     await expect(stat(target)).rejects.toThrow();
@@ -134,7 +134,7 @@ describe("remote OMP environment", () => {
       "--file", file,
       "--zshenv", zshenv,
       "--url", "https://hub.example/ingest/omp",
-      "--host", "mbp",
+      "--host", "peer1",
     ], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
@@ -144,7 +144,7 @@ describe("remote OMP environment", () => {
 
     expect(exitCode).toBe(0);
     expect(stdout + stderr).toContain(file);
-    expect(await readFile(file, "utf8")).toContain("export DASH_HOST='mbp'");
+    expect(await readFile(file, "utf8")).toContain("export DASH_HOST='peer1'");
     expect(await readFile(zshenv, "utf8")).toContain("# >>> dash zshenv.local loader >>>");
   });
 });

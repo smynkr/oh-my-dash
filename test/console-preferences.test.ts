@@ -81,7 +81,7 @@ test("GET works with replies disabled and saved views preserve literal labels th
   expect(renamed.status).toBe(200);
   expect(await renamed.json()).toEqual({ revision: 2, pins: [], views: [{ id, name: "Renamed", config: initialConfig }] });
 
-  const nextConfig = config({ project: "", account: "", status: "ended", ended: true });
+  const nextConfig = config({ project: "", account: "", harness: "agy", status: "ended", ended: true });
   const updated = await post({ action: "update", id, config: nextConfig });
   expect(await updated.json()).toEqual({ revision: 3, pins: [], views: [{ id, name: "Renamed", config: nextConfig }] });
   const noChange = await post({ action: "update", id, config: nextConfig });

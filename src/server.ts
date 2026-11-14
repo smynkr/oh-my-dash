@@ -6,9 +6,9 @@ import { createTelegram, type TelegramOptions } from "./telegram.ts";
 import { createReplies, cleanMessageText, MAX_MESSAGE_CHARS, messageTtlFromEnv, type AutopilotDelivery } from "./replies.ts";
 import { createJudge, type Judge } from "./judge.ts";
 import { createExtraction } from "./extraction.ts";
-import { normalizeClaude, normalizeOmp, normalizeCodex, normalizeAccountAlias, localHost, type EventKind, type Harness } from "./normalize.ts";
-import { scanBackfill, parseClaudeTranscript, findClaudeTranscript } from "./backfill.ts";
-import { parseClaudeAgents, pollClaudeAgents, pollOmpPresence, type LivenessRecord } from "./liveness.ts";
+import { normalizeClaude, normalizeOmp, normalizeCodex, normalizeAgy, normalizeAccountAlias, localHost, type EventKind, type Harness } from "./normalize.ts";
+import { scanBackfill, parseClaudeTranscript, findClaudeTranscript, parseAgyTranscript, findAgyTranscript } from "./backfill.ts";
+import { parseClaudeAgents, parseAgyAgents, pollClaudeAgents, pollOmpPresence, pollAgySessions, type LivenessRecord } from "./liveness.ts";
 import { resolveProject, ruleErrors, type ProjectRule } from "./projects.ts";
 import { sessionCapabilities, type SessionWithCapabilities } from "./capabilities.ts";
 import { applyConsolePreferencesAction, getConsolePreferences, type ConsolePreferences, type ConsolePreferencesActionResult } from "./console-preferences.ts";
@@ -85,6 +85,7 @@ export interface ServerOptions {
   port?: number; hostname?: string; tailnetPort?: number; dataPath?: string; backfill?: boolean; liveness?: boolean;
   pollClaude?: () => Promise<LivenessRecord[]>;
   pollOmp?: () => Promise<LivenessRecord[] | null>;
+  pollAgy?: () => Promise<LivenessRecord[] | null>;
   now?: () => number;
   telegram?: Partial<Omit<TelegramOptions, "db">>;
   judge?: { bin?: string; dataDir?: string; timeoutMs?: number };
@@ -122,7 +123,7 @@ function parseSearchOptions(params: URLSearchParams): SearchOptions | null {
   const repositoryHost = params.get("repositoryHost");
   const rawHarness = params.get("harness");
   const account = params.get("account");
-  if (rawHarness !== null && rawHarness !== "" && rawHarness !== "claude" && rawHarness !== "omp" && rawHarness !== "codex") return null;
+  if (rawHarness !== null && rawHarness !== "" && rawHarness !== "claude" && rawHarness !== "omp" && rawHarness !== "codex" && rawHarness !== "agy") return null;
   const rawHeadless = params.get("headless");
   const rawEnded = params.get("ended");
   if (rawHeadless !== null && rawHeadless !== "0" && rawHeadless !== "1") return null;
@@ -265,10 +266,10 @@ export function createDashServer(options: ServerOptions = {}) {
     replies?.observe(dto);
     autopilotController?.onSessionChange(dto,eventKind);
     if (dto.status === "needs_input" &&
-        !(dto.harness === "claude" && dto.pendingQuestionId &&
+        !((dto.harness === "claude" || dto.harness === "agy") && dto.pendingQuestionId &&
           hookRegistrationsInProgress.has(`${dto.key}\0${dto.pendingQuestionId}`)) &&
         (dto.harness === "omp" || dto.needsReason === "question") &&
-        (dto.harness !== "claude" || !autopilotDialogs.gate.enabled || !dto.pendingQuestionId ||
+        ((dto.harness !== "claude" && dto.harness !== "agy") || !autopilotDialogs.gate.enabled || !dto.pendingQuestionId ||
           !autopilotDialogs.hasRegisteredInvocation(dto.key,dto.pendingQuestionId)))
       autopilotController?.dialogReleased(dto);
     if (!emitSession(dto, force)) return;
@@ -470,6 +471,23 @@ export function createDashServer(options: ServerOptions = {}) {
         for (const dto of db.markLiveness("omp", omp, localHost())) send(dto);
       }
     } catch (error) { reportError("omp liveness", error); }
+    const defaultPollAgy = options.pollClaude || options.pollOmp ? async () => null : pollAgySessions;
+    try {
+      const agy = await (options.pollAgy ?? defaultPollAgy)();
+      if (Array.isArray(agy)) {
+        db.recordSourceReport(localHost(), now(), true);
+        emitSources();
+        for (const dto of db.markLiveness("agy", agy, localHost(), now(), () => false, true)) {
+          send(dto);
+          if (dto.host !== localHost()) continue;
+          if (!db.hasResponses(dto.host, dto.harness, dto.sessionId) && !backfillAttempted.has(dto.key)) {
+            backfillAttempted.add(dto.key);
+            const transcript = dto.transcriptPath ? parseAgyTranscript(dto.transcriptPath) : await findAgyTranscript(dto.sessionId);
+            if (transcript) send(db.addBackfill(transcript));
+          }
+        }
+      }
+    } catch (error) { reportError("agy liveness", error); }
   }
   const backfillAttempted = new Set<string>();
   const configuredTailnetPort = process.env.DASH_TAILNET_PORT?.trim();
@@ -486,7 +504,8 @@ export function createDashServer(options: ServerOptions = {}) {
     const url = new URL(request.url);
     const path = url.pathname;
     const ingestPath = path.startsWith("/ingest/");
-    const ingest = request.method === "POST" && (path === "/ingest/claude" || path === "/ingest/omp" || path === "/ingest/liveness/claude" ||
+    const ingest = request.method === "POST" && (path === "/ingest/claude" || path === "/ingest/omp" || path === "/ingest/agy" ||
+      path === "/ingest/liveness/claude" || path === "/ingest/liveness/agy" ||
       (codexEnabled && (path === "/ingest/codex" || path === "/ingest/liveness/codex")));
     const loopbackHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`]);
     const extraHosts = new Set((process.env.DASH_ALLOWED_HOSTS ?? "").split(",").map(h => h.trim().toLowerCase()).filter(Boolean));
@@ -560,8 +579,13 @@ export function createDashServer(options: ServerOptions = {}) {
         (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer))))
         return json({ error:"forbidden" },403);
       const host = listener === "loopback" ? localHost() : label!;
-      const sessionKeyFor = (session: string) => `${host}|claude|${session}`;
+      const rawQHarness = request.headers.get("X-Dash-Harness");
+      if (rawQHarness !== null && rawQHarness !== "claude" && rawQHarness !== "agy")
+        return json({ error:"bad request" },400);
+      const qHarness: "claude" | "agy" = rawQHarness === "agy" ? "agy" : "claude";
+      const sessionKeyFor = (session: string) => `${host}|${qHarness}|${session}`;
       if (path === "/hook/ask" && request.method === "POST") {
+        if (qHarness !== "claude") return json({ error:"bad request" },400);
         if (!jsonContentType(request.headers.get("content-type"))) return json({ error:"unsupported media type" },415);
         const body = await boundedJson(request) as Record<string,unknown> | null;
         const allowedFields = ["action","toolName","sessionId","toolUseId","invocationId","questions","hook_deadline_ms"];
@@ -612,17 +636,30 @@ export function createDashServer(options: ServerOptions = {}) {
       if (path === "/question/register" && request.method === "POST") {
         if (!jsonContentType(request.headers.get("content-type"))) return json({ error:"unsupported media type" },415);
         const body = await boundedJson(request) as Record<string, unknown> | null;
-        if (!body || Object.keys(body).some(field =>
-          !["sessionId","toolUseId","invocationId","questions","timeoutMs"].includes(field)) ||
+        const allowedRegisterFields = qHarness === "agy"
+          ? ["sessionId","toolUseId","invocationId","questions","timeoutMs","cwd","title","transcriptPath"]
+          : ["sessionId","toolUseId","invocationId","questions","timeoutMs"];
+        if (!body || Object.keys(body).some(field => !allowedRegisterFields.includes(field)) ||
           typeof body.sessionId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.sessionId) ||
           typeof body.toolUseId !== "string" || !/^[A-Za-z0-9_-]{1,256}$/.test(body.toolUseId) ||
           typeof body.invocationId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(body.invocationId) ||
-          !Array.isArray(body.questions) || !Number.isSafeInteger(body.timeoutMs))
+          !Array.isArray(body.questions) || !Number.isSafeInteger(body.timeoutMs) ||
+          (body.cwd !== undefined && typeof body.cwd !== "string") ||
+          (body.title !== undefined && typeof body.title !== "string") ||
+          (body.transcriptPath !== undefined && typeof body.transcriptPath !== "string"))
           return json({ error:"bad request" },400);
-        const event = normalizeClaude({
-          session_id:body.sessionId,hook_event_name:"PreToolUse",tool_name:"AskUserQuestion",
-          tool_use_id:body.toolUseId,tool_input:{ questions:body.questions },
-        },request.headers,now());
+        const event = qHarness === "agy"
+          ? normalizeAgy({
+              session_id:body.sessionId,hook_event_name:"PreToolUse",tool_name:"ask_question",
+              tool_use_id:body.toolUseId,tool_input:{ questions:body.questions },
+              ...(typeof body.cwd === "string" ? { cwd:body.cwd } : {}),
+              ...(typeof body.title === "string" ? { title:body.title } : {}),
+              ...(typeof body.transcriptPath === "string" ? { transcript_path:body.transcriptPath } : {}),
+            },request.headers,now())
+          : normalizeClaude({
+              session_id:body.sessionId,hook_event_name:"PreToolUse",tool_name:"AskUserQuestion",
+              tool_use_id:body.toolUseId,tool_input:{ questions:body.questions },
+            },request.headers,now());
         if (!event) return json({ error:"invalid question" },400);
         const result = replies.registerQuestion({ event, id:body.invocationId, toolUseId:body.toolUseId,
           timeoutMs:Math.min(Number(body.timeoutMs),600_000) });
@@ -674,7 +711,7 @@ export function createDashServer(options: ServerOptions = {}) {
       }
       return json({ error:"not found" },404);
     }
-    if (path === "/reply/wait/claude" || path === "/reply/wait/omp" || path === "/reply/wait/codex" || path === "/reply/ack" || path === "/reply/commit") {
+    if (path === "/reply/wait/claude" || path === "/reply/wait/omp" || path === "/reply/wait/codex" || path === "/reply/wait/agy" || path === "/reply/ack" || path === "/reply/commit") {
       if (!replies) return json({ error: "not found" }, 404);
       if (request.method === "GET" && path.startsWith("/reply/wait/")) {
         if (["session", "waiter", "started", "wait", "commit"].some(name => url.searchParams.getAll(name).length > 1)) return json({ error: "bad request" }, 400);
@@ -682,13 +719,16 @@ export function createDashServer(options: ServerOptions = {}) {
         const rawStarted = url.searchParams.get("started"), rawWait = url.searchParams.get("wait");
         const rawCommit = url.searchParams.get("commit");
         const waitSec = rawWait === null ? 50 : Number(rawWait);
+        const isAgyWait = path.endsWith("agy");
+        const minWait = isAgyWait ? 0 : 1;
         if (!session || !/^[A-Za-z0-9_-]{1,128}$/.test(session) || !waiter || !/^[A-Za-z0-9_-]{8,64}$/.test(waiter) ||
           !rawStarted || !/^-?\d+$/.test(rawStarted) || !Number.isSafeInteger(Number(rawStarted)) ||
-          (rawWait !== null && !/^\d+$/.test(rawWait)) || !Number.isInteger(waitSec) || waitSec < 1 || waitSec > 55 ||
+          (rawWait !== null && !/^\d+$/.test(rawWait)) || !Number.isInteger(waitSec) || waitSec < minWait || waitSec > 55 ||
           (rawCommit !== null && (path.endsWith("claude") || rawCommit !== "1")) ||
+          (isAgyWait && rawCommit !== "1") ||
           (path.endsWith("codex") && (!codexEnabled || rawCommit !== "1"))) return json({ error: "bad request" }, 400);
         const label = request.headers.get("X-Dash-Host");
-        const harness = path.endsWith("claude") ? "claude" : path.endsWith("codex") ? "codex" : "omp";
+        const harness = path.endsWith("claude") ? "claude" : path.endsWith("codex") ? "codex" : path.endsWith("agy") ? "agy" : "omp";
         const host = listener === "loopback" && harness !== "codex" ? localHost() : label ?? localHost();
         const key = `${host}|${harness}|${session}`;
         const targetSessionHost = harness === "codex" ? db.getSession(key)?.host : undefined;
@@ -700,11 +740,14 @@ export function createDashServer(options: ServerOptions = {}) {
           (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer))))
           return json({ error: "forbidden" }, 403);
         disableTimeout();
+        const leasePeer = listener === "loopback" ? "loopback" : peer;
         const result = harness === "claude"
           ? await replies.waitClaude(key, waiter, Number(rawStarted), waitSec * 1000, request.signal)
           : harness === "codex"
-            ? await replies.waitCodex(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, listener === "loopback" ? "loopback" : peer)
-            : await replies.waitOmp(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, rawCommit === "1", listener === "loopback" ? "loopback" : peer);
+            ? await replies.waitCodex(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, leasePeer)
+            : harness === "agy"
+              ? await replies.waitAgy(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, leasePeer)
+              : await replies.waitOmp(key, waiter, Number(rawStarted), waitSec * 1000, request.signal, rawCommit === "1", leasePeer);
         if (result.status !== 200) return new Response(null, { status: result.status, headers: headers() });
         if (harness === "codex" &&
             (typeof result.reply !== "object" || result.reply === null || result.reply.target !== key))
@@ -736,14 +779,19 @@ export function createDashServer(options: ServerOptions = {}) {
           : (!hostLabel(label) || label === localHost() || (peers.get(peer) !== "*" && label !== peers.get(peer)) ||
             (reply && !reply.sessionKey.startsWith(`${label}|`)))) return json({ error: "forbidden" }, 403);
         const leasePeer = listener === "loopback" ? "loopback" : peer;
+        const isAgy = !!reply && reply.sessionKey.split("|")[1] === "agy";
         if (path === "/reply/commit") return (codexControl
           ? replies.commitCodex(Number(body.id), body.waiter, body.target as string, leasePeer)
-          : replies.commitOmp(Number(body.id), body.waiter, leasePeer))
+          : isAgy
+            ? replies.commitAgy(Number(body.id), body.waiter, leasePeer)
+            : replies.commitOmp(Number(body.id), body.waiter, leasePeer))
           ? json({ ok: true }) : json({ error: "not deliverable" }, 409);
         return (codexControl
           ? replies.ackCodex(Number(body.id), body.waiter, body.outcome as "accepted" | "unsupported" | "failed" | "unknown",
             body.target as string, typeof body.reason === "string" ? body.reason : undefined, leasePeer)
-          : replies.ackOmp(Number(body.id), body.waiter, body.outcome as "sent" | "deferred", leasePeer))
+          : isAgy
+            ? replies.ackAgy(Number(body.id), body.waiter, body.outcome as "sent" | "deferred", leasePeer)
+            : replies.ackOmp(Number(body.id), body.waiter, body.outcome as "sent" | "deferred", leasePeer))
           ? json({ ok: true }) : json({ error: "not found" }, 404);
       }
       return json({ error: "not found" }, 404);
@@ -758,15 +806,16 @@ export function createDashServer(options: ServerOptions = {}) {
         if (boundLabel && boundLabel !== "*" && (path === "/ingest/omp"
           ? (body as Record<string, unknown> | null)?.host !== boundLabel
           : request.headers.get("X-Dash-Host") !== boundLabel)) { rejected++; return ack(); }
-        if (path === "/ingest/liveness/claude") {
+        if (path === "/ingest/liveness/claude" || path === "/ingest/liveness/agy") {
+          const livenessHarness = path.endsWith("agy") ? "agy" : "claude";
           const remoteHost = (request.headers.get("x-dash-host") ?? "").split(".")[0];
           if (!/^[A-Za-z0-9_-]{1,64}$/.test(remoteHost)) { malformed++; return ack(); }
           if (remoteHost === localHost()) { rejected++; return ack(); }
-          const records = parseClaudeAgents(body, remoteHost);
+          const records = livenessHarness === "agy" ? parseAgyAgents(body, remoteHost) : parseClaudeAgents(body, remoteHost);
           const acceptedAt = now();
           db.recordSourceReport(remoteHost, acceptedAt, true);
           emitSources();
-          for (const dto of db.markLiveness("claude", records, remoteHost, acceptedAt, () => false, true)) send(dto);
+          for (const dto of db.markLiveness(livenessHarness, records, remoteHost, acceptedAt, () => false, true)) send(dto);
           lastRemoteLiveness.set(remoteHost, acceptedAt);
           return ack();
         }
@@ -805,6 +854,7 @@ export function createDashServer(options: ServerOptions = {}) {
         const eventId = path === "/ingest/codex" ? request.headers.get("X-Dash-Event-Id") : null;
         if (eventId !== null && !/^[0-9a-f]{64}$/.test(eventId)) { malformed++; return ack(); }
         const event = path.endsWith("claude") ? normalizeClaude(body, request.headers, receivedAt) :
+          path.endsWith("agy") ? normalizeAgy(body, request.headers, receivedAt) :
           path.endsWith("codex") ? normalizeCodex(body, request.headers, receivedAt) : normalizeOmp(body, receivedAt);
         if (event) {
           const dto = db.applyEvent(event, eventId ?? undefined, receivedAt);
@@ -1207,7 +1257,7 @@ export function createDashServer(options: ServerOptions = {}) {
         return json({ error:"bad request" },400);
       const invocation = db.getQuestionInvocation(body.questionId,key);
       const session = db.getSession(key);
-      if (!invocation || invocation.state !== "pending" || !session || session.harness !== "claude" ||
+      if (!invocation || invocation.state !== "pending" || !session || (session.harness !== "claude" && session.harness !== "agy") ||
           session.status !== "needs_input" || session.needsReason !== "question" ||
           session.pendingQuestionId !== body.questionId)
         return json({ error:"stale question" },409);

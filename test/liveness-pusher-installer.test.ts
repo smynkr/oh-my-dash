@@ -3,7 +3,7 @@ import { buildPlist, buildScript, install, parseArgs, type Args } from "../scrip
 
 const makeArgs = (extra: string[] = []) => parseArgs([
   "--url", "https://hub.example.ts.net:4778/ingest/liveness/claude",
-  "--host", "synthetic-mbp",
+  "--host", "synthetic-peer",
   "--claude-bin", "/synthetic/bin/claude",
   "--plist", "/private/tmp/synthetic-liveness-push.plist",
   ...extra,
@@ -15,7 +15,7 @@ describe("liveness pusher installer", () => {
     const calls: string[] = [];
     const output = await install(args, async (cmd, argv) => { calls.push(`${cmd} ${argv.join(" ")}`); });
     expect(output).toContain("https://hub.example.ts.net:4778/ingest/liveness/claude");
-    expect(output).toContain("X-Dash-Host: synthetic-mbp");
+    expect(output).toContain("X-Dash-Host: synthetic-peer");
     expect(output).toContain("/synthetic/bin/claude");
     expect(output).toContain("<key>StartInterval</key><integer>45</integer>");
     expect(output).toContain("&amp;&amp;");

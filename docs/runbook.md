@@ -111,7 +111,7 @@ For an application rollback, keep the known-good Git commit and database backup.
 
 ## Dashboard console
 
-The default view is **Console**: a table of sessions with state, project, session name, machine, account, harness and activity age, plus a reading and reply pane that switches between **Selected session** and a consolidated chronological **Timeline (all clients)** across all connected clients, alongside the open-by-default **Client output timeline** section below the console table. **Feed** (`#view=sessions`) and full-page **Timeline** (`#view=timeline`) remain alternate views and persist in the URL hash across reloads. Headless and ended sessions stay hidden until you enable **Show headless** or **Show ended**.
+The default view is **Console**: a table of sessions with state, project, session name, machine, account, harness and activity age, plus a resizable reading and reply pane (drag the divider or press `w` for **Wide reader**) that switches between **Selected session** and a consolidated chronological **Timeline (all clients)** across all connected clients, alongside the collapsed-by-default **Client output timeline** section below the console table. Toggle **Quiet hints** in the top bar to hide repetitive helper disclaimers while preserving critical warnings and ARIA labels, or open **Triage** (`t`) to inspect Needs you, Errors, and Unread sessions grouped by project. **Feed** (`#view=sessions`) and full-page **Timeline** (`#view=timeline`) remain alternate views and persist in the URL hash across reloads. Headless and ended sessions stay hidden until you enable **Show headless** or **Show ended**.
 
 Selecting a session (either from the table or by clicking a session name in any timeline item) switches the Console reading pane to **Selected session** and opens its first unread retained response, or the latest output when nothing is unread. The reply composer is locked to that session. Filters, row changes and live events never retarget it or replace a draft. **Show latest** returns from history to current output.
 
@@ -132,11 +132,11 @@ Selecting a session (either from the table or by clicking a session name in any 
 
 ### Search, pins and views
 
-- **Search** in the session list matches names, IDs, projects, machines, account aliases, harnesses and working-directory paths. It does not search response text.
+- **Search** in the session list matches names, IDs, projects, machines, account aliases, harnesses and working-directory paths. It does not search response text; use **Search in outputs** beside the search box (or in empty filter states) to bridge the query directly into retained output search.
 - **Search outputs** searches retained response text and identity metadata as a literal, case-insensitive phrase, 25 results per page. Its project, machine, account and harness filters apply to output results; session-list search does not.
 - Pins hold immutable session keys in a shared working set. A pin for a session that no longer exists stays visible as missing and never resolves to another session with a similar name.
 - Named views save search, filters, visibility, grouping, density and columns. Applying a view does not change the selected session or its draft. The collector stores up to 100 views and 1,000 pins; attempts beyond those limits show an error rather than truncating silently.
-- Keyboard shortcuts: `/` focuses session search; `j` and `k`, or the arrow keys while a row is focused, move through visible rows; `r` focuses the reply composer without sending; `?` opens shortcut help; Ctrl or Cmd+K opens **Commands** (including **Show all client outputs in Console pane** and **Show selected session in Console pane**). Shortcuts do not fire while typing in a field. No command sends a reply, chooses a decision option or grants authorization.
+- Keyboard shortcuts: `/` focuses session search; `j` and `k`, or the arrow keys while a row is focused, move through visible rows; `r` focuses the reply composer without sending; `t` opens or closes **Triage**; `w` toggles **Wide reader**; `?` opens shortcut help; Ctrl or Cmd+K opens **Commands** (including **Show all client outputs in Console pane** and **Show selected session in Console pane**). Shortcuts do not fire while typing in a field. No command sends a reply, chooses a decision option or grants authorization.
 
 ### Sources and session controls
 
@@ -204,6 +204,7 @@ Collector flags live in `EnvironmentVariables` in the collector plist. Codex sou
 | `DASH_PORT` | Local loopback port; default `4777`. |
 | `DASH_DATA` | Private directory for SQLite and judge scratch data; template default is the checkout's `data/`. |
 | `DASH_BACKFILL_HOURS` | Transcript backfill window; default `12` hours. |
+| `DASH_AGY_HOME` | Optional colon-separated Antigravity data roots for backfill and local liveness; defaults to `~/.gemini/antigravity-cli:~/.gemini/antigravity:~/.gemini/antigravity-ide`. |
 | `DASH_TELEGRAM=1` | Enables optional Telegram alerts. The bot token is read from the logged-in user's Keychain. |
 | `DASH_REPLIES=1` | Enables the collector's reply broker, dashboard and Telegram replies, decision cards, new messages and Ideas inbox. Codex turn controls also require this flag in the source runner. |
 | `DASH_CODEX=1` | Enables Codex event/liveness intake and control support on the collector; off by default. Set it in the source runner too to start the adapter. |
@@ -329,7 +330,24 @@ Decision cards use the same `DASH_REPLIES=1` flag. With it unset, nothing is ext
 
 To roll back, clear `DASH_REPLIES` and reload the collector. The additive columns and the card table remain. Set `DASH_JUDGE=1` only after the canary in [Optional decision extraction](#optional-decision-extraction) passes.
 
-### Per-session autopilot and Claude dialogs (AXI-241)
+### Antigravity (agy) plugin and liveness
+
+Antigravity (`agy`) visibility works automatically via local transcript backfill (`~/.gemini/antigravity-cli`, `~/.gemini/antigravity`, `~/.gemini/antigravity-ide`, or colon-separated `DASH_AGY_HOME`) and local `presence/<id>.lock` non-blocking `fcntl.flock` liveness polling every 15 seconds. Subagent conversations (`nesting_depth > 0` or non-empty `parent_conversation_id`) and killed conversations are excluded, and truncated responses in `transcript.jsonl` are resolved from `transcript_full.jsonl` by `step_index`.
+
+To enable live lifecycle hook events (`SessionStart`, `PreInvocation`, `Stop`), queued reply delivery, and optional remote `ask_question` answering, install the managed Antigravity plugin:
+
+```sh
+cd "$HOME/.local/share/dash"
+bun run scripts/install-agy-plugin.ts --target "$HOME/.gemini/config/plugins/dash" --dry-run
+bun run scripts/install-agy-plugin.ts --target "$HOME/.gemini/config/plugins/dash"
+```
+
+- **Queued replies:** When `DASH_REPLIES=1` is enabled on the collector, `PreInvocation` (`invocationNum <= 1`) commits queued replies via `GET /reply/wait/agy?commit=1` + `POST /reply/commit` + `POST /reply/ack` and injects them via `injectSteps`; `Stop` (`terminationReason == "NO_TOOL_CALL"`) posts `/ingest/agy`, polls `/reply/wait/agy` for up to `--stop-wait` seconds (0–55, default 5), and returns `{"decision": "continue", "reason": ...}` when an owner reply arrives.
+- **Remote `ask_question` opt-in:** Add `--remote-questions` (and optional `--question-timeout-sec 120`, range 5–600) to intercept `ask_question` tool calls (`"matcher": "ask_question"` on `PreToolUse` and `PostToolUse`, never `"*"`) and answer them from the dashboard or paired Telegram bot, or click **Release to terminal** to return control to Antigravity's terminal prompt.
+- **Remote machines:** Pass `--url "https://hub.example.ts.net:4777/ingest/agy" --reply-base "https://hub.example.ts.net:4777" --host "peer-label"` matching the device's bound label in `DASH_ALLOWED_PEERS`. Remote liveness helpers can post `{"agents":[...]}` to `POST /ingest/liveness/agy` with `X-Dash-Host: peer-label`.
+- **Rollback:** Run `bun run scripts/install-agy-plugin.ts --target "$HOME/.gemini/config/plugins/dash" --uninstall`. The installer checks `.dash-managed` and refuses to overwrite or delete unmanaged non-empty directories or symlink targets.
+
+### Per-session autopilot and Claude dialogs
 
 All autopilot actions are inert by default. Runtime automation requires `DASH_AUTOPILOT=1`, `DASH_REPLIES=1`, and the persisted `settings.autopilot.enabled` master switch; the stored switch starts OFF and the environment flag alone cannot turn it on. Owners create, edit, pause, resume and stop per-session goals in the dashboard or paired Telegram controls. Goals expire after 8 hours by default and cannot be extended beyond 24 hours from create/edit.
 

@@ -353,8 +353,8 @@ test("project rules are cached, malformed settings fall back safely, and flag-of
   try {
     expect(db.getSetting("projects.rules")).toBeTruthy();
 
-    db.applyEvent(event("session", "/projects/invest/task"));
-    expect(db.getSession(sessionKey)?.project).toBe("invest");
+    db.applyEvent(event("session", "/projects/billing/task"));
+    expect(db.getSession(sessionKey)?.project).toBe("billing");
 
     const custom = [{ pattern: "^/custom/([^/]+)", project: "$1" }];
     db.setSetting("projects.rules", JSON.stringify(custom));

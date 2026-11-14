@@ -1,0 +1,49 @@
+{
+  "dash": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./dash-agy-hook.py",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./dash-agy-hook.py",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "ask_question",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./dash-agy-hook.py",
+            "timeout": 125
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "ask_question",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./dash-agy-hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./dash-agy-hook.py",
+        "timeout": 15
+      }
+    ]
+  }
+}

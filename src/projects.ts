@@ -8,6 +8,7 @@ export const SEED_PROJECT_RULES: readonly ProjectRule[] = Object.freeze([
   Object.freeze({ pattern: "/example-api(/|$)", project: "example" }),
   Object.freeze({ pattern: "/\\.example-triage(/|$)", project: "example" }),
   Object.freeze({ pattern: "^/Volumes/ExampleData/tmp/([a-z0-9]+)[-_]", project: "$1" }),
+  Object.freeze({ pattern: "/Documents/GitHub/([^/]+)", project: "$1" }),
   Object.freeze({ pattern: "/Documents/([^/]+)", project: "$1" }),
   Object.freeze({ pattern: "/(?:Documents|projects|Code|workspaces)/([^/]+)(?:/|$)", project: "$1" }),
 ]);

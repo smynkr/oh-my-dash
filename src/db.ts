@@ -1,8 +1,8 @@
 import { Buffer } from "node:buffer";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, basename } from "node:path";
+import { mkdirSync, readFileSync } from "node:fs";
+import { dirname, basename, join } from "node:path";
 import type { AskQuestion, NormalizedEvent, Harness, PendingQuestion, CodexAction, CodexControlInfo } from "./normalize.ts";
 import { clip, describePrompt, sessionKey, normalizeQuestions } from "./normalize.ts";
 import { reduceLiveness, reduceState, type SessionState, type Status } from "./state.ts";
@@ -408,8 +408,15 @@ export class DashDB {
     if (!alertColumns.has("content")) this.sqlite.exec("ALTER TABLE tg_alerts ADD COLUMN content TEXT");
     this.lastResponseTs = n((this.sqlite.query("SELECT MAX(ts) AS ts FROM responses").get() as Row)?.ts);
     const storedRules = this.getSetting("projects.rules");
-    this.refreshProjectRules(storedRules);
-    if (this.topicsEnabled && storedRules === undefined) this.setSetting("projects.rules", JSON.stringify(SEED_PROJECT_RULES));
+    let initialSeed: readonly ProjectRule[] = SEED_PROJECT_RULES;
+    if (storedRules === undefined && path !== ":memory:") {
+      try {
+        const localSeed = JSON.parse(readFileSync(join(dirname(path), "project-rules.seed.json"), "utf8"));
+        if (isProjectRuleArray(localSeed) && ruleErrors(localSeed).length === 0) initialSeed = localSeed;
+      } catch { /* optional local seed file */ }
+    }
+    this.refreshProjectRules(storedRules ?? JSON.stringify(initialSeed));
+    if (this.topicsEnabled && storedRules === undefined) this.setSetting("projects.rules", JSON.stringify(initialSeed));
   }
   close() { this.sqlite.close(); }
   getSetting(key: string): string | undefined {
@@ -604,7 +611,7 @@ export class DashDB {
       .get(now - 60 * 60_000,now,exceptId,now) as Row;
     return n(row.count) >= AUTOPILOT_GLOBAL_REPLY_RATE_LIMIT;
   }
-  private takeQueued(key: string, id: number, turnSeq: number, now: number, mode: "claude"|"omp"|"codex", waiterId?: string,
+  private takeQueued(key: string, id: number, turnSeq: number, now: number, mode: "claude"|"omp"|"codex"|"agy", waiterId?: string,
     commitCapable = false): ReplyTakeResult {
     return this.sqlite.transaction(() => {
       const row = this.sqlite.query(`SELECT r.*,s.turn_seq,s.status AS session_status,s.needs_reason,s.pending_question_id,s.harness AS session_harness,
@@ -640,9 +647,11 @@ export class DashDB {
         : mode === "omp"
           ? String(row.session_harness) === "omp" && (bound ? status === "your_turn" :
             status === "working" || status === "your_turn" || status === "needs_input" && ["question","waiting"].includes(String(row.needs_reason)))
-          : String(row.session_harness) === "codex" && String(row.session_status) !== "ended" &&
-            (bool(row.codex_app_server_owned) || row.codex_action === "turn/start" && bool(row.codex_turn_start));
-      if (!deliverable || mode === "omp" && waiterId !== undefined && !commitCapable && row.source === "autopilot")
+          : mode === "agy"
+            ? String(row.session_harness) === "agy" && (bound ? status === "your_turn" : status === "working" || status === "your_turn")
+            : String(row.session_harness) === "codex" && String(row.session_status) !== "ended" &&
+              (bool(row.codex_app_server_owned) || row.codex_action === "turn/start" && bool(row.codex_turn_start));
+      if (!deliverable || (mode === "omp" || mode === "agy") && waiterId !== undefined && !commitCapable && row.source === "autopilot")
         return { kind:"not_ready" } as const;
       if (row.source === "autopilot" && this.autopilotReplyRateLimitReached(id,now)) return { kind:"not_ready" } as const;
       const copy = this.reply(row)!;
@@ -666,8 +675,38 @@ export class DashDB {
   leaseQueuedForOmp(key: string, id: number, waiterId: string, turnSeq: number, now: number, commitCapable = false): ReplyTakeResult {
     return this.takeQueued(key,id,turnSeq,now,"omp",waiterId,commitCapable);
   }
+  leaseQueuedForAgy(key: string, id: number, waiterId: string, turnSeq: number, now: number, commitCapable = true): ReplyTakeResult {
+    return this.takeQueued(key,id,turnSeq,now,"agy",waiterId,commitCapable);
+  }
   leaseQueuedForCodex(key: string, id: number, waiterId: string, now: number, commitCapable = false): ReplyTakeResult {
     return this.takeQueued(key,id,0,now,"codex",waiterId,commitCapable);
+  }
+  commitAgy(id: number, _waiterId: string, now: number): ReplyCommitResult {
+    return this.sqlite.transaction(() => {
+      const row = this.sqlite.query(`SELECT r.*,s.turn_seq,s.status AS session_status,s.needs_reason,s.pending_question_id,s.harness AS session_harness
+        FROM replies r JOIN sessions s ON s.key=r.session_key WHERE r.id=?`).get(id) as Row | null;
+      if (!row) return { ok:false,reason:"not_found" } as const;
+      if (row.state !== "leased" || row.lease_until == null || n(row.lease_until) <= now) return { ok:false,reason:"not_leased" } as const;
+      if (!bool(row.lease_commit)) return { ok:false,reason:"not_commit_capable" } as const;
+      const status = String(row.session_status);
+      const deliverable = String(row.session_harness) === "agy" &&
+        (row.answers_turn != null ? status === "your_turn" : status === "working" || status === "your_turn");
+      const stale = row.answers_turn != null && n(row.answers_turn) !== n(row.turn_seq);
+      if (row.committed_at != null) return !stale && deliverable ? { ok:true } as const : { ok:false,reason:"not_ready" } as const;
+      if (row.source === "autopilot" && this.autopilotReplyRateLimitReached(id,now))
+        return { ok:false,reason:"not_ready" } as const;
+      if (stale) {
+        return { ok:false,reason:"stale",reply:this.finishReply(row,"cancelled",now,"stale") } as const;
+      }
+      if (!deliverable) {
+        this.sqlite.query(`UPDATE replies SET state='queued',lease_until=NULL,lease_commit=NULL,committed_at=NULL
+          WHERE id=? AND state='leased' AND committed_at IS NULL`).run(id);
+        return { ok:false,reason:"not_ready" } as const;
+      }
+      const changes = this.sqlite.query(`UPDATE replies SET committed_at=? WHERE id=? AND state='leased'
+        AND lease_until>? AND lease_commit=1 AND committed_at IS NULL`).run(now,id,now).changes;
+      return changes < 1 ? { ok:false,reason:"not_leased" } as const : { ok:true } as const;
+    })();
   }
   commitOmp(id: number, _waiterId: string, now: number): ReplyCommitResult {
     return this.sqlite.transaction(() => {
@@ -1165,7 +1204,7 @@ export class DashDB {
     if (result === "expired") this.finishQuestion(id,key,toolUseId,now,"expired","expired");
     if (result === "accepted") {
       const dto = this.getSession(key);
-      if (dto) this.applyEvent({ host:dto.host,harness:"claude",sessionId:dto.sessionId,kind:"question_answered",
+      if (dto) this.applyEvent({ host:dto.host,harness:dto.harness,sessionId:dto.sessionId,kind:"question_answered",
         ts:now,interactive:dto.interactive,cwd:dto.cwd,title:dto.title,transcriptPath:dto.transcriptPath,
         sessionKind:dto.sessionKind,questionIdentity:id,toolUseId });
     }
@@ -1283,7 +1322,7 @@ export class DashDB {
   }
   applyEvent(event: NormalizedEvent, eventId?: string, receivedAt = Date.now()): SessionDTO {
     const key = sessionKey(event);
-    const invocation = event.harness === "claude" && event.toolUseId ? this.questionForToolUse(key,event.toolUseId) : undefined;
+    const invocation = (event.harness === "claude" || event.harness === "agy") && event.toolUseId ? this.questionForToolUse(key,event.toolUseId) : undefined;
     const current = invocation ? { ...event, questionIdentity: invocation.id } : event;
     this.sqlite.transaction(() => {
       const row = this.ensure(current);
@@ -1474,7 +1513,7 @@ export class DashDB {
     if (row.status !== "needs_input" || row.needs_reason !== "question") return undefined;
     const id = s(row.pending_question_id), key = String(row.key);
     if (!id) return undefined;
-    if (row.harness === "claude") {
+    if (row.harness === "claude" || row.harness === "agy") {
       const invocation = this.getQuestionInvocation(id,key);
       return invocation?.state === "pending" && invocation.expiresAt > Date.now()
         ? { id, questions: invocation.questions } : undefined;
@@ -1706,7 +1745,7 @@ export class DashDB {
         status: row.status as Status, needsReason: s(row.needs_reason), needsText: s(row.needs_text),
         lastActivity: n(row.last_activity),
       };
-      const next = harness === "claude" ? reduceLiveness(state, record.detail, now, row.last_hook_event_ts == null ? undefined : n(row.last_hook_event_ts)) : state;
+      const next = (harness === "claude" || harness === "agy") ? reduceLiveness(state, record.detail, now, row.last_hook_event_ts == null ? undefined : n(row.last_hook_event_ts)) : state;
       this.sqlite.query(`UPDATE sessions SET alive=1,pid=?,display_name=COALESCE(?,display_name),cwd=COALESCE(?,cwd),
         status=?,needs_reason=?,needs_text=?,dead_since=NULL,last_liveness_status=COALESCE(?,last_liveness_status) WHERE key=?`)
         .run(value(record.pid), value(record.name), value(record.cwd), next.status, value(next.needsReason), value(next.needsText), value(record.detail), key);
@@ -1725,13 +1764,14 @@ export class DashDB {
       changed.push(this.getSession(key)!);
     }
     if (harness === "claude") changed.push(...this.sweepDeadClaude(host, now, pidAlive, missingPidDead));
+    if (harness === "agy") changed.push(...this.sweepDeadAgy(host, now, pidAlive, missingPidDead));
     return changed;
   }
-  sweepDeadClaude(host: string, now = Date.now(), pidAlive: (pid: number) => boolean = (pid) => {
+  private sweepDeadByHarness(harness: "claude" | "agy", host: string, now = Date.now(), pidAlive: (pid: number) => boolean = (pid) => {
     try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
   }, missingPidDead = false): SessionDTO[] {
     const changed: SessionDTO[] = [];
-    const stale = this.sqlite.query("SELECT key,pid,last_activity,dead_since FROM sessions WHERE host=? AND harness='claude' AND alive=0 AND status!='ended'").all(host) as Row[];
+    const stale = this.sqlite.query("SELECT key,pid,last_activity,dead_since FROM sessions WHERE host=? AND harness=? AND alive=0 AND status!='ended'").all(host, harness) as Row[];
     for (const row of stale) {
       const key = String(row.key);
       const dead = row.pid == null ? missingPidDead : !pidAlive(n(row.pid));
@@ -1743,5 +1783,11 @@ export class DashDB {
       }
     }
     return changed;
+  }
+  sweepDeadClaude(host: string, now = Date.now(), pidAlive?: (pid: number) => boolean, missingPidDead = false): SessionDTO[] {
+    return this.sweepDeadByHarness("claude", host, now, pidAlive, missingPidDead);
+  }
+  sweepDeadAgy(host: string, now = Date.now(), pidAlive?: (pid: number) => boolean, missingPidDead = false): SessionDTO[] {
+    return this.sweepDeadByHarness("agy", host, now, pidAlive, missingPidDead);
   }
 }

@@ -21,12 +21,13 @@ async function repo(files: Record<string, string>): Promise<string> {
 const pkg = (extra: Record<string, unknown>) => JSON.stringify({ name: "x", private: true, type: "module", ...extra }, null, 2) + "\n";
 
 test("exports code paths, keeps the public identity and public-owned docs, and deletes files removed in dash", async () => {
-  const dash = await repo({ ".export-deny": "secret-host\n", "src/a.ts": "export const a = 1;\n", "docs/spec/private.md": "private\n",
+  const dash = await repo({ ".export-deny": "secret-host\n", "src/a.ts": "export const a = 1;\n", "agy-plugin/plugin.json": "{\"name\":\"dash\"}\n", "docs/spec/private.md": "private\n",
     "README.md": "dash readme\n", "package.json": pkg({ name: "dash-private", repository: "private/dash", dependencies: { y: "1" } }) });
   const omd = await repo({ "src/a.ts": "old\n", "src/gone.ts": "stale\n", "README.md": "public readme\n", "LICENSE": "MIT\n",
     "package.json": pkg({ name: "oh-my-dash", license: "MIT", version: "0.1.0" }) });
   const changed = await exportPublic({ ...parseArgs(["--target", omd]), repo: dash });
   expect(await readFile(join(omd, "src/a.ts"), "utf8")).toBe("export const a = 1;\n");
+  expect(await readFile(join(omd, "agy-plugin/plugin.json"), "utf8")).toBe("{\"name\":\"dash\"}\n");
   await expect(stat(join(omd, "src/gone.ts"))).rejects.toThrow();
   await expect(stat(join(omd, "docs/spec/private.md"))).rejects.toThrow();
   expect(await readFile(join(omd, "README.md"), "utf8")).toBe("public readme\n");
@@ -80,4 +81,23 @@ test("dry run reports files without writing, and arguments are validated", async
   expect(() => parseArgs([])).toThrow("--target");
   expect(() => parseArgs(["--target"])).toThrow("requires a value");
   expect(() => parseArgs(["--target", "x", "--bogus"])).toThrow("Unknown option");
+});
+
+test("--include-docs exports generic README and runbook while never exporting docs/private, and retained target docs are scanned", async () => {
+  const dash = await repo({
+    ".export-deny": "secret-host\n",
+    "src/a.ts": "export const a = 2;\n",
+    "README.md": "generic public readme\n",
+    "docs/runbook.md": "generic public runbook\n",
+    "docs/private/hub-runbook.md": "secret-host private hub runbook\n",
+    "package.json": pkg({}),
+  });
+  const leakyOmd = await repo({ "src/a.ts": "old\n", "README.md": "leaked secret-host\n", "package.json": pkg({ name: "oh-my-dash" }) });
+  await expect(exportPublic({ ...parseArgs(["--target", leakyOmd]), repo: dash })).rejects.toThrow("README.md:1");
+  expect(await readFile(join(leakyOmd, "src/a.ts"), "utf8")).toBe("old\n");
+
+  await exportPublic({ ...parseArgs(["--target", leakyOmd, "--include-docs"]), repo: dash });
+  expect(await readFile(join(leakyOmd, "README.md"), "utf8")).toBe("generic public readme\n");
+  expect(await readFile(join(leakyOmd, "docs/runbook.md"), "utf8")).toBe("generic public runbook\n");
+  await expect(stat(join(leakyOmd, "docs/private/hub-runbook.md"))).rejects.toThrow();
 });

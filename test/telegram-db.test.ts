@@ -29,13 +29,13 @@ test("Telegram settings round-trip through SQLite and can be deleted", () => {
 test("settings prefix deletion treats underscores literally", () => {
   const db = new DashDB(":memory:");
   try {
-    db.setSetting("telegram.mode.invest", "turns");
-    db.setSetting("telegram.mode.squad_rogue", "off");
-    db.setSetting("telegram.modeX.rogue", "input");
+    db.setSetting("telegram.mode.billing", "turns");
+    db.setSetting("telegram.mode.team_core", "off");
+    db.setSetting("telegram.modeX.core", "input");
     expect(db.deleteSettingsPrefix("telegram.mode.")).toBe(2);
-    expect(db.getSetting("telegram.mode.invest")).toBeUndefined();
-    expect(db.getSetting("telegram.mode.squad_rogue")).toBeUndefined();
-    expect(db.getSetting("telegram.modeX.rogue")).toBe("input");
+    expect(db.getSetting("telegram.mode.billing")).toBeUndefined();
+    expect(db.getSetting("telegram.mode.team_core")).toBeUndefined();
+    expect(db.getSetting("telegram.modeX.core")).toBe("input");
   } finally {
     db.close();
   }
