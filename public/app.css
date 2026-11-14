@@ -442,7 +442,7 @@
 .pill.harness-pill.omp{color:#9ce3d4;border-color:#34665c;background:#18353066}
 .pill.harness-pill.codex{color:#b6d4ff;border-color:#3b5882;background:#1b2d4766}
 #quiet-mode-toggle[aria-pressed="true"],#console-wide-toggle[aria-pressed="true"]{border-color:var(--accent);background:#202c3d;color:#edf3ff}
-body[data-quiet="1"] :is(.sources-explainer,.output-search-note,.console-read-guidance,.comparison-guidance,.selective-guidance,.reply-queue-note,.capability-note){display:none}
+body[data-quiet="1"] :is(.sources-explainer,.output-search-note,.console-read-guidance,.comparison-guidance,.selective-guidance){display:none}
 .console-resizer{display:none}
 @media(min-width:951px){
   .console-layout{grid-template-columns:minmax(280px,var(--console-split,1.5fr)) 8px minmax(290px,1fr);gap:8px}

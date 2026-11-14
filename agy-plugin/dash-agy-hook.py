@@ -372,8 +372,10 @@ def handle_remote_question(opener, cfg, headers, payload, session_id, title):
             w_status, w_body = request_json(opener, wait_url, "GET", headers, None, min(4.0, rem + 0.5))
             if w_status == 204:
                 continue
-            if w_status != 200:
+            if w_status == 404:
                 registered = False
+                return None
+            if w_status != 200:
                 return None
             parsed = json.loads(w_body.decode("utf-8"))
             answers = parsed.get("answers") if isinstance(parsed, dict) else None

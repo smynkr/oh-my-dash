@@ -102,8 +102,7 @@ export function stripAgyPromptEnvelope(value: unknown): string | undefined {
 
 export function describePrompt(text: string | undefined | null): string | null {
   if (text == null) return null;
-  const unwrapped = text.includes("<USER_REQUEST>") ? (stripAgyPromptEnvelope(text) ?? text) : text;
-  const trimmed = unwrapped.trimStart();
+  const trimmed = text.trimStart();
   if (/^<task-notification(?:\s|>)/.test(trimmed)) {
     const summary = trimmed.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim();
     return `⟲ Background task update${summary ? `: ${summary.slice(0, 160)}` : ""}`;
@@ -115,7 +114,7 @@ export function describePrompt(text: string | undefined | null): string | null {
     return `/${name}${args ? ` ${args}` : ""}`;
   }
   if (/^(?:<system-reminder(?:\s|>)|<local-command-stdout(?:\s|>)|Caveat:)/.test(trimmed)) return null;
-  return unwrapped;
+  return text;
 }
 
 function questionFields(input: Data | null) {

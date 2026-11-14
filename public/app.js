@@ -2967,7 +2967,7 @@
       $(`#${id}-filter-toggle`).setAttribute('aria-pressed', String(selected === status));
     }
     $('#next-unresolved').disabled = !needs.length;
-    const attentionTotal = base.filter(s => statusOf(s) === 'needs_input' || Boolean(byId(s, 'lastError', 'last_error')) || (statusOf(s) !== 'ended' && Number(byId(s, 'unreadCount', 'unread_count') || 0) > 0)).length;
+    const attentionTotal = base.filter(s => statusOf(s) !== 'ended' && (statusOf(s) === 'needs_input' || Boolean(byId(s, 'lastError', 'last_error')) || Number(byId(s, 'unreadCount', 'unread_count') || 0) > 0)).length;
     $('#triage-open').textContent = attentionTotal ? `Triage · ${attentionTotal}` : 'Triage';
     if ($('#triage-dialog')?.open) renderTriageDialog();
     const visible = visibleSessions().length;

@@ -133,7 +133,13 @@ export function parseAgyTimestamp(value: unknown): number {
     .replace(/(\.\d{3})\d+/, "$1");
   return Date.parse(iso);
 }
-function parseAgyLines(path: string, maxBytes: number, meta?: { sessionId?: string; cwd?: string; title?: string; host?: string }): BackfillSession | null {
+const SAFE_AGY_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function parseAgyLines(
+  path: string,
+  maxBytes: number,
+  meta?: { sessionId?: string; cwd?: string; title?: string; host?: string; requireUserEnvelope?: boolean },
+): BackfillSession | null {
   let fileSize = 0;
   try { fileSize = statSync(path).size; } catch { return null; }
   let lines: string[];
@@ -166,6 +172,9 @@ function parseAgyLines(path: string, maxBytes: number, meta?: { sessionId?: stri
     if (Number.isInteger(e.step_index) && fullContent.has(e.step_index)) return fullContent.get(e.step_index)!;
     return typeof e.content === "string" ? e.content : "";
   };
+  if (meta?.requireUserEnvelope && !entries.some(e => e.type === "USER_INPUT" && contentOf(e).includes("<USER_REQUEST>"))) {
+    return fileSize > INITIAL_TAIL && maxBytes < MAX_TAIL ? parseAgyLines(path, MAX_TAIL, meta) : null;
+  }
   const turns: { user: Record<string, any>; promptText: string; planners: { entry: Record<string, any>; text: string }[] }[] = [];
   for (const e of entries) {
     if (e.type === "USER_INPUT" && (e.source === "USER_EXPLICIT" || e.source === undefined)) {
@@ -202,7 +211,7 @@ export function parseAgyTranscript(path: string, meta?: { sessionId?: string; cw
   return parseAgyLines(path, INITIAL_TAIL, meta);
 }
 export async function findAgyTranscript(sessionId: string, agyRoots = defaultAgyRoots()): Promise<BackfillSession | null> {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return null;
+  if (!SAFE_AGY_ID.test(sessionId)) return null;
   for (const root of agyRoots) {
     const transcriptPath = join(root, "brain", sessionId, ".system_generated/logs/transcript.jsonl");
     try { if (!(await stat(transcriptPath)).isFile()) continue; } catch { continue; }
@@ -244,7 +253,7 @@ export async function scanAgyBackfill(cutoff: number, agyRoots = defaultAgyRoots
       finally { try { db?.close(); } catch { /* ignore */ } }
       for (const row of rows) {
         const id = typeof row.conversation_id === "string" ? row.conversation_id.trim() : "";
-        if (!id || (typeof row.parent_conversation_id === "string" && row.parent_conversation_id.trim())) continue;
+        if (!SAFE_AGY_ID.test(id) || (typeof row.parent_conversation_id === "string" && row.parent_conversation_id.trim())) continue;
         seenInRoot.add(id);
         const modMs = parseAgyTimestamp(row.last_modified_time);
         if (Number.isFinite(modMs) && modMs < cutoff) continue;
@@ -268,13 +277,13 @@ export async function scanAgyBackfill(cutoff: number, agyRoots = defaultAgyRoots
     let entries;
     try { entries = await readdir(brainDir, { withFileTypes: true }); } catch { continue; }
     for (const entry of entries) {
-      if (!entry.isDirectory() || seenInRoot.has(entry.name)) continue;
+      if (!entry.isDirectory() || !SAFE_AGY_ID.test(entry.name) || seenInRoot.has(entry.name)) continue;
       if (hasDb) continue;
       const transcriptPath = join(brainDir, entry.name, ".system_generated/logs/transcript.jsonl");
       let st;
       try { st = await stat(transcriptPath); } catch { continue; }
       if (!st.isFile() || st.mtimeMs < cutoff) continue;
-      const parsed = parseAgyTranscript(transcriptPath, { sessionId: entry.name });
+      const parsed = parseAgyLines(transcriptPath, INITIAL_TAIL, { sessionId: entry.name, requireUserEnvelope: true });
       if (!parsed) continue;
       const prev = byId.get(entry.name);
       if (!prev || st.mtimeMs >= prev.mtime) byId.set(entry.name, { mtime: st.mtimeMs, session: parsed });

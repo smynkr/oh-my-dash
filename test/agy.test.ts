@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAgyTranscript, scanAgyBackfill, scanBackfill } from "../src/backfill.ts";
 import { parseAgyAgents, pollAgySessions } from "../src/liveness.ts";
-import { localHost, normalizeAgy, normalizeAgyQuestions, stripAgyPromptEnvelope } from "../src/normalize.ts";
+import { localHost, describePrompt, normalizeAgy, normalizeAgyQuestions, stripAgyPromptEnvelope } from "../src/normalize.ts";
 import { createDashServer } from "../src/server.ts";
 import { installAgyPlugin, parseArgs as parseAgyInstallArgs } from "../scripts/install-agy-plugin.ts";
 
@@ -69,6 +69,10 @@ describe("Antigravity normalization", () => {
   test("strips context summary and unwraps <USER_REQUEST> envelopes", () => {
     const raw = `<CONTEXT_SUMMARY>\nOld summary text\n</CONTEXT_SUMMARY>\n<USER_REQUEST>\nAdd first-class Antigravity support\n</USER_REQUEST>`;
     expect(stripAgyPromptEnvelope(raw)).toBe("Add first-class Antigravity support");
+    // describePrompt remains harness-agnostic so literal tags in non-agy prompts are preserved.
+    expect(describePrompt("Literal doc snippet: <USER_REQUEST>example</USER_REQUEST>")).toBe(
+      "Literal doc snippet: <USER_REQUEST>example</USER_REQUEST>",
+    );
 
     const event = normalizeAgy(
       {
@@ -207,8 +211,13 @@ describe("Antigravity backfill and presence lock liveness", () => {
     mkdirSync(agyRoot, { recursive: true });
     createSummaryDb(agyRoot, [
       { id: "main-conv", title: "Primary AGY Session", workspaces: ["file:///work/synthetic-alpha"] },
+      { id: "../escaped-conv", title: "Traversal Attempt", workspaces: ["file:///work/escaped"] },
       { id: "subagent-conv", title: "Subagent Worker", nestingDepth: 1, parentId: "main-conv" },
       { id: "killed-conv", title: "Killed Session", killed: 1 },
+    ]);
+    writeTranscript(scratch, "escaped-conv", [
+      { step_index: 0, type: "USER_INPUT", source: "USER_EXPLICIT", content: "<USER_REQUEST>\nEscaped\n</USER_REQUEST>" },
+      { step_index: 1, type: "PLANNER_RESPONSE", content: "Should never be read" },
     ]);
 
     const compactPath = writeTranscript(
@@ -268,6 +277,19 @@ describe("Antigravity backfill and presence lock liveness", () => {
     const emptyClaude = join(scratch, "empty-claude");
     mkdirSync(emptyClaude, { recursive: true });
     expect(await scanBackfill(12, { roots: [{ path: emptyClaude, omp: false }] })).toEqual([]);
+
+    // Without conversation_summaries.db, directory fallback still skips subagent transcripts lacking <USER_REQUEST>.
+    const dbLessRoot = join(scratch, "antigravity-no-db");
+    writeTranscript(dbLessRoot, "main-nodb", [
+      { step_index: 0, type: "USER_INPUT", source: "USER_EXPLICIT", created_at: "2026-11-14T01:00:00Z", content: "<USER_REQUEST>\nDirect user prompt\n</USER_REQUEST>" },
+      { step_index: 1, type: "PLANNER_RESPONSE", created_at: "2026-11-14T01:00:05Z", content: "Main reply" },
+    ]);
+    writeTranscript(dbLessRoot, "worker-nodb", [
+      { step_index: 0, type: "USER_INPUT", source: "AGENT", created_at: "2026-11-14T01:00:00Z", content: "Subagent brief without envelope" },
+      { step_index: 1, type: "PLANNER_RESPONSE", created_at: "2026-11-14T01:00:05Z", content: "Subagent reply" },
+    ]);
+    const dbLessScanned = await scanAgyBackfill(0, [dbLessRoot]);
+    expect(dbLessScanned.map(s => s.sessionId)).toEqual(["main-nodb"]);
   });
 
   test("pollAgySessions detects live flock holders and ignores stale or subagent locks", async () => {
